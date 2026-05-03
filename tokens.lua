@@ -55,6 +55,52 @@ Tokens.expanders.date_numeric  = function(_b, s) return fmt("%d/%m/%Y", s) end
 Tokens.expanders.weekday       = function(_b, s) return fmt("%A", s) end
 Tokens.expanders.weekday_short = function(_b, s) return fmt("%a", s) end
 
+local function minutesToHM(m)
+    if not m or m <= 0 then return "" end
+    local h = math.floor(m / 60); local mm = m % 60
+    return string.format("%dh %02dm", h, mm)
+end
+
+Tokens.expanders.book_time_left   = function(b) return minutesToHM(b and b.book_time_left_minutes) end
+Tokens.expanders.book_read_time   = function(b)
+    return b and b.book_read_time_seconds and minutesToHM(math.floor(b.book_read_time_seconds / 60)) or ""
+end
+Tokens.expanders.pages_today      = function(_b, s) return s and s.pages_today and tostring(s.pages_today) or "" end
+Tokens.expanders.time_today       = function(_b, s) return minutesToHM(s and s.time_today_minutes) end
+Tokens.expanders.speed            = function(b) return b and b.speed_pph and tostring(b.speed_pph) or "" end
+Tokens.expanders.avg_page_time    = function(b)
+    if not b or not b.avg_page_time_seconds then return "" end
+    local s = b.avg_page_time_seconds
+    if s < 60 then return string.format("%ds", s) end
+    return string.format("%dm %02ds", math.floor(s / 60), s % 60)
+end
+Tokens.expanders.book_pages_read    = function(b) return b and b.book_pages_read and tostring(b.book_pages_read) or "" end
+Tokens.expanders.days_reading_book  = function(b) return b and b.days_reading_book and tostring(b.days_reading_book) or "" end
+Tokens.expanders.pages_per_day      = function(b) return b and b.pages_per_day and tostring(b.pages_per_day) or "" end
+
+Tokens.expanders.highlights   = function(b) return b and b.highlights and tostring(b.highlights) or "" end
+Tokens.expanders.notes        = function(b) return b and b.notes and tostring(b.notes) or "" end
+Tokens.expanders.bookmarks    = function(b) return b and b.bookmarks and tostring(b.bookmarks) or "" end
+Tokens.expanders.annotations  = function(b)
+    if not b then return "" end
+    local total = (b.highlights or 0) + (b.notes or 0) + (b.bookmarks or 0)
+    return total > 0 and tostring(total) or ""
+end
+
+Tokens.expanders.batt      = function(_b, s) return s and s.batt and (tostring(s.batt) .. "%") or "" end
+Tokens.expanders.batt_icon = function(_b, s)
+    if not s or not s.batt then return "" end
+    if s.charging then return "⚡" end
+    if s.batt < 20 then return "🪫" end
+    return "🔋"
+end
+Tokens.expanders.wifi  = function(_b, s) return s and s.wifi == "on" and "📶" or "" end
+Tokens.expanders.light = function(_b, s) return s and s.light or "" end
+Tokens.expanders.warmth= function(_b, s) return s and s.warmth and tostring(s.warmth) or "" end
+Tokens.expanders.mem   = function(_b, s) return s and s.mem and (tostring(s.mem) .. "%") or "" end
+Tokens.expanders.ram   = function(_b, s) return s and s.ram_mib and (tostring(s.ram_mib) .. " MiB") or "" end
+Tokens.expanders.disk  = function(_b, s) return s and s.disk_free or "" end
+
 -- Match longest token names first so %book_pct_left wins over %book_pct.
 local function compareLengthDesc(a, b) return #a > #b end
 local function tokenNamesByLengthDesc()
