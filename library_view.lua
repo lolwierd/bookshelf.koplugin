@@ -24,6 +24,7 @@ local Size            = require("ui/size")
 local Font            = require("ui/font")
 local UIManager       = require("ui/uimanager")
 local Screen          = require("device").screen
+local Blitbuffer      = require("ffi/blitbuffer")
 local ChipStrip       = require("chip_strip")
 local ShelfRow        = require("shelf_row")
 local Repo            = require("book_repository")
@@ -172,11 +173,14 @@ function LibraryView:_rebuild()
     }
 
     -- ── Assemble ──────────────────────────────────────────────────────────────
+    -- Page background = pure white, filling the whole screen so the
+    -- underlying FileManager doesn't bleed through (mirrors BookshelfWidget).
     self[1] = FrameContainer:new{
-        width     = self.width,
-        height    = self.height,
+        width      = self.width,
+        height     = self.height,
         bordersize = 0,
-        padding   = Size.padding.default,
+        padding    = Size.padding.default,
+        background = Blitbuffer.COLOR_WHITE,
         VerticalGroup:new{
             align = "left",
             titlebar,

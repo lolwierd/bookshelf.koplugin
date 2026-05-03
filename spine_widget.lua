@@ -34,7 +34,7 @@ end
 function SpineWidget:_renderCover()
     local Screen = require("device").screen
     return FrameContainer:new{
-        bordersize = Screen:scaleBySize(2),     -- 2dp border per spec
+        bordersize = Screen:scaleBySize(1),     -- 1dp border (was 2, too heavy)
         radius     = Screen:scaleBySize(4),     -- slight rounding
         padding    = 0,
         ImageWidget:new{
@@ -92,7 +92,7 @@ function SpineWidget:_renderFallback()
     -- white page. Blitbuffer.gray semantics: 0 = white, 1 = black.
     local paper  = Blitbuffer.gray(0.07)
     local Screen = require("device").screen
-    local border = Screen:scaleBySize(2)
+    local border = Screen:scaleBySize(1)
     -- Match the cover render path: 2dp border, slight rounding, EXACTLY
     -- the same self.width × self.height footprint. Inner CenterContainer
     -- subtracts the border so the FrameContainer's outer size stays at

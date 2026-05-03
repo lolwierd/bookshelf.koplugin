@@ -46,12 +46,16 @@ function ChipStrip:init()
     -- an outlined button against the page. Active chip is inverted to black.
     local paper = Blitbuffer.COLOR_WHITE
 
+    -- Chips have NO individual borders — the doubling-border issue from
+    -- adjacent FrameContainers (with negative padding_left clamped to 0
+    -- by KOReader's FrameContainer) made every join look like a 2px line.
+    -- Instead, each chip is a borderless cell; a single outer border
+    -- around the whole strip provides the segmented-control outline.
     for i, chip in ipairs(self.chips) do
         local is_active = (chip.key == self.active)
-        -- Last chip gets any rounding remainder so total width = self.width.
         local w = (i == n) and (self.width - chip_w * (n - 1)) or chip_w
-        local frame = FrameContainer:new{
-            bordersize = Size.border.thin,
+        row[#row + 1] = FrameContainer:new{
+            bordersize = 0,
             margin     = 0,
             padding    = 0,
             background = is_active and Blitbuffer.COLOR_BLACK or paper,
@@ -65,13 +69,15 @@ function ChipStrip:init()
                 }
             }
         }
-        -- Visually butt-joined: shift each chip after the first left by one
-        -- border-width so adjacent borders overlap instead of doubling.
-        if i > 1 then frame.padding_left = -Size.border.thin end
-        row[#row + 1] = frame
         self._chip_dimens[chip.key] = { x = (i - 1) * chip_w, w = w }
     end
-    self[1] = row
+    -- Single outer border framing the whole strip.
+    self[1] = FrameContainer:new{
+        bordersize = Size.border.thin,
+        margin     = 0,
+        padding    = 0,
+        row,
+    }
 
     -- Single gesture binding for the whole strip; we resolve which chip was
     -- tapped by the x-coordinate within onTapStrip.

@@ -138,7 +138,7 @@ function BookshelfWidget:_rebuild()
     -- Settings → Edit hero card lines.
     local lines = G_reader_settings:readSetting("bookshelf_hero_lines") or {
         "[if:page_num]Page %page_num / %page_count · %book_pct[else]%book_pct[/if]",
-        "[if:book_time_left]%book_time_left LEFT[else]Open to start reading[/if]",
+        "[if:book_time_left]%book_time_left LEFT[/if]",
     }
     local hero = HeroCard:new{
         book         = current,

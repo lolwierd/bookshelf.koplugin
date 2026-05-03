@@ -121,14 +121,30 @@ function HeroCard:_renderFull()
     -- Constrained to ~half the cover height with ellipsis overflow so it
     -- can't push the progress bar / clock off the bottom.
     local Screen = require("device").screen
-    if self.book.description and self.book.description ~= "" then
-        right_top[#right_top + 1] = TextBoxWidget:new{
-            text   = self.book.description,
-            face   = Font:getFace("infofont", 14),
-            width  = right_w,
-            height = math.floor(cover_h * 0.40),
-            height_overflow_show_ellipsis = true,
-        }
+    local desc = self.book.description
+    if desc and desc ~= "" then
+        -- BookInfoManager stores the raw <dc:description> with embedded
+        -- HTML markup (<p><b><i><br>…). TextBoxWidget has no markup
+        -- renderer so we strip tags + decode the most common entities.
+        desc = desc:gsub("<br%s*/?>", "\n")     -- preserve line breaks
+                   :gsub("</p>", "\n\n")        -- paragraph breaks
+                   :gsub("<[^>]+>", "")         -- drop all other tags
+                   :gsub("&amp;",  "&")
+                   :gsub("&quot;", "\"")
+                   :gsub("&apos;", "'")
+                   :gsub("&lt;",   "<")
+                   :gsub("&gt;",   ">")
+                   :gsub("&#(%d+);", function(n) return string.char(tonumber(n)) end)
+                   :gsub("^%s+", ""):gsub("%s+$", "")  -- trim
+        if desc ~= "" then
+            right_top[#right_top + 1] = TextBoxWidget:new{
+                text   = desc,
+                face   = Font:getFace("infofont", 14),
+                width  = right_w,
+                height = math.floor(cover_h * 0.40),
+                height_overflow_show_ellipsis = true,
+            }
+        end
     end
 
     -- Bottom-anchored stack: progress bar + large clock/battery readout below.
