@@ -136,12 +136,21 @@ function Bookshelf:show()
 end
 
 function Bookshelf:_takeOver(fm_instance)
-    -- Close FileManager if it was the boot path, then show Bookshelf.
-    -- fm_instance is captured at schedule time (in init()) so we use that known
-    -- reference instead of a fresh require lookup.
-    if fm_instance then
-        UIManager:close(fm_instance)
-    end
+    -- Leave FileManager loaded *underneath* Bookshelf — don't close it. Two
+    -- reasons:
+    --   1. KOReader's standard menu (FileManagerMenu top-zone tap/swipe) is
+    --      registered against the FM instance via touch zones; if we close
+    --      FM, those gestures have nowhere to land and the system menu
+    --      stops working anywhere on the home screen.
+    --   2. Closing back out of Bookshelf (e.g. user dismisses it through a
+    --      future "show file browser" path) hits FM directly with no need
+    --      to re-instantiate.
+    -- Bookshelf paints fully opaque (white page bg) over FM, so there's no
+    -- visible bleed-through; the only cost is a few hundred KB of FM widget
+    -- tree in memory, which is acceptable on every target device.
+    -- (We keep `fm_instance` in the signature for diagnostic use only —
+    -- closing it is now intentional dead code.)
+    local _ = fm_instance
     self:show()
 end
 
