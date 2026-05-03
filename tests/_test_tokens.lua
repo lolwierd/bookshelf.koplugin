@@ -44,5 +44,37 @@ test("smoke: Tokens module loads", function()
     assert(type(Tokens.expand) == "function", "Tokens.expand missing")
 end)
 
+local function bookFixture()
+    return {
+        title = "Dune",
+        author = "Frank Herbert",
+        authors = { "Frank Herbert" },
+        series = "Dune #1",
+        series_name = "Dune",
+        series_num = "1",
+        filename = "dune",
+        lang = "en",
+        format = "EPUB",
+    }
+end
+
+test("metadata: %title", function()
+    eq(Tokens.expand("%title", bookFixture()), "Dune")
+end)
+test("metadata: %author", function()
+    eq(Tokens.expand("%author", bookFixture()), "Frank Herbert")
+end)
+test("metadata: %series", function()
+    eq(Tokens.expand("%series", bookFixture()), "Dune #1")
+end)
+test("metadata: literal text passes through", function()
+    eq(Tokens.expand("Reading %title by %author.", bookFixture()),
+       "Reading Dune by Frank Herbert.")
+end)
+test("metadata: missing token resolves to empty", function()
+    local b = bookFixture(); b.series = nil
+    eq(Tokens.expand("%series", b), "")
+end)
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)
