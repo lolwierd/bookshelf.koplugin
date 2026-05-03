@@ -121,10 +121,17 @@ function BookshelfWidget:_rebuild()
     local label_text
     if is_expanded then
         label_text = "\xe2\x86\x90  " .. (self._expanded_series.series_name or "Series")
+    elseif total < 0 then
+        -- Total is unknown (e.g. "latest" chip avoids an expensive filesystem
+        -- walk), so omit the "of N" portion.
+        label_text = string.format(
+            "%s  \xc2\xb7  1\xe2\x80\x93%d  \xe2\x80\xba",
+            self:_chipLabel(), math.min(8, shown)
+        )
     else
         label_text = string.format(
             "%s  \xc2\xb7  1\xe2\x80\x93%d of %d  \xe2\x80\xba",
-            self:_chipLabel(), shown, total
+            self:_chipLabel(), math.min(8, shown), total
         )
     end
 
@@ -251,16 +258,30 @@ function BookshelfWidget:_chipLabel()
 end
 
 -- _chipTotal() — total item count for the active chip (used in the label).
--- Calls Repo with a large limit so we get the true count without loading all
--- items into widget form. Slightly wasteful but simple; Phase 9 can cache.
+-- Returns -1 to signal "unknown" for chips where counting would be expensive
+-- (e.g. "latest" requires a filesystem walk). The label-formatter omits the
+-- total in that case.
 function BookshelfWidget:_chipTotal()
     if self._expanded_series then
         return #self._expanded_series.books
     end
-    if self.chip == "recent"    then return #Repo.getRecent(9999)       end
-    if self.chip == "latest"    then return #Repo.getLatest(9999)       end
-    if self.chip == "series"    then return #Repo.getSeriesGroups(9999) end
-    if self.chip == "favorites" then return #Repo.getFavorites(9999)    end
+    -- For the active chip, count from the cheapest available source. The
+    -- "latest" chip is filesystem-bound; counting it would re-walk every
+    -- rebuild, so we return -1 to signal "unknown" and the label-formatter
+    -- omits the total.
+    if self.chip == "recent" then
+        local rh = require("readhistory")
+        return #rh.hist
+    elseif self.chip == "latest" then
+        return -1
+    elseif self.chip == "series" then
+        return #Repo.getSeriesGroups(9999)
+    elseif self.chip == "favorites" then
+        local rc = require("readcollection")
+        local count = 0
+        for _ in pairs(rc.coll and rc.coll.favorites or {}) do count = count + 1 end
+        return count
+    end
     return 0
 end
 
@@ -315,6 +336,9 @@ end
 -- ReaderUI is required inside the function to avoid boot-order issues (Phase 5 lesson).
 function BookshelfWidget:_openBook(book)
     if not book or not book.filepath then return end
+    -- Returning from a book should land on the chip-level view, not in the
+    -- middle of an expanded series.
+    self._expanded_series = nil
     local ReaderUI = require("apps/reader/readerui")
     UIManager:close(self)
     UIManager:nextTick(function()
@@ -335,7 +359,7 @@ end
 -- ─── Gear menu (Task 6.2) ─────────────────────────────────────────────────────
 
 function BookshelfWidget:_openGearMenu()
-    local ButtonDialog = require("ui/widget/buttondialogtitle")
+    local ButtonDialog = require("ui/widget/buttondialog")
     local bw = self
     UIManager:show(ButtonDialog:new{
         title = "Bookshelf",
@@ -376,7 +400,7 @@ function BookshelfWidget:_openBookMenu(item)
         return self:_openSeriesMenu(item)
     end
     local book = item
-    local ButtonDialog   = require("ui/widget/buttondialogtitle")
+    local ButtonDialog   = require("ui/widget/buttondialog")
     local ReadCollection = require("readcollection")
     local bw = self
     local ok_fav, in_fav = pcall(function()
@@ -390,7 +414,13 @@ function BookshelfWidget:_openBookMenu(item)
             {
                 { text = "Show info",
                   callback = function()
-                    require("apps/filemanager/filemanagerbookinfo"):show(book.filepath)
+                    local FileManager = require("apps/filemanager/filemanager")
+                    local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
+                    if FileManager.instance and FileManager.instance.bookinfo then
+                        FileManager.instance.bookinfo:show(book.filepath)
+                    else
+                        FileManagerBookInfo:new{}:show(book.filepath)
+                    end
                   end },
                 { text = fav_label,
                   callback = function()
@@ -422,7 +452,7 @@ end
 
 -- _openSeriesMenu(series)  — long-press on a series stack.
 function BookshelfWidget:_openSeriesMenu(series)
-    local ButtonDialog = require("ui/widget/buttondialogtitle")
+    local ButtonDialog = require("ui/widget/buttondialog")
     local bw = self
     UIManager:show(ButtonDialog:new{
         title = series.series_name or "Series",
