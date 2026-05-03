@@ -7,15 +7,16 @@
 -- walks pixel columns 3dp apart and draws a 1×thickness fillRect at each stop.
 -- Pattern reference: bookends_overlay_widget.lua lines 176–185 (MultiLineWidget).
 
-local FrameContainer = require("ui/widget/container/framecontainer")
-local VerticalGroup  = require("ui/widget/verticalgroup")
-local HorizontalGroup= require("ui/widget/horizontalgroup")
-local Widget         = require("ui/widget/widget")
-local Geom           = require("ui/geometry")
-local Size           = require("ui/size")
-local Blitbuffer     = require("ffi/blitbuffer")
-local SpineWidget    = require("spine_widget")
-local SeriesStack    = require("series_stack")
+local FrameContainer  = require("ui/widget/container/framecontainer")
+local VerticalGroup   = require("ui/widget/verticalgroup")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan  = require("ui/widget/horizontalspan")
+local Widget          = require("ui/widget/widget")
+local Geom            = require("ui/geometry")
+local Size            = require("ui/size")
+local Blitbuffer      = require("ffi/blitbuffer")
+local SpineWidget     = require("spine_widget")
+local SeriesStack     = require("series_stack")
 
 local ShelfRow = {}
 
@@ -32,7 +33,7 @@ function ShelfRow._renderDottedRule(width, thickness)
     function DottedRule:paintTo(bb, x, y)
         -- Walk across the width placing 1×thickness filled rects every 3px.
         for px = 0, width - 1, 3 do
-            bb:fillRect(x + px, y, 1, thickness, Blitbuffer.COLOR_BLACK)
+            bb:paintRect(x + px, y, 1, thickness, Blitbuffer.COLOR_BLACK)
         end
     end
 
@@ -59,10 +60,7 @@ function ShelfRow.new(opts)
     for i = 1, n_slots do
         -- Insert a gap spacer before every slot after the first.
         if i > 1 then
-            row[#row + 1] = FrameContainer:new{
-                bordersize = 0,
-                Geom:new{ w = gap, h = opts.height },
-            }
+            row[#row + 1] = HorizontalSpan:new{ width = gap }
         end
 
         local item = opts.items and opts.items[i]
@@ -86,10 +84,7 @@ function ShelfRow.new(opts)
             }
         else
             -- Empty slot — blank spacer so layout is stable.
-            row[#row + 1] = FrameContainer:new{
-                bordersize = 0,
-                Geom:new{ w = slot_w, h = opts.height },
-            }
+            row[#row + 1] = HorizontalSpan:new{ width = slot_w }
         end
     end
 

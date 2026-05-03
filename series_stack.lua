@@ -17,6 +17,7 @@ local OverlapGroup   = require("ui/widget/overlapgroup")
 local CenterContainer= require("ui/widget/container/centercontainer")
 local TextWidget     = require("ui/widget/textwidget")
 local Geom           = require("ui/geometry")
+local GestureRange   = require("ui/gesturerange")
 local Size           = require("ui/size")
 local Font           = require("ui/font")
 local Blitbuffer     = require("ffi/blitbuffer")
@@ -136,7 +137,8 @@ function SeriesStack:init()
     local badge = FrameContainer:new{
         bordersize  = 0,
         padding     = 0,
-        padding_top = self.height - Size.item.height_small,
+        -- The count badge area: ~20dp tall, anchored near the bottom.
+        padding_top = math.max(0, self.height - 24),
         badge_inner,
     }
 
@@ -149,8 +151,8 @@ function SeriesStack:init()
         badge,
     }
     self.ges_events = {
-        Tap  = { GestureRange = { ges = "tap",  range = self.dimen } },
-        Hold = { GestureRange = { ges = "hold", range = self.dimen } },
+        Tap  = { GestureRange:new{ ges = "tap",  range = self.dimen } },
+        Hold = { GestureRange:new{ ges = "hold", range = self.dimen } },
     }
 end
 

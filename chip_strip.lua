@@ -16,6 +16,7 @@ local HorizontalGroup= require("ui/widget/horizontalgroup")
 local TextWidget     = require("ui/widget/textwidget")
 local CenterContainer= require("ui/widget/container/centercontainer")
 local Geom           = require("ui/geometry")
+local GestureRange   = require("ui/gesturerange")
 local Size           = require("ui/size")
 local Font           = require("ui/font")
 local Blitbuffer     = require("ffi/blitbuffer")
@@ -30,6 +31,12 @@ local ChipStrip = InputContainer:extend{
 
 function ChipStrip:init()
     self.dimen = Geom:new{ w = self.width, h = self.height }
+    if not self.chips or #self.chips == 0 then
+        -- Empty chip-strip: render a no-op widget so callers can still
+        -- compose us into a layout without conditionals.
+        self[1] = require("ui/widget/widget"):new{ dimen = self.dimen }
+        return
+    end
     local n = #self.chips
     local chip_w = math.floor(self.width / n)
     local row = HorizontalGroup:new{}
@@ -72,7 +79,7 @@ function ChipStrip:init()
     -- Single gesture binding for the whole strip; we resolve which chip was
     -- tapped by the x-coordinate within onTapStrip.
     self.ges_events = {
-        TapStrip = { GestureRange = { ges = "tap", range = self.dimen } },
+        TapStrip = { GestureRange:new{ ges = "tap", range = self.dimen } },
     }
 end
 

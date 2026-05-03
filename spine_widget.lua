@@ -6,6 +6,7 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ImageWidget    = require("ui/widget/imagewidget")
 local Geom           = require("ui/geometry")
+local GestureRange   = require("ui/gesturerange")
 local Size           = require("ui/size")
 local InputContainer = require("ui/widget/container/inputcontainer")
 
@@ -25,8 +26,8 @@ function SpineWidget:init()
         self[1] = self:_renderFallback()
     end
     self.ges_events = {
-        Tap  = { GestureRange = { ges = "tap",  range = self.dimen } },
-        Hold = { GestureRange = { ges = "hold", range = self.dimen } },
+        Tap  = { GestureRange:new{ ges = "tap",  range = self.dimen } },
+        Hold = { GestureRange:new{ ges = "hold", range = self.dimen } },
     }
 end
 
@@ -57,17 +58,22 @@ function SpineWidget:_renderFallback()
         alignment = "center",
         bold = true,
     }
+    local HorizontalSpan = require("ui/widget/horizontalspan")
     local rule = FrameContainer:new{
         bordersize = 0,
         background = Blitbuffer.COLOR_BLACK,
-        Geom:new{ w = self.width / 4, h = Size.line.thin },
+        padding = 0,
+        HorizontalSpan:new{ width = math.floor(self.width / 4) },
     }
+    -- KOReader's TextBoxWidget doesn't support italic; render upright.
+    -- Visually distinguishing the author line via italic is deferred to a
+    -- future revision that loads an italic font face. v0.1 accepts the
+    -- visual compromise.
     local author = TextBoxWidget:new{
         text = self.book and self.book.author or "",
         face = Font:getFace("infofont", 10),
         width = self.width - pad * 2,
         alignment = "center",
-        italic = true,
     }
 
     local stack = VerticalGroup:new{
