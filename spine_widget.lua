@@ -67,6 +67,7 @@ function SpineWidget:_renderFallback()
         face = Font:getFace("infofont", 10),
         width = self.width - pad * 2,
         alignment = "center",
+        italic = true,
     }
 
     local stack = VerticalGroup:new{
