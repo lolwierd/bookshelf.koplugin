@@ -212,17 +212,35 @@ function Repo.getFavorites(limit)
 end
 
 -- ─── getSeriesGroups ─────────────────────────────────────────────────────────
--- Returns up to `limit` series groups derived from ReadHistory.
--- Each group is { series_name, books, latest } where books are sorted by
--- series_num ascending. Groups are sorted by most recent activity descending.
+-- Returns up to `limit` series groups derived from a filesystem walk of the
+-- user's library (so unread books in a series still show up, not only ones
+-- in ReadHistory). Each group is { series_name, books, latest } where books
+-- are sorted by series_num ascending. Groups are sorted by most recent
+-- activity descending — read-time from ReadHistory when available, else the
+-- file's mtime as a fallback so newly-added unread series still surface.
 -- Books without a series_name are excluded.
 
 function Repo.getSeriesGroups(limit)
-    local rh     = getReadHistory()
-    local groups = {}  -- keyed by series_name
-    local order  = {}  -- preserves insertion order for deterministic sorting
+    -- Build a filepath → read-time map so the series sort still favours
+    -- series you've actually been reading lately.
+    local rh        = getReadHistory()
+    local read_time = {}
     for _, entry in ipairs(rh.hist) do
-        local book = Repo.buildBook(entry.file)
+        local t = entry.time or 0
+        if t > (read_time[entry.file] or 0) then
+            read_time[entry.file] = t
+        end
+    end
+
+    local home       = G_reader_settings:readSetting("home_dir") or "/"
+    local depth      = G_reader_settings:readSetting("bookshelf_latest_walk_depth") or 3
+    local candidates = {}
+    walkBooks(home, depth, candidates)
+
+    local groups = {}  -- keyed by series_name
+    local order  = {}  -- preserves insertion order for deterministic tie-break
+    for _, c in ipairs(candidates) do
+        local book = Repo.buildBook(c.fp)
         if book and book.series_name then
             local key = book.series_name
             if not groups[key] then
@@ -233,8 +251,9 @@ function Repo.getSeriesGroups(limit)
                 groups[key]._seen[book.filepath] = true
                 groups[key].books[#groups[key].books + 1] = book
             end
-            if entry.time > groups[key].latest then
-                groups[key].latest = entry.time
+            local t = read_time[book.filepath] or c.mtime or 0
+            if t > groups[key].latest then
+                groups[key].latest = t
             end
         end
     end
@@ -265,17 +284,95 @@ end
 -- tokens auto-hide via Tokens.isEmpty. When the upstream API stabilises,
 -- update this single function — that's why the boundary is isolated here.
 
+-- enrichStats — fill the book record with reading-statistics fields.
+-- Queries the statistics plugin's SQLite DB directly: ReaderStatistics
+-- doesn't expose a clean filepath-keyed API, only an integer id_book and
+-- KeyValuePage-shaped output for its Reader-context UI. We compute the
+-- file's partial MD5 (the same key the stats plugin uses) and read the
+-- rolled-up fields from the `book` table plus a couple of derived stats
+-- from `page_stat_data` for days-reading / pages-per-day / speed.
 function Repo.enrichStats(book)
-    local req_ok, stats = pcall(require, "readerstatistics")
-    if not req_ok or not stats or not stats.getBookStat then return end
-    local call_ok, s = pcall(function() return stats:getBookStat(book.filepath) end)
-    if not call_ok or not s then return end
-    book.book_time_left_minutes = s.time_left_minutes
-    book.book_read_time_seconds = s.read_time_seconds
-    book.book_pages_read        = s.pages_read
-    book.days_reading_book      = s.days_reading
-    book.pages_per_day          = s.pages_per_day
-    book.speed_pph              = s.speed_pph
+    if not book or not book.filepath then return end
+    -- ReaderStatistics keys books by `partial_md5_checksum` stored in the
+    -- DocSettings sidecar (statistics/main.lua:2740). Read from there
+    -- first; fall back to recomputing only if the sidecar is missing.
+    local md5
+    local ok_ds, ds = pcall(function() return getDocSettings():open(book.filepath) end)
+    if ok_ds and ds and ds.readSetting then
+        md5 = ds:readSetting("partial_md5_checksum")
+    end
+    if not md5 then
+        local ok_util, util = pcall(require, "util")
+        if ok_util and util and util.partialMD5 then
+            md5 = util.partialMD5(book.filepath)
+        end
+    end
+    if not md5 then return end
+
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    local ok_sq, SQ3         = pcall(require, "lua-ljsqlite3/init")
+    if not (ok_ds and DataStorage and ok_sq and SQ3) then return end
+    local db_path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+
+    local ok_conn, conn = pcall(SQ3.open, db_path)
+    if not ok_conn or not conn then return end
+
+    -- Roll-ups from the book table (kept in sync by ReaderStatistics).
+    local id_book, total_read_time, total_read_pages, pages_total
+    local ok_q, err = pcall(function()
+        local stmt = conn:prepare(
+            "SELECT id, total_read_time, total_read_pages, pages "
+            .. "FROM book WHERE md5 = ? LIMIT 1")
+        local row = stmt:reset():bind(md5):step()
+        stmt:close()
+        if row then
+            id_book          = tonumber(row[1])
+            total_read_time  = tonumber(row[2]) or 0
+            total_read_pages = tonumber(row[3]) or 0
+            pages_total      = tonumber(row[4]) or 0
+        end
+    end)
+    if not ok_q or not id_book then conn:close(); return end
+
+    -- Days-reading + first-open + last-page from page_stat_data, same query
+    -- shape as ReaderStatistics:getBookStat.
+    local total_days, first_open
+    pcall(function()
+        local stmt = conn:prepare(
+            "SELECT count(*) FROM ("
+            .. "  SELECT strftime('%Y-%m-%d', start_time, 'unixepoch', 'localtime') AS d "
+            .. "  FROM page_stat_data WHERE id_book = ? GROUP BY d)")
+        local row = stmt:reset():bind(id_book):step()
+        stmt:close()
+        total_days = row and tonumber(row[1]) or 0
+    end)
+    pcall(function()
+        local stmt = conn:prepare(
+            "SELECT min(start_time) FROM page_stat_data WHERE id_book = ?")
+        local row = stmt:reset():bind(id_book):step()
+        stmt:close()
+        first_open = row and tonumber(row[1]) or nil
+    end)
+    conn:close()
+
+    -- Roll-up derived fields. Defensive math: pages_total/total_read_pages
+    -- can be 0 on a freshly-tracked book; guard divisions.
+    book.book_read_time_seconds = total_read_time
+    book.book_pages_read        = total_read_pages
+    book.days_reading_book      = total_days
+    if total_days > 0 then
+        book.pages_per_day = math.floor(total_read_pages / total_days + 0.5)
+    end
+    if total_read_time > 0 then
+        -- Speed in pages per hour.
+        book.speed_pph = math.floor(total_read_pages * 3600 / total_read_time + 0.5)
+    end
+    -- Time-left estimate: pages remaining × current avg time per page.
+    if total_read_pages > 0 and pages_total > 0 then
+        local pages_left = math.max(0, pages_total - total_read_pages)
+        local avg_per_page = total_read_time / total_read_pages
+        book.book_time_left_minutes = math.floor(pages_left * avg_per_page / 60 + 0.5)
+    end
 end
 
 return Repo

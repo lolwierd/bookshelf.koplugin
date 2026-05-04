@@ -162,17 +162,29 @@ end)
 
 test("getSeriesGroups: groups books by series_name, sorts by latest activity", function()
     package.loaded["readhistory"].hist = {
-        { file = "/dune.epub", time = 500 },
-        { file = "/foundation1.epub", time = 400 },
-        { file = "/foundation2.epub", time = 450 },
-        { file = "/standalone.epub", time = 100 },
+        { file = "/lib/dune.epub", time = 500 },
+        { file = "/lib/foundation1.epub", time = 400 },
+        { file = "/lib/foundation2.epub", time = 450 },
+        { file = "/lib/standalone.epub", time = 100 },
     }
     _G._test_bim_data = {
-        ["/dune.epub"]        = { title = "Dune", series = "Dune #1" },
-        ["/foundation1.epub"] = { title = "Foundation", series = "Foundation #1" },
-        ["/foundation2.epub"] = { title = "Foundation and Empire", series = "Foundation #2" },
-        ["/standalone.epub"]  = { title = "Standalone" },
+        ["/lib/dune.epub"]        = { title = "Dune", series = "Dune #1" },
+        ["/lib/foundation1.epub"] = { title = "Foundation", series = "Foundation #1" },
+        ["/lib/foundation2.epub"] = { title = "Foundation and Empire", series = "Foundation #2" },
+        ["/lib/standalone.epub"]  = { title = "Standalone" },
     }
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 1 }
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = (path == "/lib")
+            and { ".", "..", "dune.epub", "foundation1.epub", "foundation2.epub", "standalone.epub" }
+            or {}
+        local i = 0
+        return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(_fp, key)
+        if key == "mode" then return "file" end
+        if key == "modification" then return 0 end
+    end
     local groups = Repo.getSeriesGroups(10)
     -- Standalone should NOT appear (no series).
     assert(#groups == 2, "expected 2 series groups, got " .. #groups)
@@ -189,25 +201,18 @@ end)
 -- Task 2.5: enrichStats
 -- ============================================================================
 
-test("enrichStats: missing statistics plugin → no-op, no crash", function()
-    package.loaded["readerstatistics"] = nil
+-- enrichStats now queries the statistics plugin's SQLite DB directly
+-- (the plugin's own getBookStat is integer-id-keyed and returns
+-- KeyValuePage-shaped output, not what we need). Pure-Lua tests can't
+-- exercise SQLite without complex setup, so the contract test below just
+-- confirms the no-data path is a clean no-op.
+test("enrichStats: no md5 / no DB → no-op, no crash", function()
+    package.loaded["util"] = { partialMD5 = function() return nil end }
     local b = { filepath = "/x.epub" }
-    Repo.enrichStats(b)
-    -- We just want to confirm it doesn't crash; tokens auto-hide handles empties.
+    local ok = pcall(Repo.enrichStats, b)
+    assert(ok, "enrichStats let an error propagate")
     assert(b.book_time_left_minutes == nil)
-end)
-
-test("enrichStats: pulls minutes from ReaderStatistics public API", function()
-    package.loaded["readerstatistics"] = {
-        getBookStat = function(_self, fp)
-            return { time_left_minutes = 131, read_time_seconds = 7920, pages_read = 87 }
-        end
-    }
-    local b = { filepath = "/x.epub" }
-    Repo.enrichStats(b)
-    assert(b.book_time_left_minutes == 131)
-    assert(b.book_read_time_seconds == 7920)
-    assert(b.book_pages_read == 87)
+    assert(b.book_read_time_seconds == nil)
 end)
 
 -- ============================================================================
@@ -269,26 +274,34 @@ test("getLatest: unreadable directory does not crash the walk", function()
     assert(latest[1].title == "OK")
 end)
 
-test("enrichStats: throwing getBookStat does not propagate", function()
-    package.loaded["readerstatistics"] = {
-        getBookStat = function(_self, _fp) error("simulated SQLite failure") end
-    }
+test("enrichStats: missing util.partialMD5 → no-op", function()
+    package.loaded["util"] = nil
     local b = { filepath = "/x.epub" }
     local ok = pcall(Repo.enrichStats, b)
     assert(ok, "enrichStats let an error propagate")
-    assert(b.book_time_left_minutes == nil, "no fields should be set after a failed call")
+    assert(b.book_time_left_minutes == nil)
 end)
 
 test("getSeriesGroups: dedupes books across multiple history entries for the same filepath", function()
     package.loaded["readhistory"].hist = {
-        { file = "/foundation1.epub", time = 500 },
-        { file = "/foundation1.epub", time = 400 },  -- same book, opened earlier
-        { file = "/foundation2.epub", time = 300 },
+        { file = "/lib/foundation1.epub", time = 500 },
+        { file = "/lib/foundation1.epub", time = 400 },  -- same book, opened earlier
+        { file = "/lib/foundation2.epub", time = 300 },
     }
     _G._test_bim_data = {
-        ["/foundation1.epub"] = { title = "Foundation",            series = "Foundation #1" },
-        ["/foundation2.epub"] = { title = "Foundation and Empire", series = "Foundation #2" },
+        ["/lib/foundation1.epub"] = { title = "Foundation",            series = "Foundation #1" },
+        ["/lib/foundation2.epub"] = { title = "Foundation and Empire", series = "Foundation #2" },
     }
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 1 }
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = (path == "/lib") and { ".", "..", "foundation1.epub", "foundation2.epub" } or {}
+        local i = 0
+        return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(_fp, key)
+        if key == "mode" then return "file" end
+        if key == "modification" then return 0 end
+    end
     local groups = Repo.getSeriesGroups(10)
     assert(#groups == 1, "expected 1 group, got " .. #groups)
     assert(#groups[1].books == 2, "expected 2 unique books in Foundation, got " .. #groups[1].books)
