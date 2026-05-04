@@ -560,12 +560,6 @@ end
 -- that froze the UI for several seconds on fat CBRs and the visual gain
 -- wasn't worth it.
 function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_h, PAD)
-    -- The cached _preview_book carries a cover_bb that the *previous* hero
-    -- paint freed (ImageWidget has image_disposable=true on the default
-    -- path — the BIM bb is treated as a fresh-from-zstd one-shot copy).
-    -- Re-fetch from filepath every _buildHero so the new SpineWidget reads
-    -- a live bb, not freed memory. Without this, paginating away from the
-    -- previewed book corrupts the hero on subsequent rebuilds.
     local current
     if self._preview_book and self._preview_book.filepath then
         current = Repo.buildBook(self._preview_book.filepath) or self._preview_book
@@ -574,10 +568,6 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
         current = Repo.getCurrent()
     end
     if current then Repo.enrichStats(current) end
-    local lines = G_reader_settings:readSetting("bookshelf_hero_lines") or {
-        "[if:page_num]Page %page_num / %page_count[/if]",
-        "[if:book_time_left]%book_time_left LEFT[/if]",
-    }
     return HeroCard:new{
         book         = current,
         width        = content_w,
@@ -585,7 +575,6 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
         cover_w      = hero_cover_w,
         cover_h      = hero_cover_h,
         pad          = PAD,
-        lines        = lines,
         device_state = self:_buildDeviceState(),
         on_tap       = function(b) self:_openBook(b) end,
         on_hold      = function(b) self:_openBookMenu(b) end,
