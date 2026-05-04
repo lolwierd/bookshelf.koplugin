@@ -121,6 +121,24 @@ local function toggleBarToken(dialog, draft, applyLivePreview)
     applyLivePreview()
 end
 
+-- Soft-imports bookends's icon library and shows the picker. Returns
+-- false if bookends is missing (caller can hide the button entirely).
+local function showIconsLibrary(dialog)
+    local ok, IconsLibrary = pcall(require, "menu.icons_library")
+    if not ok or not IconsLibrary or not IconsLibrary.show then return false end
+    IconsLibrary:show(function(value)
+        if dialog and dialog.addTextToInput then
+            pcall(function() dialog:addTextToInput(value) end)
+        end
+    end)
+    return true
+end
+
+local function bookendsIconsAvailable()
+    local ok, IconsLibrary = pcall(require, "menu.icons_library")
+    return ok and IconsLibrary and IconsLibrary.show ~= nil
+end
+
 local LineEditor = {}
 
 -- show(region_key, bw, settings_module)
@@ -274,8 +292,8 @@ function LineEditor.show(region_key, bw, settings_module)
             rows[#rows + 1] = bar_row
         end
 
-        -- Row 3: action row (existing).
-        rows[#rows + 1] = {
+        -- Row 3: action row.
+        local action_row = {
             {
                 text     = _("Cancel"),
                 id       = "close",
@@ -295,33 +313,43 @@ function LineEditor.show(region_key, bw, settings_module)
                     end
                 end,
             },
-            {
-                text     = _("Default"),
-                callback = function()
-                    local d = Regions.DEFAULTS[region_key]
-                    draft.template  = d.template
-                    draft.font_face = d.font_face
-                    draft.font_size = d.font_size
-                    draft.bold      = d.bold
-                    draft.uppercase = d.uppercase
-                    draft.alignment = d.alignment
-                    draft.bar_height= d.bar_height
-                    draft.bar_style = d.bar_style
-                    if dialog and dialog.setInputText then dialog:setInputText(d.template) end
-                    applyLivePreview()
-                    if dialog then dialog:reinit() end
-                end,
-            },
-            {
-                text             = _("Save"),
-                is_enter_default = true,
-                callback         = function()
-                    commitText()
-                    Regions.write(region_key, draft)
-                    UIManager:close(dialog)
-                end,
-            },
         }
+        if bookendsIconsAvailable() then
+            action_row[#action_row + 1] = {
+                text     = _("Icons\xE2\x80\xA6"),
+                callback = function()
+                    if dialog then dialog:onCloseKeyboard() end
+                    showIconsLibrary(dialog)
+                end,
+            }
+        end
+        action_row[#action_row + 1] = {
+            text     = _("Default"),
+            callback = function()
+                local d = Regions.DEFAULTS[region_key]
+                draft.template  = d.template
+                draft.font_face = d.font_face
+                draft.font_size = d.font_size
+                draft.bold      = d.bold
+                draft.uppercase = d.uppercase
+                draft.alignment = d.alignment
+                draft.bar_height= d.bar_height
+                draft.bar_style = d.bar_style
+                if dialog and dialog.setInputText then dialog:setInputText(d.template) end
+                applyLivePreview()
+                if dialog then dialog:reinit() end
+            end,
+        }
+        action_row[#action_row + 1] = {
+            text             = _("Save"),
+            is_enter_default = true,
+            callback         = function()
+                commitText()
+                Regions.write(region_key, draft)
+                UIManager:close(dialog)
+            end,
+        }
+        rows[#rows + 1] = action_row
         return rows
     end
 
