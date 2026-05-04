@@ -93,6 +93,36 @@ local function showFontPicker(current_face, default_face, on_select)
     UIManager:show(menu, nil, nil, x, y)
 end
 
+local HeroBar = require("hero_bar")
+
+-- Returns true iff the current dialog text contains the %bar token.
+local function hasBarToken(dialog)
+    if not dialog then return false end
+    local t = dialog:getInputText() or ""
+    return t:find("%%bar") ~= nil
+end
+
+-- Insert / remove %bar from the dialog text. Collapses surrounding
+-- whitespace so toggling on and off doesn't accumulate spaces.
+local function toggleBarToken(dialog, draft, applyLivePreview)
+    if not dialog then return end
+    local text = dialog:getInputText() or ""
+    if text:find("%%bar") then
+        text = text:gsub("%s*%%bar%s*", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    else
+        if text == "" then
+            text = "%bar"
+        else
+            text = text .. " %bar"
+        end
+    end
+    if dialog._input_widget and dialog._input_widget.setText then
+        dialog._input_widget:setText(text)
+    end
+    draft.template = text
+    applyLivePreview()
+end
+
 local LineEditor = {}
 
 -- show(region_key, bw, settings_module)
@@ -200,7 +230,53 @@ function LineEditor.show(region_key, bw, settings_module)
 
         rows[#rows + 1] = style_row
 
-        -- Row 2: action row (existing).
+        -- Row 2: progress-region-only bar controls.
+        if region_key == "progress" then
+            local bar_row = {
+                {
+                    text_func = function()
+                        if not hasBarToken(dialog) then return _("Bar style") end
+                        return _("Bar: ") .. (draft.bar_style or "bordered")
+                    end,
+                    enabled_func = function() return hasBarToken(dialog) end,
+                    callback = function()
+                        if dialog then dialog:onCloseKeyboard() end
+                        local styles = HeroBar.availableStyles()
+                        draft.bar_style = cycleNext(styles, draft.bar_style or "bordered")
+                        applyLivePreview()
+                        if dialog then dialog:reinit() end
+                    end,
+                },
+                {
+                    text_func = function()
+                        return hasBarToken(dialog) and _("- Bar") or _("+ Bar")
+                    end,
+                    callback = function()
+                        if dialog then dialog:onCloseKeyboard() end
+                        toggleBarToken(dialog, draft, applyLivePreview)
+                        if dialog then dialog:reinit() end
+                    end,
+                },
+                {
+                    text_func = function()
+                        if not hasBarToken(dialog) then return _("Bar height") end
+                        return _("Height: ") .. (draft.bar_height or _("auto"))
+                    end,
+                    enabled_func = function() return hasBarToken(dialog) end,
+                    callback = function()
+                        if dialog then dialog:onCloseKeyboard() end
+                        showSizeNudge(
+                            draft.bar_height or 14,
+                            14,
+                            function(val) draft.bar_height = val; applyLivePreview() end,
+                            function() if dialog then dialog:reinit() end end)
+                    end,
+                },
+            }
+            rows[#rows + 1] = bar_row
+        end
+
+        -- Row 3: action row (existing).
         rows[#rows + 1] = {
             {
                 text     = _("Cancel"),
