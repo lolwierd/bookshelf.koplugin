@@ -85,14 +85,9 @@ local function resolveOne(key, raw)
     local out = shallowCopy(default) or {}
     if type(raw) == "table" then
         for k, v in pairs(raw) do
-            -- Only accept strings, numbers, booleans — reject malformed values.
-            local t = type(v)
-            if t == "string" or t == "number" or t == "boolean" then
-                if k == "template" and t ~= "string" then
-                    -- fall through to default
-                else
-                    out[k] = v
-                end
+            local vt = type(v)
+            if vt == "string" or vt == "number" or vt == "boolean" then
+                out[k] = v
             end
         end
         -- Reject malformed template (must be a string).
