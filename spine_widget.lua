@@ -26,10 +26,11 @@ local InputContainer  = require("ui/widget/container/inputcontainer")
 local Screen          = require("device").screen
 
 -- Shadow geometry shared by both render paths.
-local SHADOW_OFFSET  = Screen:scaleBySize(4)        -- shadow offset in dp
-local CARD_RADIUS    = Screen:scaleBySize(4)        -- rounded corner radius
-local CARD_BORDER    = Screen:scaleBySize(1)        -- 1dp border on the card
-local SHADOW_GRAY    = Blitbuffer.gray(0.55)        -- grey level for the shadow
+local SHADOW_OFFSET   = Screen:scaleBySize(4)       -- shadow offset in dp
+local CARD_RADIUS     = Screen:scaleBySize(4)       -- rounded corner radius
+local CARD_BORDER     = Screen:scaleBySize(1)       -- 1dp border on the card
+local SELECTED_BORDER = Screen:scaleBySize(3)       -- 3dp thick border when selected
+local SHADOW_GRAY     = Blitbuffer.gray(0.55)       -- grey level for the shadow
 
 -- A simple Widget subclass that paints a rounded rectangle in a fixed grey.
 -- Used as the shadow layer behind every cover. Has its own dimen so
@@ -43,6 +44,28 @@ function ShadowRect:init()
 end
 function ShadowRect:paintTo(bb, x, y)
     bb:paintRoundedRect(x, y, self.width, self.height, SHADOW_GRAY, CARD_RADIUS)
+end
+
+-- Border-only overlay used as the selected-state cue. Sits ON TOP of the
+-- cover in an OverlapGroup, painting nothing but a thick rounded border at
+-- the cover's perimeter. The cover image's pixel position and size are
+-- unchanged between selected/unselected — only the perimeter pixels differ
+-- — so e-ink doesn't redraw the cover bitmap, just toggles the frame.
+local BorderOverlay = Widget:extend{
+    width     = nil,
+    height    = nil,
+    thickness = nil,
+    radius    = 0,
+    color     = nil,    -- defaults to COLOR_BLACK
+}
+function BorderOverlay:init()
+    self.dimen = Geom:new{ w = self.width, h = self.height }
+end
+function BorderOverlay:paintTo(bb, x, y)
+    bb:paintBorder(x, y, self.width, self.height,
+                   self.thickness,
+                   self.color or Blitbuffer.COLOR_BLACK,
+                   self.radius or 0, true)
 end
 
 -- A card that paints its inner widget (typically an ImageWidget for the
@@ -191,12 +214,13 @@ local SpineWidget = InputContainer:extend{
     height      = nil,
     on_tap      = nil,
     on_hold     = nil,
-    -- When true, the card paints WITHOUT its drop shadow and shifts
-    -- down + right by SHADOW_OFFSET into where the shadow normally
-    -- sits — visually it has "dropped" into the page (pressed-in
-    -- metaphor). Set by ShelfRow when the spine's filepath matches
-    -- the BookshelfWidget's preview filepath. Border stays thin in
-    -- both states; the position shift is the selection cue.
+    -- When true, the card paints WITHOUT its drop shadow and gains a
+    -- thick black border at the cover perimeter. The cover image's
+    -- pixel position and size are identical to the unselected state —
+    -- only the perimeter pixels change — so the e-ink controller
+    -- doesn't redraw the cover bitmap on (de)selection. Set by
+    -- ShelfRow when the spine's filepath matches the BookshelfWidget's
+    -- preview filepath.
     is_selected = false,
     -- Cover rendering mode. Mutually exclusive:
     --   cover_fill   = true (default)  → stretch to fill (object-fit: fill)
@@ -252,21 +276,24 @@ end
 function SpineWidget:_renderShadowedCard(inner)
     local card_w = self.width  - SHADOW_OFFSET
     local card_h = self.height - SHADOW_OFFSET
-    -- Selected state: skip the shadow AND shift the card down + right
-    -- by SHADOW_OFFSET so it occupies the position the shadow normally
-    -- has. Visually the card has "dropped" into the page — clearer
-    -- pressed-in metaphor than just removing the shadow with the card
-    -- staying put. Same FrameContainer-padding trick the shadow_wrapper
-    -- uses, applied to the cover instead.
+    -- Selected state: skip the shadow, keep the cover at exactly the
+    -- same (0,0)–(card_w, card_h) position as unselected, and overlay
+    -- a thick black border at the cover perimeter. The cover image's
+    -- pixel position and size do not change between states — the
+    -- e-ink diff is only the perimeter pixels (thin border → thick
+    -- border) plus the shadow's L-shape disappearing, which avoids
+    -- the jarring full-cover redraw a position-shift causes.
     if self.is_selected then
-        local shifted = FrameContainer:new{
-            bordersize   = 0,
-            padding      = 0,
-            padding_top  = SHADOW_OFFSET,
-            padding_left = SHADOW_OFFSET,
+        return OverlapGroup:new{
+            dimen = Geom:new{ w = self.width, h = self.height },
             inner,
-        }
-        return shifted, card_w, card_h
+            BorderOverlay:new{
+                width     = card_w,
+                height    = card_h,
+                thickness = SELECTED_BORDER,
+                radius    = CARD_RADIUS,
+            },
+        }, card_w, card_h
     end
     local shadow_wrapper = FrameContainer:new{
         bordersize   = 0,
@@ -284,9 +311,10 @@ end
 
 function SpineWidget:_renderCover(bb)
     local card_w, card_h = self.width - SHADOW_OFFSET, self.height - SHADOW_OFFSET
-    -- Border stays thin in both states. Selection cue is the position
-    -- shift in _renderShadowedCard (card drops into the shadow slot)
-    -- rather than a thicker border.
+    -- The card-perimeter border stays thin in both states so the cover
+    -- image's pixel position and size are identical between selected
+    -- and unselected. The selection cue is a thicker BorderOverlay
+    -- painted on TOP in _renderShadowedCard.
     local border = CARD_BORDER
     local img_w = card_w - 2 * border
     local img_h = card_h - 2 * border
@@ -376,21 +404,25 @@ function SpineWidget:_renderCover(bb)
         cover_inner = ImageWidget:new(img_args)
     end
 
-    local cover = RoundedCornerCard:new{
-        inner           = cover_inner,
-        width           = card_w,
-        height          = card_h,
-        radius          = CARD_RADIUS,
-        border_size     = border,
+    local cover_args = {
+        inner       = cover_inner,
+        width       = card_w,
+        height      = card_h,
+        radius      = CARD_RADIUS,
+        border_size = border,
+    }
+    if not self.is_selected then
         -- The card sits at (0, 0) in the OverlapGroup; the shadow paints
         -- at (SHADOW_OFFSET, SHADOW_OFFSET) with the same w/h and same
         -- radius. Pass these so the corner mask can restore shadow grey
-        -- where the shadow would otherwise show through.
-        shadow_color    = SHADOW_GRAY,
-        shadow_offset_x = SHADOW_OFFSET,
-        shadow_offset_y = SHADOW_OFFSET,
-        shadow_radius   = CARD_RADIUS,
-    }
+        -- where the shadow would otherwise show through. When selected
+        -- there's no shadow, so the BR corner falls back to bg-white.
+        cover_args.shadow_color    = SHADOW_GRAY
+        cover_args.shadow_offset_x = SHADOW_OFFSET
+        cover_args.shadow_offset_y = SHADOW_OFFSET
+        cover_args.shadow_radius   = CARD_RADIUS
+    end
+    local cover = RoundedCornerCard:new(cover_args)
     return (self:_renderShadowedCard(cover))
 end
 
