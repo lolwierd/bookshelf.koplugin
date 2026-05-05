@@ -185,21 +185,18 @@ function RoundedCornerCard:paintTo(bb, x, y)
     end
 end
 
--- Border thickness used when the spine is the currently-previewed book.
--- Visibly thicker than CARD_BORDER without overwhelming the cover. Image
--- dimensions are recomputed against the active border so the cover
--- shrinks slightly under the thicker frame rather than being painted over.
-local CARD_BORDER_SELECTED = Screen:scaleBySize(3)
-
 local SpineWidget = InputContainer:extend{
     book        = nil,
     width       = nil,
     height      = nil,
     on_tap      = nil,
     on_hold     = nil,
-    -- When true, paint the card with a thicker black border and
-    -- correspondingly-shrunk inner image. Set by ShelfRow when the
-    -- spine's filepath matches the BookshelfWidget's preview filepath.
+    -- When true, the card paints WITHOUT its drop shadow and shifts
+    -- down + right by SHADOW_OFFSET into where the shadow normally
+    -- sits — visually it has "dropped" into the page (pressed-in
+    -- metaphor). Set by ShelfRow when the spine's filepath matches
+    -- the BookshelfWidget's preview filepath. Border stays thin in
+    -- both states; the position shift is the selection cue.
     is_selected = false,
     -- Cover rendering mode. Mutually exclusive:
     --   cover_fill   = true (default)  → stretch to fill (object-fit: fill)
@@ -255,13 +252,21 @@ end
 function SpineWidget:_renderShadowedCard(inner)
     local card_w = self.width  - SHADOW_OFFSET
     local card_h = self.height - SHADOW_OFFSET
-    -- Selected state: skip the drop shadow. The thicker border combined
-    -- with no shadow reads as "pressed-in button" — the card has lost
-    -- its lift off the page. The slot's bottom-right SHADOW_OFFSET strip
-    -- stays paper-coloured (no shadow to fill it), which sells the
-    -- pressed-in metaphor.
+    -- Selected state: skip the shadow AND shift the card down + right
+    -- by SHADOW_OFFSET so it occupies the position the shadow normally
+    -- has. Visually the card has "dropped" into the page — clearer
+    -- pressed-in metaphor than just removing the shadow with the card
+    -- staying put. Same FrameContainer-padding trick the shadow_wrapper
+    -- uses, applied to the cover instead.
     if self.is_selected then
-        return inner, card_w, card_h
+        local shifted = FrameContainer:new{
+            bordersize   = 0,
+            padding      = 0,
+            padding_top  = SHADOW_OFFSET,
+            padding_left = SHADOW_OFFSET,
+            inner,
+        }
+        return shifted, card_w, card_h
     end
     local shadow_wrapper = FrameContainer:new{
         bordersize   = 0,
@@ -279,11 +284,10 @@ end
 
 function SpineWidget:_renderCover(bb)
     local card_w, card_h = self.width - SHADOW_OFFSET, self.height - SHADOW_OFFSET
-    local border = self.is_selected and CARD_BORDER_SELECTED or CARD_BORDER
-    -- Image fills the inside of the card border. RoundedCornerCard then
-    -- masks the four corners and draws the rounded border on top. Image
-    -- dimensions track the active border so the selected state shrinks
-    -- the cover slightly rather than the border encroaching on it.
+    -- Border stays thin in both states. Selection cue is the position
+    -- shift in _renderShadowedCard (card drops into the shadow slot)
+    -- rather than a thicker border.
+    local border = CARD_BORDER
     local img_w = card_w - 2 * border
     local img_h = card_h - 2 * border
     local bb_w  = bb:getWidth()
@@ -447,7 +451,7 @@ function SpineWidget:_renderFallback()
     -- the white page. The inner CenterContainer is sized to (card_w − 2*border,
     -- card_h − 2*border) so the FrameContainer's outer size stays exactly at
     -- card_w × card_h (matches the cover render path).
-    local border = self.is_selected and CARD_BORDER_SELECTED or CARD_BORDER
+    local border = CARD_BORDER
     local card = FrameContainer:new{
         bordersize = border,
         radius     = CARD_RADIUS,
