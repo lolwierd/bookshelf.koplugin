@@ -120,9 +120,9 @@ function MagazinePolygon:paintTo(bb, x, y)
     -- Round bottom corners by knocking out the bottom-left/-right corner
     -- squares with PAGE_BG. Same arithmetic dx² + dy² > r² test the
     -- SpineWidget's RoundedCornerCard uses for consistency.
-    local r = self.radius or 0
+    local r    = self.radius or 0
+    local r_sq = r * r
     if r > 0 then
-        local r_sq = r * r
         for i = 0, r - 1 do
             local dy = h - r + i           -- row inside the corner square
             local i_sq = (i + 1) * (i + 1) -- y² distance from corner-arc centre
