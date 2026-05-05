@@ -30,7 +30,13 @@ local BookshelfWidget = InputContainer:extend{
     name = "bookshelf",
     -- Internal state.
     chip             = "recent",
-    _expanded_series = nil,
+    -- Drill-down path: empty array = top level (chips list shown); non-empty
+    -- means the chip strip is in breadcrumb mode and shelf data is scoped
+    -- to the deepest entry. Each entry: { kind, label, payload }.
+    -- Today only `kind = "series"` is produced (from _expandSeries / now
+    -- _drillIntoSeries); the model is array-shaped so future Folders /
+    -- Tags / Authors chips can drill multiple levels.
+    _drilldown_path  = {},
 }
 
 function BookshelfWidget:init()
@@ -240,25 +246,69 @@ function BookshelfWidget:_rebuild()
     }
 
     -- ── Chip strip ────────────────────────────────────────────────────────────
+    -- Two modes share the same widget: chips-list at top level, or a
+    -- breadcrumb when the user has drilled into a chip-level item.
+    -- The list is filtered against bookshelf_chips_disabled so the user
+    -- can hide chips they don't use (e.g. Favourites if they don't
+    -- favourite books).
+    local CHIP_LABELS = {
+        recent = "Recent", latest = "Latest", series = "Series", favorites = "Favourites",
+    }
+    local CHIP_ORDER = { "recent", "latest", "series", "favorites" }
+    local disabled_set = G_reader_settings:readSetting("bookshelf_chips_disabled") or {}
+    local active_chips = {}
+    for _, key in ipairs(CHIP_ORDER) do
+        if not disabled_set[key] then
+            active_chips[#active_chips + 1] = { key = key, label = CHIP_LABELS[key] }
+        end
+    end
+    -- Defensive: the user can disable every chip via the settings menu.
+    -- Fall back to the canonical four so we never render an empty strip;
+    -- the next time settings change a chip is re-enabled this resolves.
+    if #active_chips == 0 then
+        for _, key in ipairs(CHIP_ORDER) do
+            active_chips[#active_chips + 1] = { key = key, label = CHIP_LABELS[key] }
+        end
+    end
+    -- If the currently-selected chip was just disabled, switch to the
+    -- first surviving chip so render doesn't try to fetch from a
+    -- disabled chip's data source.
+    local active_in_set = false
+    for _, c in ipairs(active_chips) do
+        if c.key == self.chip then active_in_set = true; break end
+    end
+    if not active_in_set then
+        self.chip = active_chips[1].key
+        G_reader_settings:saveSetting("bookshelf_active_chip", self.chip)
+    end
+    local breadcrumb_path = nil
+    if #self._drilldown_path > 0 then
+        breadcrumb_path = {}
+        for i, entry in ipairs(self._drilldown_path) do
+            breadcrumb_path[i] = { label = entry.label }
+        end
+    end
     local chips = ChipStrip:new{
-        chips = {
-            { key = "recent",    label = "Recent"  },
-            { key = "latest",    label = "Latest"  },
-            { key = "series",    label = "Series"  },
-            { key = "favorites", label = "Favourites" },
-        },
-        active   = self.chip,
-        width    = content_w,
-        height   = chip_h,
+        chips             = active_chips,
+        active            = self.chip,
+        width             = content_w,
+        height            = chip_h,
+        breadcrumb_path   = breadcrumb_path,
+        chip_pill_label   = CHIP_LABELS[self.chip] or self.chip,
         on_change = function(key)
-            -- Reset expanded series, preview, and page when switching chips.
-            self._expanded_series = nil
-            self._preview_book    = nil
-            self.chip             = key
-            self.page             = 1
+            -- Switch chips → reset drill path, preview, page.
+            self._drilldown_path = {}
+            self._preview_book   = nil
+            self.chip            = key
+            self.page            = 1
             G_reader_settings:saveSetting("bookshelf_active_chip", key)
             self:_rebuild()
             UIManager:setDirty(self, "ui")
+        end,
+        on_breadcrumb = function(depth)
+            -- depth 0 = chip pill (back to top level for this chip).
+            -- depth N = pop the path so the Nth crumb is the deepest.
+            self:_drillBackTo(depth)
         end,
     }
 
@@ -425,15 +475,16 @@ end
 -- _fetchChipItems(n)
 -- Returns up to n items for the current chip (or the expanded-series flat list).
 function BookshelfWidget:_fetchChipItems(n)
-    -- When a series is expanded, show that series' books as flat spine widgets.
-    -- Rebuild from filepaths so each render gets a fresh cover_bb — the cached
-    -- Book objects on self._expanded_series.books had their bbs freed by the
-    -- prior SeriesStack render (image_disposable=true on the shelf path),
-    -- and reusing them would dereference freed memory and SEGV.
-    if self._expanded_series then
+    -- Drill-down: when the path tip is a series, show that series' books
+    -- as flat spine widgets. Rebuild from filepaths so each render gets
+    -- a fresh cover_bb — the cached Book objects on .books had their
+    -- bbs freed by the prior SeriesStack render (image_disposable=true
+    -- on the shelf path), and reusing them would dereference freed
+    -- memory and SEGV.
+    local tip = self._drilldown_path[#self._drilldown_path]
+    if tip and tip.kind == "series" then
         local fresh = {}
-        for _, b in ipairs(self._expanded_series.books) do
-            -- Shelf-rendering path: BIM-only meta build (no DocSettings).
+        for _, b in ipairs(tip.payload.books) do
             local nb = b.filepath and Repo.buildBookMeta(b.filepath) or b
             fresh[#fresh + 1] = nb
         end
@@ -448,8 +499,9 @@ end
 
 -- _chipLabel()  — human-readable shelf heading for the active chip.
 function BookshelfWidget:_chipLabel()
-    if self._expanded_series then
-        return (self._expanded_series.series_name or "Series")
+    local tip = self._drilldown_path[#self._drilldown_path]
+    if tip then
+        return tip.label or "Drill-down"
     end
     local labels = {
         recent    = "Recently read",
@@ -542,9 +594,9 @@ end
 function BookshelfWidget:_openBook(book)
     if not book or not book.filepath then return end
     -- Returning from a book should land on the chip-level view, not in the
-    -- middle of an expanded series.
-    self._expanded_series = nil
-    self._preview_book    = nil
+    -- middle of a drilled-in series / folder / tag.
+    self._drilldown_path = {}
+    self._preview_book   = nil
     -- Suspend the status timer + drop any pending debounced repaint
     -- before the reader takes over. Keeping the minute heartbeat alive
     -- under the reader is wasted Lua wakeups — battery matters most
@@ -633,30 +685,13 @@ function BookshelfWidget:_buildPaginationFooter(content_w, label_h, total_pages)
     local Button         = require("ui/widget/button")
     local HorizontalSpan = require("ui/widget/horizontalspan")
     local bw = self
-    if self._expanded_series then
-        local SeriesLabel = InputContainer:extend{}
-        function SeriesLabel:init()
-            self.dimen = Geom:new{ w = content_w, h = label_h }
-            self[1] = CenterContainer:new{
-                dimen = self.dimen,
-                TextWidget:new{
-                    text = "\xe2\x86\x90  " .. (bw._expanded_series.series_name or "Series"),
-                    face = Font:getFace("infofont", 14),
-                    bold = true,
-                },
-            }
-            self.ges_events = {
-                Tap = { GestureRange:new{ ges = "tap", range = self.dimen } },
-            }
-        end
-        function SeriesLabel:onTap()
-            bw._expanded_series = nil
-            bw:_rebuild()
-            UIManager:setDirty(bw, "ui")
-            return true
-        end
-        return SeriesLabel:new{}
-    end
+    -- The footer is always pagination chevrons + page label, regardless
+    -- of drill state. Earlier the footer doubled as a "← back to chips"
+    -- label inside an expanded series, but that hijacked the only
+    -- pagination affordance — series with >8 books couldn't be paged
+    -- through. Back-out now lives in the chip strip's breadcrumb mode
+    -- (tap the chip pill / a crumb), freeing this footer for chevrons
+    -- everywhere.
     local chev_size = Screen:scaleBySize(32)
     local nav_span  = Screen:scaleBySize(32)
     local function go(p)
@@ -1029,7 +1064,10 @@ end
 -- page (swipe content leftward), east = previous page. Series-expanded
 -- view doesn't paginate (a series usually fits in one shelf-pair).
 function BookshelfWidget:onSwipeNextPage()
-    if self._expanded_series then return false end
+    -- Pagination works inside drilled views too — a series / folder with
+    -- >8 books needs to page through. Earlier this early-returned on
+    -- _expanded_series because the footer label was hijacked for back;
+    -- breadcrumb mode in the chip strip handles back now.
     local total = self._total_pages or 1
     if self.page < total then
         self.page = self.page + 1
@@ -1038,7 +1076,6 @@ function BookshelfWidget:onSwipeNextPage()
     return true
 end
 function BookshelfWidget:onSwipePrevPage()
-    if self._expanded_series then return false end
     if self.page > 1 then
         self.page = self.page - 1
         self:_swapShelvesInPlace()
@@ -1213,13 +1250,42 @@ end
 
 -- ─── Series expand-in-place (Task 6.3) ───────────────────────────────────────
 
--- _expandSeries(series)  — replace the current shelf-pair with the series'
--- books as flat spine widgets. Tapping any chip resets this state.
-function BookshelfWidget:_expandSeries(series)
-    if not series then return end
-    self._expanded_series = series
+-- _drillInto(entry) — push a drill-down level. Each entry has the shape
+--   { kind = "series" | "folder" | ..., label = "...", payload = ... }
+-- The chip strip enters breadcrumb mode and _fetchChipItems scopes to
+-- the path's tip. Pagination + preview reset on every drill so you land
+-- on page 1 and the hero re-derives.
+function BookshelfWidget:_drillInto(entry)
+    if not entry or not entry.kind then return end
+    self._drilldown_path[#self._drilldown_path + 1] = entry
+    self._preview_book = nil
+    self.page          = 1
     self:_rebuild()
     UIManager:setDirty(self, "ui")
+end
+
+-- _drillBackTo(depth) — pop the drill path so the new tip is at index
+-- `depth`. depth 0 = back to top level (chips list); depth 1 = keep
+-- only the first crumb; etc.
+function BookshelfWidget:_drillBackTo(depth)
+    depth = math.max(0, depth or 0)
+    while #self._drilldown_path > depth do
+        self._drilldown_path[#self._drilldown_path] = nil
+    end
+    self._preview_book = nil
+    self.page          = 1
+    self:_rebuild()
+    UIManager:setDirty(self, "ui")
+end
+
+-- Convenience for the existing series-expand call sites.
+function BookshelfWidget:_expandSeries(series)
+    if not series or not series.series_name then return end
+    self:_drillInto{
+        kind    = "series",
+        label   = series.series_name,
+        payload = series,
+    }
 end
 
 -- ─── Dismiss / passthrough ───────────────────────────────────────────────────

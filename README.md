@@ -39,7 +39,9 @@ Latest, Series, and Favourites.
 └──────────────────────────────────────┘
 ```
 
-Tap any spine to open that book. Long-press a spine for options (favourite, info, remove from history). Tap the shelf label to open the full paginated library view for the active chip. On the **Series** chip, tap a series stack to expand it; tap the back label to collapse.
+Tap any spine to open that book. Long-press a spine for options (favourite, info, remove from history). On the **Series** chip, tap a series stack to drill in — the chip strip morphs into a breadcrumb (`[Series] > Series Title`) and the shelf shows that series' books. Tap the chip pill or any crumb to step back out. Pagination chevrons stay available inside drilled views, so series with more than 8 books page through normally.
+
+The chip list itself can be customised: **FileManager menu → Bookshelf → Edit shelf tabs** opens a 4-row submenu with checkboxes per chip. Untick the ones you don't use.
 
 ---
 
@@ -212,6 +214,7 @@ Bookshelf-specific keys are prefixed `bookshelf_`:
 | `bookshelf_hero_regions` | Per-region overrides (sparse). One entry per region (`status` / `title` / `author` / `description` / `progress`) with a subset of `template`, `font_face`, `font_size`, `bold`, `uppercase`, `alignment`, `disabled`, `bar_style`, `bar_height` — anything not present falls through to defaults. |
 | `bookshelf_font_scale` | Global zoom for hero text (50–200%). |
 | `bookshelf_active_chip` | Last-selected chip (`recent` / `latest` / `series` / `favorites`). |
+| `bookshelf_chips_disabled` | Sparse map of chip keys the user has hidden via "Edit shelf tabs" (e.g. `{ favorites = true }`). Absent = all chips enabled. |
 | `bookshelf_latest_walk_depth` | How deep the **Latest** chip scans your library. |
 | `bookshelf_dev_branch` | Branch name for in-app dev-branch installs; empty = stable releases only. |
 | `bookshelf_last_install_source` | `release` or `branch:<name>` — set automatically by the in-app updater. |

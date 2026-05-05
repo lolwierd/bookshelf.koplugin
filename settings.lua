@@ -367,6 +367,52 @@ function Settings:_editHeroRegion(key, touchmenu_instance)
     LineEditor.show(key, self._bw, self, touchmenu_instance)
 end
 
+-- _chipsSubItems() — drill-down for "Edit shelf tabs". One row per
+-- chip with a checkbox; tapping toggles the chip's disabled flag and
+-- (if the bookshelf is live) rebuilds the strip. The home screen
+-- defensively shows all four chips if a user disables every one, so
+-- this menu can never lock the user out.
+function Settings:_chipsSubItems()
+    local CHIP_ORDER  = { "recent", "latest", "series", "favorites" }
+    local CHIP_LABELS = {
+        recent    = _("Recent"),
+        latest    = _("Latest"),
+        series    = _("Series"),
+        favorites = _("Favourites"),
+    }
+    local items = {}
+    for _i, key in ipairs(CHIP_ORDER) do
+        items[#items + 1] = {
+            text           = CHIP_LABELS[key],
+            keep_menu_open = true,
+            checked_func = function()
+                local set = G_reader_settings:readSetting("bookshelf_chips_disabled") or {}
+                return not set[key]
+            end,
+            callback = function(touchmenu_instance)
+                local set = G_reader_settings:readSetting("bookshelf_chips_disabled") or {}
+                if set[key] then set[key] = nil else set[key] = true end
+                -- If the user has cleared every override, drop the
+                -- whole key — settings.reader.lua stays minimal.
+                if not next(set) then
+                    G_reader_settings:delSetting("bookshelf_chips_disabled")
+                else
+                    G_reader_settings:saveSetting("bookshelf_chips_disabled", set)
+                end
+                G_reader_settings:flush()
+                if self._bw and self._bw._rebuild then
+                    self._bw:_rebuild()
+                    UIManager:setDirty(self._bw, "ui")
+                end
+                if touchmenu_instance and touchmenu_instance.updateItems then
+                    touchmenu_instance:updateItems()
+                end
+            end,
+        }
+    end
+    return items
+end
+
 -- Bookends-style nudge dialog for the hero font scale. Each tap on -/+ saves
 -- the new scale, kicks the live BookshelfWidget rebuild, and refreshes the
 -- dialog so the value updates. Cancel reverts to the snapshot taken on open;
@@ -483,6 +529,10 @@ function Settings:menuItems(bw, plugin)
         {
             text                = _("Edit hero card"),
             sub_item_table_func = function() return self:_heroSubItems() end,
+        },
+        {
+            text                = _("Edit shelf tabs"),
+            sub_item_table_func = function() return self:_chipsSubItems() end,
         },
         {
             text     = _("Hero card font scale"),
