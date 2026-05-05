@@ -40,15 +40,17 @@ local Blitbuffer     = require("ffi/blitbuffer")
 local Screen         = require("device").screen
 local SpineWidget    = require("spine_widget")
 
--- The magazine front face is a TRIANGLE. Slope starts at (0, y_left)
--- on the left edge and runs down to the bottom-right corner (w-1, h-1)
--- — slope FALLS left-to-right. Edges by length at a 2:3 slot aspect:
--- TOP slope ≈ 0.82·card_h (longest), BOTTOM ≈ 0.67·card_h, LEFT ≈
--- 0.47·card_h (shortest). No right edge — slope meets the bottom at
--- the corner. The 0.47 LEFT edge keeps the magazine roughly 2/3 of
--- the prior quadrilateral height while still satisfying
--- "shortest edge on the left".
-local SLOPE_LEFT_FRAC = 0.53   -- y at left edge (slope's top-left vertex)
+-- The magazine front is a triangle sitting on a rectangle (one
+-- composite quadrilateral): a gentle slope across the TOP carries the
+-- triangle "opening" of the file, and a full-width rectangle below
+-- holds the folder label. Slope falls left-to-right (back wall on
+-- LEFT, slightly shorter front wall on RIGHT).
+--   y at x=0 is SLOPE_LEFT_FRAC·card_h
+--   y at x=w-1 is SLOPE_RIGHT_FRAC·card_h
+-- Below max(SLOPE_LEFT_FRAC, SLOPE_RIGHT_FRAC) the cardboard is
+-- full-width — that's the "rectangle" where the label lives.
+local SLOPE_LEFT_FRAC  = 0.50
+local SLOPE_RIGHT_FRAC = 0.60
 
 -- Cardboard colour and a darker outline. Slightly denser than the
 -- earlier values so the magazine reads as a solid object on the page
@@ -70,21 +72,21 @@ local CARD_RADIUS = Screen:scaleBySize(4)
 local BOOK_INSET_X = Screen:scaleBySize(3)
 local BOOK_INSET_Y = Screen:scaleBySize(2)
 
--- Triangle painter for the magazine front. Vertices: (0, y_left),
--- (0, h-1), (w-1, h-1). Slope (top edge) runs from (0, y_left) down
--- to the bottom-right corner — falls left-to-right and meets the
--- bottom at the corner, so there's no separate right-side wall. Edge
--- ordering by length: TOP slope > BOTTOM > LEFT (the user's
--- "longest on top, shortest on left" constraint expressed as a 3-side
--- shape). Reused for both fill (CARDBOARD) and the drop-shadow
--- offset variant — only fill_color differs.
+-- Painter for the magazine front: a quadrilateral with a sloped top
+-- edge. The slope drops gently from (0, y_left) on the left to
+-- (w-1, y_right) on the right (y_left < y_right ⇒ slope falls L→R).
+-- Below max(y_left, y_right) the shape is full-width — the
+-- "rectangle" portion that carries the folder label. Above the
+-- slope, no fill (the book behind shows through). Bottom-left and
+-- bottom-right corners are rounded at `radius`.
 local MagazinePolygon = Widget:extend{
     width      = nil,
     height     = nil,
-    y_left     = nil,    -- slope's y on the left edge (slope ends at bottom-right corner)
+    y_left     = nil,    -- slope y at x=0
+    y_right    = nil,    -- slope y at x=w-1
     fill_color = nil,
-    edge_color = nil,    -- optional outline
-    radius     = 0,      -- bottom-LEFT corner radius (0 = sharp)
+    edge_color = nil,
+    radius     = 0,
 }
 
 function MagazinePolygon:init()
@@ -92,25 +94,32 @@ function MagazinePolygon:init()
 end
 
 function MagazinePolygon:paintTo(bb, x, y)
-    local w        = self.width
-    local h        = self.height
-    local yl       = self.y_left
-    local fill     = self.fill_color
-    local h1       = h - 1
-    local slope_dy = h1 - yl
-    if slope_dy <= 0 then return end
-    -- Triangle interior. At row dy in [yl, h-1], the right boundary
-    -- (the slope) is at x = (dy - yl) * (w-1) / slope_dy. Painted
-    -- from x=0 (left edge) to that boundary inclusive.
-    for dy = yl, h1 do
-        local x_max = math.floor((dy - yl) * (w - 1) / slope_dy + 0.5)
-        if x_max >= 0 then
-            bb:paintRect(x, y + dy, x_max + 1, 1, fill)
+    local w     = self.width
+    local h     = self.height
+    local yl    = self.y_left
+    local yr    = self.y_right
+    local fill  = self.fill_color
+    local y_min = math.min(yl, yr)
+    local y_max = math.max(yl, yr)
+    -- Per-row fill: above min(yl, yr) nothing; between min and max
+    -- the slope's x for this y; below max, full width.
+    for dy = 0, h - 1 do
+        local x_start
+        if dy >= y_max then
+            x_start = 0
+        elseif dy < y_min then
+            x_start = nil
+        else
+            local frac = (dy - yl) / (yr - yl)
+            x_start = math.floor((w - 1) * frac + 0.5)
+            if x_start < 0 then x_start = 0 end
+            if x_start > w - 1 then x_start = w - 1 end
+        end
+        if x_start then
+            bb:paintRect(x + x_start, y + dy, w - x_start, 1, fill)
         end
     end
-    -- Round the bottom-left corner only — it's the only right-angle
-    -- vertex. The other two (slope/left and slope/bottom) are acute
-    -- angles that look natural sharp at chip-strip scale.
+    -- Round bottom-left and bottom-right corners (page-bg knockout).
     local r    = self.radius or 0
     local r_sq = r * r
     if r > 0 then
@@ -122,25 +131,24 @@ function MagazinePolygon:paintTo(bb, x, y)
                 cutoff = cutoff + 1
             end
             if cutoff > 0 then
-                bb:paintRect(x, y + dy, cutoff, 1, PAGE_BG)   -- BL only
+                bb:paintRect(x, y + dy, cutoff, 1, PAGE_BG)
+                bb:paintRect(x + w - cutoff, y + dy, cutoff, 1, PAGE_BG)
             end
         end
     end
     if self.edge_color then
         local b    = Size.border.thin
         local edge = self.edge_color
-        -- Bottom edge: full width (between BL rounded corner and BR sharp tip).
-        bb:paintRect(x + r, y + h - b, w - r, b, edge)
-        -- Left edge: from yl to bottom (stops at BL corner radius).
-        bb:paintRect(x, y + yl, b, h - yl - r, edge)
-        -- Slope: stair-step b×b stamps from (0, yl) to (w-1, h-1).
-        local steps = math.max(w, slope_dy)
+        bb:paintRect(x + r, y + h - b, w - 2 * r, b, edge)            -- bottom
+        bb:paintRect(x + w - b, y + y_min, b, h - y_min - r, edge)    -- right (back wall)
+        bb:paintRect(x, y + yl, b, h - yl - r, edge)                  -- left (front wall)
+        -- Slope.
+        local steps = math.max(w, math.abs(yr - yl))
         for s = 0, steps do
             local px = math.floor(s * (w - 1) / steps + 0.5)
-            local py = math.floor(yl + slope_dy * s / steps + 0.5)
+            local py = math.floor(yl + (yr - yl) * s / steps + 0.5)
             bb:paintRect(x + px, y + py, b, b, edge)
         end
-        -- BL arc outline trace (where the rounded mask carved into the fill).
         if r > 0 then
             for i = 0, r - 1 do
                 local dy = h - r + i
@@ -150,6 +158,7 @@ function MagazinePolygon:paintTo(bb, x, y)
                     cutoff = cutoff + 1
                 end
                 bb:paintRect(x + cutoff, y + dy, b, b, edge)
+                bb:paintRect(x + w - cutoff - b, y + dy, b, b, edge)
             end
         end
     end
@@ -175,9 +184,9 @@ function FolderStack:init()
     local card_w = self.width
     local card_h = self.height
 
-    -- Slope's left endpoint (slope's right end is fixed at the
-    -- bottom-right corner of the card).
-    local y_left = math.floor(card_h * SLOPE_LEFT_FRAC)
+    -- Slope endpoints in card-local coordinates.
+    local y_left  = math.floor(card_h * SLOPE_LEFT_FRAC)
+    local y_right = math.floor(card_h * SLOPE_RIGHT_FRAC)
 
     -- Book layer: SpineWidget for the first book, inset within the card
     -- by a few pixels on every side. The book's bottom extends to the
@@ -212,38 +221,28 @@ function FolderStack:init()
         book_widget,
     }
 
-    -- Magazine front: cardboard triangle in front of the book.
+    -- Magazine front: cardboard quadrilateral with a sloped top.
     local magazine = MagazinePolygon:new{
         width      = card_w,
         height     = card_h,
         y_left     = y_left,
+        y_right    = y_right,
         fill_color = CARDBOARD,
         edge_color = CARDBOARD_EDGE,
         radius     = CARD_RADIUS,
     }
 
-    -- Folder label: positioned inside the triangle. The triangle widens
-    -- going down — at row y, the cardboard extends from x=0 to slope_x(y).
-    -- We place the label band in the LOWER portion (where the triangle
-    -- is widest) and constrain its width to what fits at the band's TOP
-    -- row, then centre the label horizontally within that available
-    -- space. Probing the unconstrained TextBoxWidget gives its content
-    -- height so the CenterContainer can vertically centre it.
+    -- Folder label: in the rectangle area below max(y_left, y_right)
+    -- where the cardboard is full width. Left-aligned text — the slope
+    -- visually anchors content to the right, so left alignment reads
+    -- as "label flush with the back wall". Probe-then-build pattern
+    -- to get true vertical centring within the rectangle.
     local label_text = self.folder and self.folder.label or ""
     label_text = label_text:gsub("/$", "")
-    -- Pick a label band starting at ~70% of cardboard height (where the
-    -- triangle has reached ~70% of its right-bottom width).
-    local label_top     = math.floor(y_left + (card_h - y_left) * 0.55)
+    local label_top     = math.max(y_left, y_right) + Size.padding.small
     local label_h_avail = card_h - label_top - Size.padding.small
-    -- Available width = slope's x at row label_top, minus a small
-    -- inset on each side so the text doesn't kiss the slope.
-    local slope_x_at_top = math.floor((label_top - y_left) * (card_w - 1)
-                                       / math.max(1, card_h - 1 - y_left))
-    local label_w_avail = slope_x_at_top - Size.padding.small * 2
-    if label_w_avail < Size.padding.default * 2 then
-        label_w_avail = Size.padding.default * 2
-    end
-    local face = Font:getFace("infofont", 14)
+    local label_w_avail = card_w - Size.padding.default * 2
+    local face          = Font:getFace("infofont", 14)
     local probe = TextBoxWidget:new{
         text  = label_text,
         face  = face,
@@ -261,21 +260,22 @@ function FolderStack:init()
         fgcolor                       = Blitbuffer.COLOR_BLACK,
         bgcolor                       = CARDBOARD,
         width                         = label_w_avail,
-        alignment                     = "center",
+        alignment                     = "left",
         height                        = label_h,
         height_overflow_show_ellipsis = not fits,
     }
-    -- Centre horizontally within the available cardboard band (which
-    -- starts at x=0 and extends to slope_x_at_top), and vertically
-    -- within label_h_avail.
+    -- Vertical centring via CenterContainer of the full available
+    -- height; the label widget is left-aligned within so the
+    -- horizontal padding sits naturally on the left side.
     local label_centered = CenterContainer:new{
-        dimen = Geom:new{ w = slope_x_at_top, h = label_h_avail },
+        dimen = Geom:new{ w = label_w_avail, h = label_h_avail },
         label_widget,
     }
     local label_positioned = FrameContainer:new{
-        bordersize  = 0,
-        padding     = 0,
-        padding_top = label_top,
+        bordersize    = 0,
+        padding       = 0,
+        padding_top   = label_top,
+        padding_left  = Size.padding.default,
         label_centered,
     }
 
