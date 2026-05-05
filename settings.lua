@@ -476,8 +476,9 @@ end
 -- consumes this to nest the settings under the FM menu's folder/file tab.
 -- Optional `bw` lets the nudge dialog reach the live BookshelfWidget for
 -- font-scale preview rebuilds.
-function Settings:menuItems(bw)
+function Settings:menuItems(bw, plugin)
     if bw then self._bw = bw end
+    if plugin then self._plugin = plugin end
     return {
         {
             text                = _("Edit hero card"),
@@ -492,9 +493,98 @@ function Settings:menuItems(bw)
             callback = function() self:_pickLatestDepth() end,
         },
         {
+            text                = _("Updates"),
+            sub_item_table_func = function() return self:_updateSubItems() end,
+        },
+        {
             text     = _("About"),
             callback = function() self:_about() end,
             separator = true,
+        },
+    }
+end
+
+-- _updateSubItems() — drill-down menu for the in-app updater. Mirrors
+-- bookends's structure: a "Notify" toggle, a primary update row that
+-- auto-relabels when an update is queued, and an "Advanced" pocket for
+-- the dev-branch picker + reset-to-stable.
+function Settings:_updateSubItems()
+    local Updater = require("bookshelf_updater")
+    local plugin = self._plugin   -- the Bookshelf plugin instance
+    return {
+        {
+            text         = _("Notify on wake when update available"),
+            checked_func = function() return plugin and plugin.check_updates end,
+            callback     = function()
+                if not plugin then return end
+                plugin.check_updates = not plugin.check_updates
+                G_reader_settings:saveSetting("bookshelf_check_updates", plugin.check_updates)
+                G_reader_settings:flush()
+            end,
+        },
+        {
+            text_func = function()
+                local current   = Updater.getInstalledVersion()
+                local available = Updater.getAvailableUpdate()
+                local source    = (plugin and plugin.last_install_source) or "release"
+                local source_suffix = ""
+                if source ~= "release" then
+                    local branch = source:match("^branch:(.+)$") or source
+                    source_suffix = " (branch: " .. branch .. ")"
+                end
+                if available then
+                    return _("Update available") .. ": v" .. current .. source_suffix
+                        .. " \xE2\x86\x92 v" .. available
+                end
+                return _("Installed version") .. ": v" .. current .. source_suffix
+            end,
+            keep_menu_open = true,
+            callback = function() if plugin then plugin:checkForUpdates() end end,
+        },
+        {
+            text = _("Advanced"),
+            sub_item_table = {
+                {
+                    text_func = function()
+                        local b = (plugin and plugin.dev_branch) or ""
+                        if b == "" then return _("Development branch") end
+                        return _("Development branch") .. ": " .. b
+                    end,
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        if plugin then plugin:editDevBranch(touchmenu_instance) end
+                    end,
+                },
+                {
+                    text_func = function()
+                        local b = (plugin and plugin.dev_branch) or ""
+                        if b == "" then return _("Check for updates") end
+                        return _("Install branch") .. ": " .. b
+                    end,
+                    keep_menu_open = true,
+                    callback = function() if plugin then plugin:checkForUpdates() end end,
+                },
+                {
+                    text           = _("Reset to latest stable release"),
+                    keep_menu_open = true,
+                    callback       = function() if plugin then plugin:resetToStableRelease() end end,
+                },
+                {
+                    -- Disabled status row: shows "Installed: vX (release)" /
+                    -- "(branch: foo)". Tap is a no-op via enabled_func=false.
+                    text_func = function()
+                        local current = Updater.getInstalledVersion()
+                        local source  = (plugin and plugin.last_install_source) or "release"
+                        if source == "release" then
+                            return _("Installed: v") .. current .. " (release)"
+                        end
+                        local branch = source:match("^branch:(.+)$") or source
+                        return _("Installed: v") .. current .. " (branch: " .. branch .. ")"
+                    end,
+                    enabled_func   = function() return false end,
+                    keep_menu_open = true,
+                },
+            },
         },
     }
 end

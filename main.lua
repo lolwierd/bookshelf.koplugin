@@ -44,6 +44,13 @@ local Bookshelf = WidgetContainer:extend{
 -- ---------------------------------------------------------------------------
 
 function Bookshelf:init()
+    -- Cache update-related settings on the instance for the menu's text_func
+    -- closures. Defaults match bookends: branch empty, source = "release",
+    -- background check OFF (opt-in via the menu toggle).
+    self.dev_branch          = G_reader_settings:readSetting("bookshelf_dev_branch") or ""
+    self.last_install_source = G_reader_settings:readSetting("bookshelf_last_install_source") or "release"
+    self.check_updates       = G_reader_settings:isTrue("bookshelf_check_updates")
+
     -- Patch the start_with menu so users can pick Bookshelf as their home.
     self:_registerStartWithMenu()
 
@@ -53,6 +60,9 @@ function Bookshelf:init()
 
     -- Register "Open Bookshelf" in the main menu (works in both FM and Reader).
     self.ui.menu:registerToMainMenu(self)
+
+    -- One silent background check per init when the user's opted in.
+    self:backgroundUpdateCheck()
 
     -- Takeover: if start_with=bookshelf and we're in the FileManager context
     -- (no document currently being opened), close FM and present Bookshelf.
@@ -237,7 +247,7 @@ function Bookshelf:addToMainMenu(menu_items)
             else
                 out[#out].separator = true
             end
-            for _i, it in ipairs(require("settings"):menuItems(outer._widget)) do
+            for _i, it in ipairs(require("settings"):menuItems(outer._widget, outer)) do
                 out[#out + 1] = it
             end
             return out
@@ -320,6 +330,115 @@ function Bookshelf:onCloseDocument()
     -- FileManager. Fresh boot path through onCloseDocument (rare) creates
     -- a new instance.
     UIManager:nextTick(function() self:show() end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Updates / dev-branch install
+-- ---------------------------------------------------------------------------
+-- Mirrors bookends's flow (bookends_updater.lua + Bookends:checkForUpdates,
+-- editDevBranch, resetToStableRelease, backgroundUpdateCheck). Lets the user
+-- bring new bookshelf code onto the device without an SSH push from the
+-- laptop — useful when away from the home network.
+--
+-- Settings written here all use the bookshelf_ prefix on G_reader_settings:
+--   bookshelf_dev_branch          — empty for stable, branch name for branch path
+--   bookshelf_last_install_source — "release" or "branch:<name>"
+--   bookshelf_check_updates       — boolean: silent wake-time check
+
+local Updater = require("bookshelf_updater")
+
+-- Branch-aware update entry: if a dev branch is configured, install that
+-- branch's latest tip (no release needed). Otherwise hit the GitHub
+-- releases API and offer the latest stable. Both paths share the same
+-- download / unpack / restart-prompt pipeline inside Updater.install.
+function Bookshelf:checkForUpdates()
+    if self.dev_branch and self.dev_branch ~= "" then
+        local branch = self.dev_branch
+        Updater.installBranch(branch, function()
+            self.last_install_source = "branch:" .. branch
+            G_reader_settings:saveSetting("bookshelf_last_install_source", self.last_install_source)
+            G_reader_settings:flush()
+        end)
+    else
+        Updater.check(function()
+            self.last_install_source = "release"
+            G_reader_settings:saveSetting("bookshelf_last_install_source", "release")
+            G_reader_settings:flush()
+        end)
+    end
+end
+
+-- Open a single-line dialog to set / change / clear the dev branch.
+function Bookshelf:editDevBranch(touchmenu_instance)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dlg
+    dlg = InputDialog:new{
+        title       = _("Development branch"),
+        input       = self.dev_branch or "",
+        input_hint  = _("Branch name (leave empty for stable)"),
+        buttons = {{
+            {
+                text     = _("Cancel"),
+                id       = "close",
+                callback = function() UIManager:close(dlg) end,
+            },
+            {
+                text             = _("Save"),
+                is_enter_default = true,
+                callback         = function()
+                    local raw = dlg:getInputText() or ""
+                    local trimmed = raw:gsub("^%s+", ""):gsub("%s+$", "")
+                    self.dev_branch = trimmed
+                    G_reader_settings:saveSetting("bookshelf_dev_branch", trimmed)
+                    G_reader_settings:flush()
+                    UIManager:close(dlg)
+                    if touchmenu_instance and touchmenu_instance.updateItems then
+                        touchmenu_instance:updateItems()
+                    end
+                end,
+            },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+-- Clear dev branch + install latest stable release. Used when escaping a
+-- broken branch back to a known-good release.
+function Bookshelf:resetToStableRelease()
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("This will clear the development branch setting and install the latest stable release of Bookshelf, then restart KOReader. Continue?"),
+        ok_text = _("Reset"),
+        ok_callback = function()
+            self.dev_branch = ""
+            G_reader_settings:saveSetting("bookshelf_dev_branch", "")
+            G_reader_settings:flush()
+            Updater.installLatestStable(function()
+                self.last_install_source = "release"
+                G_reader_settings:saveSetting("bookshelf_last_install_source", "release")
+                G_reader_settings:flush()
+            end)
+        end,
+    })
+end
+
+-- Silent background poll: checks at most once an hour, only when the user
+-- has opted in via "Notify on wake when update available". Surfaces a
+-- short notification if a newer release tag is found.
+function Bookshelf:backgroundUpdateCheck()
+    if not self.check_updates then return end
+    Updater.checkBackground(function(ver)
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Bookshelf update available: v") .. ver,
+            Notification.SOURCE_ALWAYS_SHOW)
+    end)
+end
+
+-- Wake-from-sleep also fires backgroundUpdateCheck, mirroring bookends.
+-- The Updater's 1-hour internal cache prevents wake-spam.
+function Bookshelf:onResume()
+    self:backgroundUpdateCheck()
 end
 
 return Bookshelf

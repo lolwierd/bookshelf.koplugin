@@ -180,6 +180,20 @@ Restart KOReader after installing.
 
 ---
 
+## Updates
+
+Bookshelf can update itself in place over Wi-Fi. Settings live under
+**FileManager menu → Bookshelf → Updates**:
+
+- **Notify on wake when update available** — opt-in; once an hour after a Wi-Fi-connected wake, Bookshelf checks the GitHub releases API and posts a brief notification if a newer release exists. Off by default.
+- **Installed version: vX (release)** / **Update available: vX → vY** — tap the row to fetch release notes between installed and latest, and choose **Update and restart**. The release path needs a published ZIP asset on the GitHub release.
+- **Advanced → Development branch** — set a branch name (e.g. `feat/foo`); the row labels flip to **Install branch: foo**. Tapping installs the tip of that branch (no release tag required) — useful for testing fixes when you can't reach the device over the local network.
+- **Advanced → Reset to latest stable release** — clears the dev-branch setting and pulls the latest published release ZIP, then restarts KOReader.
+
+The whole pipeline (download → unpack → restart prompt) requires only Wi-Fi.
+
+---
+
 ## Configuration
 
 Settings are stored in KOReader's main settings file alongside all other plugin state:
@@ -199,6 +213,9 @@ Bookshelf-specific keys are prefixed `bookshelf_`:
 | `bookshelf_font_scale` | Global zoom for hero text (50–200%). |
 | `bookshelf_active_chip` | Last-selected chip (`recent` / `latest` / `series` / `favorites`). |
 | `bookshelf_latest_walk_depth` | How deep the **Latest** chip scans your library. |
+| `bookshelf_dev_branch` | Branch name for in-app dev-branch installs; empty = stable releases only. |
+| `bookshelf_last_install_source` | `release` or `branch:<name>` — set automatically by the in-app updater. |
+| `bookshelf_check_updates` | Boolean: silent wake-time release-check. Off by default. |
 
 ---
 
