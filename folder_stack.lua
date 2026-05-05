@@ -44,8 +44,11 @@ local SpineWidget    = require("spine_widget")
 -- left-to-right (y_left < y_right), so the back wall is on the LEFT
 -- (taller) and the front wall is on the RIGHT (shorter, magazine
 -- "opening" lip). Book visible above the slope, cardboard fill below.
-local SLOPE_LEFT_FRAC  = 0.30   -- y at left edge (high point of slope, back wall top)
-local SLOPE_RIGHT_FRAC = 0.55   -- y at right edge (low point of slope, front wall top)
+-- Magazine occupies roughly the bottom half of the slot (back wall
+-- ≈ 0.47 × slot height, front wall ≈ 0.30 × slot height) — about
+-- 2/3 of the previous size, leaving more of the book visible.
+local SLOPE_LEFT_FRAC  = 0.53   -- y at left edge (high point of slope, back wall top)
+local SLOPE_RIGHT_FRAC = 0.70   -- y at right edge (low point of slope, front wall top)
 
 -- Cardboard colour and a darker outline. Slightly denser than the
 -- earlier values so the magazine reads as a solid object on the page
