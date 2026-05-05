@@ -233,7 +233,10 @@ function BookshelfWidget:_rebuild()
             active_chips[#active_chips + 1] = { key = key, label = CHIP_LABELS[key] }
         end
     end
-    local hide_chip_strip = (#active_chips == 0) and (#self._drilldown_path == 0)
+    -- Hide the strip when 0 or 1 chips are enabled (a single full-width
+    -- chip is just a non-interactive label) AND no drill-down is active
+    -- (the breadcrumb still needs the strip's slot for back-navigation).
+    local hide_chip_strip = (#active_chips <= 1) and (#self._drilldown_path == 0)
     -- Defensive: the user can disable every chip via the settings menu.
     -- Fall back to the canonical four for chip selection so the shelves
     -- still have a data source even when the strip is hidden.
