@@ -69,27 +69,57 @@ local ChipStrip = InputContainer:extend{
 -- HorizontalGroup uses for layout (notch + body, NOT including tip);
 -- the tip overhangs into the next slot.
 local function arrowPillFrame(label, h, chained, glyph)
-    -- glyph (optional): a UTF-8 string to render in place of `label`. Used
-    -- by the breadcrumb chip pill to show the search nerd-font icon when
-    -- the user is in search mode. Skips :upper() so glyphs aren't mangled
-    -- through case-folding, and uses a slightly larger point size to
-    -- match the chip-row search icon's visual weight.
-    local label_text, face
-    if glyph then
-        label_text = glyph
-        face       = Font:getFace("infofont", 18)
+    -- glyph (optional): a UTF-8 string (typically a nerd-font icon) shown
+    -- in the pill. Three render modes depending on which of label/glyph
+    -- are supplied:
+    --   * label only        — uppercase text (the standard breadcrumb crumb)
+    --   * glyph only        — single icon, point-size 18 to match chip-row
+    --   * glyph + label     — icon + text, side-by-side ("[icon] LABEL")
+    -- The combined mode is used for the search-mode chip pill so the user
+    -- sees "[search] SEARCH RESULTS" instead of just the bare icon.
+    local content_widget, content_w, content_h
+    if glyph and label and label ~= "" then
+        local icon_tw = TextWidget:new{
+            text    = glyph,
+            face    = Font:getFace("infofont", 18),
+            bold    = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        local text_tw = TextWidget:new{
+            text    = label:upper(),
+            face    = Font:getFace("infofont", 16),
+            bold    = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        local gap = Size.padding.default
+        content_widget = HorizontalGroup:new{
+            align = "center",
+            icon_tw,
+            HorizontalSpan:new{ width = gap },
+            text_tw,
+        }
+        content_w = icon_tw:getSize().w + gap + text_tw:getSize().w
+        content_h = math.max(icon_tw:getSize().h, text_tw:getSize().h)
     else
-        label_text = (label or ""):upper()
-        face       = Font:getFace("infofont", 16)
+        local label_text, face
+        if glyph then
+            label_text = glyph
+            face       = Font:getFace("infofont", 18)
+        else
+            label_text = (label or ""):upper()
+            face       = Font:getFace("infofont", 16)
+        end
+        content_widget = TextWidget:new{
+            text    = label_text,
+            face    = face,
+            bold    = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        content_w = content_widget:getSize().w
+        content_h = content_widget:getSize().h
     end
-    local tw = TextWidget:new{
-        text    = label_text,
-        face    = face,
-        bold    = true,
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-    local text_w = tw:getSize().w
-    local text_h = tw:getSize().h
+    local text_w = content_w  -- keep historical names so the layout maths below stay readable
+    local text_h = content_h
     local h_pad  = Size.padding.large
     local tip_w  = math.floor(h * 0.4)
     -- For chained pills the body has a TRIANGULAR NOTCH carved into
@@ -178,7 +208,7 @@ local function arrowPillFrame(label, h, chained, glyph)
         padding      = 0,
         padding_left = left_text_pad,
         padding_top  = math.floor((h - text_h) / 2),
-        tw,
+        content_widget,
     }
 
     local pill = OverlapGroup:new{

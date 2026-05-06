@@ -418,18 +418,24 @@ function BookshelfWidget:_rebuild()
             if entry.kind == "search" then in_search_mode = true end
         end
     end
-    -- Search-mode chip pill: the search nerd-font glyph (U+F002) replaces
-    -- the active chip's name so the user reads "[search-icon] > query"
-    -- instead of "[CHIP] > query" — search is a separate context, not a
-    -- filter applied within the active chip.
+    -- Search-mode chip pill: shows the search nerd-font glyph (U+F002)
+    -- followed by "Search results" so the user reads
+    -- "[search-icon] SEARCH RESULTS > query" — search is a separate
+    -- context, not a filter applied within the active chip.
     local chip_pill_glyph = in_search_mode and "\xEF\x80\x82" or nil
+    local chip_pill_label
+    if in_search_mode then
+        chip_pill_label = "Search results"
+    else
+        chip_pill_label = CHIP_LABELS[self.chip] or self.chip
+    end
     local chips = not hide_chip_strip and ChipStrip:new{
         chips             = active_chips,
         active            = self.chip,
         width             = content_w,
         height            = chip_h,
         breadcrumb_path   = breadcrumb_path,
-        chip_pill_label   = CHIP_LABELS[self.chip] or self.chip,
+        chip_pill_label   = chip_pill_label,
         chip_pill_glyph   = chip_pill_glyph,
         on_change = function(key)
             -- Search "chip" is an action, not a navigable tab — open
