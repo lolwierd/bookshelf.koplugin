@@ -403,12 +403,19 @@ function BookshelfWidget:_rebuild()
     -- Skipped entirely when hide_chip_strip is true (every chip
     -- disabled AND no drill-down) so the hero can claim the slot.
     local breadcrumb_path = nil
+    local in_search_mode  = false
     if #self._drilldown_path > 0 then
         breadcrumb_path = {}
         for i, entry in ipairs(self._drilldown_path) do
             breadcrumb_path[i] = { label = entry.label }
+            if entry.kind == "search" then in_search_mode = true end
         end
     end
+    -- Search-mode chip pill: the search nerd-font glyph (U+F002) replaces
+    -- the active chip's name so the user reads "[search-icon] > query"
+    -- instead of "[CHIP] > query" — search is a separate context, not a
+    -- filter applied within the active chip.
+    local chip_pill_glyph = in_search_mode and "\xEF\x80\x82" or nil
     local chips = not hide_chip_strip and ChipStrip:new{
         chips             = active_chips,
         active            = self.chip,
@@ -416,6 +423,7 @@ function BookshelfWidget:_rebuild()
         height            = chip_h,
         breadcrumb_path   = breadcrumb_path,
         chip_pill_label   = CHIP_LABELS[self.chip] or self.chip,
+        chip_pill_glyph   = chip_pill_glyph,
         on_change = function(key)
             -- Search "chip" is an action, not a navigable tab — open
             -- the search dialog and bail before switching self.chip.
@@ -1862,15 +1870,27 @@ function BookshelfWidget:_drillBackTo(depth)
     -- before tearing the entry down. When popping multiple levels at once
     -- (e.g. a deep crumb tap) only the FIRST popped entry's parent_page
     -- matters — that's the page of the level we're landing on.
+    -- Search entries also carry `prior_drilldown` (the path that was active
+    -- before search was invoked); restore it so backing out of search
+    -- returns the user to where they were, not to a bare chip top.
     local restore_page = 1
+    local restore_path
     if #self._drilldown_path > depth then
         local first_pop = self._drilldown_path[depth + 1]
         if first_pop and first_pop.parent_page then
             restore_page = first_pop.parent_page
         end
+        if first_pop and first_pop.kind == "search" and first_pop.prior_drilldown then
+            restore_path = first_pop.prior_drilldown
+        end
     end
     while #self._drilldown_path > depth do
         self._drilldown_path[#self._drilldown_path] = nil
+    end
+    if restore_path then
+        for _, entry in ipairs(restore_path) do
+            self._drilldown_path[#self._drilldown_path + 1] = entry
+        end
     end
     self._preview_book = nil
     self.page          = restore_page
@@ -1954,10 +1974,18 @@ end
 
 function BookshelfWidget:_searchAndDrill(query)
     local books = Repo.searchBooks(query, 200) or {}
+    -- Search is its own top-level mode rather than a nested drill under
+    -- the active chip. Stash whatever drilldown the user was in so the
+    -- back-out path restores it (a folder browse + search-then-back
+    -- shouldn't drop the folder context). The active chip is preserved
+    -- by self.chip — _drillBackTo to depth 0 leaves us on it.
+    local prior_path = self._drilldown_path
+    self._drilldown_path = {}
     self:_drillInto{
-        kind    = "search",
-        label   = string.format("Search: %s", query),
-        payload = { query = query, books = books },
+        kind            = "search",
+        label           = query,
+        payload         = { query = query, books = books },
+        prior_drilldown = prior_path,
     }
 end
 

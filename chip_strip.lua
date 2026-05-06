@@ -46,6 +46,7 @@ local ChipStrip = InputContainer:extend{
     active            = nil,   -- key of the currently-selected chip
     breadcrumb_path   = nil,   -- list of { label } — when non-empty, breadcrumb mode
     chip_pill_label   = nil,   -- label for the chip pill in breadcrumb mode (e.g. "Series")
+    chip_pill_glyph   = nil,   -- nerd-font glyph for the chip pill (overrides label)
     width             = nil,
     height            = nil,
     on_change         = nil,   -- function(key) — chips mode tap
@@ -67,9 +68,20 @@ local ChipStrip = InputContainer:extend{
 -- Returns (widget, placement_w, tip_w). `placement_w` is what
 -- HorizontalGroup uses for layout (notch + body, NOT including tip);
 -- the tip overhangs into the next slot.
-local function arrowPillFrame(label, h, chained)
-    local label_text = (label or ""):upper()
-    local face       = Font:getFace("infofont", 16)
+local function arrowPillFrame(label, h, chained, glyph)
+    -- glyph (optional): a UTF-8 string to render in place of `label`. Used
+    -- by the breadcrumb chip pill to show the search nerd-font icon when
+    -- the user is in search mode. Skips :upper() so glyphs aren't mangled
+    -- through case-folding, and uses a slightly larger point size to
+    -- match the chip-row search icon's visual weight.
+    local label_text, face
+    if glyph then
+        label_text = glyph
+        face       = Font:getFace("infofont", 18)
+    else
+        label_text = (label or ""):upper()
+        face       = Font:getFace("infofont", 16)
+    end
     local tw = TextWidget:new{
         text    = label_text,
         face    = face,
@@ -301,7 +313,12 @@ function ChipStrip:_initBreadcrumb()
     local n         = #self.breadcrumb_path
 
     -- Chip pill at depth 0 (e.g. "HOME") — chained=false (full border).
-    local pill, pill_w, pill_tip_w = arrowPillFrame(self.chip_pill_label or "", self.height, false)
+    -- chip_pill_glyph wins over chip_pill_label when set: search mode
+    -- replaces the chip name with the search icon so the user sees
+    -- they're in a separate "search" context, not nested under their
+    -- previously-active chip.
+    local pill, pill_w, pill_tip_w = arrowPillFrame(
+        self.chip_pill_label or "", self.height, false, self.chip_pill_glyph)
 
     -- Chained pills for parent entries (1..n-1).
     local crumb_pills = {}
