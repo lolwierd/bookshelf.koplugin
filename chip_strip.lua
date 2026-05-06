@@ -222,7 +222,13 @@ function ChipStrip:_initChips()
         local cell_content
         if chip.icon then
             local IconWidget = require("ui/widget/iconwidget")
-            local icon_size  = math.floor(self.height * 0.55)
+            -- Icon at ~75% of chip height. KOReader only ships the
+            -- mdlight ("light" weight) icon set; bumping the render
+            -- size compensates for the thin strokes so the icon
+            -- reads as substantial against the chip border. Bold
+            -- icon variants from nerd-font / mdbold sets aren't
+            -- available without a separate icon-pack install.
+            local icon_size  = math.floor(self.height * 0.75)
             cell_content = IconWidget:new{
                 icon   = chip.icon,
                 width  = icon_size,
