@@ -67,6 +67,12 @@ function Bookshelf:init()
     -- Register "Open Bookshelf" in the main menu (works in both FM and Reader).
     self.ui.menu:registerToMainMenu(self)
 
+    -- Register Dispatcher actions so users can bind gestures / keys to
+    -- Bookshelf show/hide/toggle from KOReader's Gesture Manager. Required
+    -- for users who run Bookshelf alongside other home-screen plugins and
+    -- want a quick toggle rather than digging through the FM menu.
+    self:onDispatcherRegisterActions()
+
     -- One silent background check per init when the user's opted in.
     self:backgroundUpdateCheck()
 
@@ -353,6 +359,56 @@ function Bookshelf:show()
         outer._widget = nil
     end
     UIManager:show(self._widget)
+end
+
+-- ---------------------------------------------------------------------------
+-- Dispatcher actions
+-- ---------------------------------------------------------------------------
+
+-- Register Bookshelf actions in KOReader's Dispatcher so they appear in the
+-- Gesture Manager's action picker. Titles all begin with "Bookshelf:" so the
+-- two actions read as a related block. IDs are kept stable — renaming would
+-- silently break existing bindings users have set up.
+function Bookshelf:onDispatcherRegisterActions()
+    local Dispatcher = require("dispatcher")
+    Dispatcher:registerAction("toggle_bookshelf", {
+        category    = "none",
+        event       = "ToggleBookshelf",
+        title       = _("Bookshelf: toggle visibility"),
+        filemanager = true,
+        reader      = true,
+    })
+    Dispatcher:registerAction("set_bookshelf", {
+        category    = "string",
+        event       = "SetBookshelf",
+        title       = _("Bookshelf: open"),
+        filemanager = true,
+        reader      = true,
+        args        = { true, false },
+        toggle      = { _("on"), _("off") },
+        separator   = true,
+    })
+end
+
+-- Toggle visibility — close the live widget if showing, otherwise show.
+function Bookshelf:onToggleBookshelf()
+    if self:_isShowing() then
+        UIManager:close(self._widget)
+    else
+        self:show()
+    end
+    return true
+end
+
+-- Explicit show/hide — used by the Set Bookshelf action with on/off args.
+-- Hide is a no-op when nothing's showing, mirroring how Set Bookends behaves.
+function Bookshelf:onSetBookshelf(visible)
+    if visible then
+        if not self:_isShowing() then self:show() end
+    else
+        if self:_isShowing() then UIManager:close(self._widget) end
+    end
+    return true
 end
 
 function Bookshelf:_takeOver(fm_instance)
