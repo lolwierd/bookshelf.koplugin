@@ -1253,9 +1253,11 @@ end
 -- ─── findGroup ───────────────────────────────────────────────────────────────
 -- Searches the in-memory shape cache for a group whose series_name matches
 -- `name` (case-insensitive exact match) and hydrates just that one group.
--- Returns nil when: kind is unrecognised, the relevant cache is cold (has
--- never been populated this session), or no group matches the name.
--- Callers that get nil should fall back to a minimal single-book group.
+-- When the relevant cache is cold (e.g. the user long-presses a book on the
+-- Recent tab without ever having visited the Authors tab this session),
+-- warms it via the matching getter so the lookup actually finds the full
+-- group instead of falling back to a single-book stub. Returns nil when:
+-- kind is unrecognised, or no group matches the name even after warming.
 function Repo.findGroup(kind, name)
     if not name or name == "" then return nil end
     local home  = G_reader_settings:readSetting("home_dir") or "/"
@@ -1266,7 +1268,13 @@ function Repo.findGroup(kind, name)
     elseif kind == "series" then cache = _series_cache[key]
     elseif kind == "genre"  then cache = _genres_cache[key]
     else return nil end
-    if not cache then return nil end
+    if not cache then
+        if     kind == "author" then Repo.getAuthors(0, 0);      cache = _authors_cache[key]
+        elseif kind == "series" then Repo.getSeriesGroups(0, 0); cache = _series_cache[key]
+        elseif kind == "genre"  then Repo.getGenres(0, 0);       cache = _genres_cache[key]
+        end
+        if not cache then return nil end
+    end
     local lname = name:lower()
     for _, shape in ipairs(cache.groups) do
         if (shape.series_name or ""):lower() == lname then

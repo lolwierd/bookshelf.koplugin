@@ -2009,6 +2009,12 @@ function BookshelfWidget:_openBookMenu(item)
     -- corresponding chip is not disabled.
     local ds = _resolveDisabledSet()
     local nav_rows = {}
+    -- Long-press nav rows are JUMPS, not descents — reset the drilldown
+    -- path before each so the breadcrumb starts fresh (otherwise repeated
+    -- long-press jumps stack: SERIES > DISCWORLD > TERRY PRATCHETT >
+    -- TERRY PRATCHETT > Discworld …). The chip-tap on_*_tap path leaves
+    -- this alone so descending into a group from the groups list still
+    -- builds the expected hierarchy.
     -- Go to Author
     if book.author and book.author ~= "" and not ds["authors"] then
         local author_name = book.author
@@ -2020,6 +2026,7 @@ function BookshelfWidget:_openBookMenu(item)
                     group = { kind = "author", series_name = author_name,
                               books = { book }, latest = 0 }
                 end
+                bw._drilldown_path = {}
                 bw:_expandAuthor(group)
               end) },
         }
@@ -2038,6 +2045,7 @@ function BookshelfWidget:_openBookMenu(item)
                     group = { kind = "series", series_name = series_name,
                               books = { book }, latest = 0 }
                 end
+                bw._drilldown_path = {}
                 bw:_expandSeries(group)
               end) },
         }
@@ -2055,62 +2063,65 @@ function BookshelfWidget:_openBookMenu(item)
                         group = { kind = "genre", series_name = genre_name,
                                   books = { book }, latest = 0 }
                     end
+                    bw._drilldown_path = {}
                     bw:_expandGenre(group)
                   end) },
             }
         end
     end
 
-    dialog = ButtonDialog:new{
-        title = book.title or book.filename or "Book",
-        buttons = {
-            {
-                { text = "Show info",
-                  callback = closing(function()
-                    local FileManager = require("apps/filemanager/filemanager")
-                    local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-                    if FileManager.instance and FileManager.instance.bookinfo then
-                        FileManager.instance.bookinfo:show(book.filepath)
-                    else
-                        FileManagerBookInfo:new{}:show(book.filepath)
-                    end
-                  end) },
-                { text = fav_label,
-                  callback = closing(function()
-                    -- KOReader API quirk: removeItem writes the collections
-                    -- file to disk automatically; addItem only updates
-                    -- in-memory state and relies on a caller-side :write()
-                    -- to persist. Without the explicit write, additions are
-                    -- lost on the next KOReader restart.
-                    local ok, already = pcall(function()
-                        return ReadCollection:isFileInCollection(book.filepath, "favorites")
-                    end)
-                    if ok and already then
-                        ReadCollection:removeItem(book.filepath, "favorites")
-                    else
-                        ReadCollection:addItem(book.filepath, "favorites")
-                        ReadCollection:write({ favorites = true })
-                    end
-                    bw:_rebuild()
-                    UIManager:setDirty(bw, "ui")
-                  end) },
-            },
-            {
-                { text = "Remove from history",
-                  callback = closing(function()
-                    require("readhistory"):removeItemByPath(book.filepath)
-                    bw:_rebuild()
-                    UIManager:setDirty(bw, "ui")
-                  end) },
-            },
+    -- Build the complete buttons table before construction — ButtonDialog
+    -- processes self.buttons into a ButtonTable widget synchronously in
+    -- init(), so any mutations after new{} are invisible to the rendered dialog.
+    local buttons = {
+        {
+            { text = "Show info",
+              callback = closing(function()
+                local FileManager = require("apps/filemanager/filemanager")
+                local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
+                if FileManager.instance and FileManager.instance.bookinfo then
+                    FileManager.instance.bookinfo:show(book.filepath)
+                else
+                    FileManagerBookInfo:new{}:show(book.filepath)
+                end
+              end) },
+            { text = fav_label,
+              callback = closing(function()
+                -- KOReader API quirk: removeItem writes the collections
+                -- file to disk automatically; addItem only updates
+                -- in-memory state and relies on a caller-side :write()
+                -- to persist. Without the explicit write, additions are
+                -- lost on the next KOReader restart.
+                local ok, already = pcall(function()
+                    return ReadCollection:isFileInCollection(book.filepath, "favorites")
+                end)
+                if ok and already then
+                    ReadCollection:removeItem(book.filepath, "favorites")
+                else
+                    ReadCollection:addItem(book.filepath, "favorites")
+                    ReadCollection:write({ favorites = true })
+                end
+                bw:_rebuild()
+                UIManager:setDirty(bw, "ui")
+              end) },
+        },
+        {
+            { text = "Remove from history",
+              callback = closing(function()
+                require("readhistory"):removeItemByPath(book.filepath)
+                bw:_rebuild()
+                UIManager:setDirty(bw, "ui")
+              end) },
         },
     }
-    -- Splice in nav rows, then Cancel
-    local btns = dialog.buttons
     for _, row in ipairs(nav_rows) do
-        btns[#btns + 1] = row
+        buttons[#buttons + 1] = row
     end
-    btns[#btns + 1] = { { text = "Cancel", callback = closing() } }
+    buttons[#buttons + 1] = { { text = "Cancel", callback = closing() } }
+    dialog = ButtonDialog:new{
+        title   = book.title or book.filename or "Book",
+        buttons = buttons,
+    }
     UIManager:show(dialog)
 end
 
@@ -2209,8 +2220,20 @@ function BookshelfWidget:_drillBackTo(depth)
 end
 
 -- Convenience for the existing series-expand call sites.
+-- These switch self.chip to the matching tab so the breadcrumb pill shows
+-- the right kind ("AUTHORS > Stephen King") when entered from a long-press
+-- on a different tab. When entered from the matching chip's own tap
+-- callback the assignment is a no-op.
+local function _switchChip(self, key)
+    if self.chip ~= key then
+        self.chip = key
+        G_reader_settings:saveSetting("bookshelf_active_chip", key)
+    end
+end
+
 function BookshelfWidget:_expandSeries(series)
     if not series or not series.series_name then return end
+    _switchChip(self, "series")
     self:_drillInto{
         kind    = "series",
         label   = series.series_name,
@@ -2220,6 +2243,7 @@ end
 
 function BookshelfWidget:_expandAuthor(group)
     if not group or not group.series_name then return end
+    _switchChip(self, "authors")
     self:_drillInto{
         kind    = "author",
         label   = group.series_name,
@@ -2229,6 +2253,7 @@ end
 
 function BookshelfWidget:_expandGenre(group)
     if not group or not group.series_name then return end
+    _switchChip(self, "genres")
     self:_drillInto{
         kind    = "genre",
         label   = group.series_name,
@@ -2238,6 +2263,7 @@ end
 
 function BookshelfWidget:_expandTag(group)
     if not group or not group.series_name then return end
+    _switchChip(self, "tags")
     self:_drillInto{
         kind    = "tag",
         label   = group.series_name,
