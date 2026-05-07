@@ -154,58 +154,62 @@ function Repo.buildBookMeta(filepath)
     if not filepath then return nil end
     local bim  = getBookInfoMgr()
     local info = bim:getBookInfo(filepath, true) or {}
-    -- Calibre fallback: when the user has a Calibre-managed library
-    -- their metadata.calibre file gives us full metadata for every book
-    -- without waiting on BIM extraction. Only used as a fallback per
-    -- field — BIM's data wins where present, since it was extracted from
-    -- the on-device file directly. cover_bb stays BIM-only because
-    -- metadata.calibre doesn't carry binary cover data.
+    -- Calibre is the PRIMARY source for textual metadata when a
+    -- metadata.calibre file is available — it already has clean,
+    -- user-curated title / authors / series / tags / description that
+    -- often come from richer sources (Goodreads, Amazon, manual edits)
+    -- than crengine's per-file extractor. BIM stays primary for the
+    -- fields Calibre doesn't track: cover_bb (binary), has_cover,
+    -- page_count. Where Calibre has no entry for a book (non-Calibre
+    -- libraries, or new books not yet imported), we fall back to BIM.
     local cb = _calibreMetadataFor(filepath)
 
-    -- Parse series info.
-    -- KOReader's BookInfoManager returns info.series as "<name> #<n>" and
-    -- info.series_index as the bare number when the cache is populated.
-    -- We use series_index when available; otherwise parse the formatted
-    -- string. Calibre stores series + series_index as separate fields.
+    -- Series — KOReader's BIM stores `info.series` as "<name> #<n>"
+    -- with series_index as the bare number; Calibre stores series +
+    -- series_index as separate fields. Prefer Calibre when present.
     local series_name, series_num
-    if info.series then
+    if cb and cb.series then
+        series_name = cb.series
+    elseif info.series then
         series_name = info.series:gsub(" #%d+$", "")
         series_num  = info.series:match(" #(%d+)$")
-    elseif cb and cb.series then
-        series_name = cb.series
     end
-    if info.series_index then
-        series_num = tostring(info.series_index)
-    elseif cb and cb.series_index then
+    if cb and cb.series_index then
         series_num = tostring(cb.series_index)
+    elseif info.series_index then
+        series_num = tostring(info.series_index)
+    elseif info.series and not series_num then
+        series_num = info.series:match(" #(%d+)$")
     end
 
-    local authors = splitAuthors(info.authors)
-    if (not authors or #authors == 0)
-            and cb and type(cb.authors) == "table" and #cb.authors > 0 then
+    -- Authors
+    local authors
+    if cb and type(cb.authors) == "table" and #cb.authors > 0 then
         authors = {}
         for _i, name in ipairs(cb.authors) do
             authors[#authors + 1] = name
         end
+    else
+        authors = splitAuthors(info.authors)
     end
+
     local filename = (filepath:match("([^/]+)$") or filepath):gsub("%.[^.]+$", "")
-    -- Title chain: BIM info → Calibre title → filename so the hero, the
-    -- spine fallback, the breadcrumb, etc. always have something
-    -- readable.
+    -- Title chain: Calibre → BIM → filename
     local title
-    if info.title and info.title ~= "" then
-        title = info.title
-    elseif cb and cb.title and cb.title ~= "" then
+    if cb and cb.title and cb.title ~= "" then
         title = cb.title
+    elseif info.title and info.title ~= "" then
+        title = info.title
     else
         title = filename
     end
-    -- Genres come from BIM's `keywords` column (mirrors the credocument
-    -- getDocProps "keywords" field; format is typically "Sci-Fi, Fantasy"
-    -- or "Sci-Fi; Fantasy"). When BIM has none, fall back to Calibre
-    -- tags (already an array — no parsing needed).
+
+    -- Genres: Calibre `tags` (array) → BIM `keywords` (string) → none.
     local genres
-    if info.keywords and info.keywords ~= "" then
+    if cb and type(cb.tags) == "table" and #cb.tags > 0 then
+        genres = {}
+        for _i, t in ipairs(cb.tags) do genres[#genres + 1] = t end
+    elseif info.keywords and info.keywords ~= "" then
         genres = {}
         for part in info.keywords:gmatch("[^,;]+") do
             local trimmed = part:match("^%s*(.-)%s*$")
@@ -214,10 +218,8 @@ function Repo.buildBookMeta(filepath)
             end
         end
         if #genres == 0 then genres = nil end
-    elseif cb and type(cb.tags) == "table" and #cb.tags > 0 then
-        genres = {}
-        for _i, t in ipairs(cb.tags) do genres[#genres + 1] = t end
     end
+
     return {
         filepath    = filepath,
         filename    = filename,
@@ -226,15 +228,24 @@ function Repo.buildBookMeta(filepath)
         author      = authors and authors[1] or nil,
         authors     = authors,
         genres      = genres,
-        series      = info.series,
+        -- `series` is the raw "Foundation #1" string used by some
+        -- consumers; reconstruct it from Calibre fields when needed.
+        series      = info.series
+                       or (cb and cb.series and series_num
+                           and (cb.series .. " #" .. series_num))
+                       or (cb and cb.series),
         series_name = series_name,
         series_num  = series_num,
+        -- BIM-only: covers and page count are not in metadata.calibre.
         cover_bb    = info.cover_bb,
         has_cover   = info.has_cover and not info.ignore_cover,
-        lang        = info.language or (cb and cb.languages and cb.languages[1]),
-        description = (info.description and info.description ~= "")
-                          and info.description
-                          or (cb and cb.comments) or nil,
+        lang        = (cb and cb.languages and cb.languages[1])
+                       or info.language,
+        description = (cb and cb.comments and cb.comments ~= "")
+                       and cb.comments
+                       or (info.description and info.description ~= ""
+                           and info.description)
+                       or nil,
         page_count  = info.pages,
     }
 end
