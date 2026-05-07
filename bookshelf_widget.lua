@@ -849,6 +849,11 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
         elseif info.has_meta == nil
                 and (tonumber(info.in_progress) or 0) < max_tries then
             needs = true
+        elseif info.cover_fetched == nil
+                and (tonumber(info.in_progress) or 0) < max_tries then
+            -- Metadata was extracted (e.g. by "Scan all library metadata")
+            -- but no cover attempt has been made yet.
+            needs = true
         elseif info.has_cover == "Y"
                 and (tonumber(info.in_progress) or 0) < max_tries
                 and BookshelfWidget._coverNeedsResize(info, cover_specs) then
