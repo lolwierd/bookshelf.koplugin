@@ -1336,21 +1336,36 @@ function BookshelfWidget:_buildPaginationFooter(content_w, label_h, total_pages)
     }
 end
 
--- _openSortMenu — opens an anchored ButtonDialog above the page-text button
--- showing chip-relevant sort options. Tapping a row writes the per-chip
--- setting and re-renders the shelf via _swapShelvesInPlace. The Recent chip
--- shows a single inert checked row so the gesture is consistent across chips.
+-- _openSortMenu — chip-relevant sort menu, opened from the pagination
+-- footer's page-text button. Centred ButtonDialog with a "Sort by" title.
+-- Picks write the per-chip setting and re-render via _swapShelvesInPlace.
+-- Recent chip shows a single inert checked row so the gesture stays
+-- consistent across chips.
+--
+-- Layout decisions (refined after the initial anchored version read poorly):
+--   1. `title = "Sort by"` adds a proper header — replaces a stock-looking
+--      KOReader dialog with one that announces its purpose.
+--   2. Unchecked radio rows are padded with two spaces so their left edge
+--      aligns with the checked row's `✓ ` glyph (no zigzag down the list).
+--   3. The All chip's two toggles (Reverse / Mixed folders) share a single
+--      two-up row, visually distinguishing them as independent on/off
+--      switches versus the one-of-many radio rows above.
+--   4. No anchor — the dialog centres on screen via the default
+--      CenterContainer wrap. The earlier left-anchored attempt read as
+--      lopsided rather than "rising from the pagination".
 function BookshelfWidget:_openSortMenu()
     local ButtonDialog = require("ui/widget/buttondialog")
-    local CHECK = "\xe2\x9c\x93 "  -- "✓ " — matches _openBookMenu's pattern.
+    local CHECK    = "\xe2\x9c\x93 "  -- "✓ " — matches _openBookMenu's pattern.
+    local NO_CHECK = "   "             -- 3 spaces ≈ ✓+space in the button face,
+                                       -- so unchecked rows align with checked.
 
     local chip   = self.chip
     local active = Repo.getSortKey(chip)
     local bw     = self
     local dialog
 
-    local function radio_row(label, sort_value)
-        local prefix = (active == sort_value) and CHECK or ""
+    local function radio_btn(label, sort_value)
+        local prefix = (active == sort_value) and CHECK or NO_CHECK
         return { text = prefix .. label,
                  callback = function()
                      G_reader_settings:saveSetting("bookshelf_sort_" .. chip, sort_value)
@@ -1360,9 +1375,9 @@ function BookshelfWidget:_openSortMenu()
                  end }
     end
 
-    local function toggle_row(label, setting_key)
+    local function toggle_btn(label, setting_key)
         local on     = G_reader_settings:readSetting(setting_key) == true
-        local prefix = on and CHECK or ""
+        local prefix = on and CHECK or NO_CHECK
         return { text = prefix .. label,
                  callback = function()
                      G_reader_settings:saveSetting(setting_key, not on)
@@ -1380,41 +1395,76 @@ function BookshelfWidget:_openSortMenu()
         }
     elseif chip == "all" then
         buttons = {
-            { radio_row(_("By title"),      "title") },
-            { radio_row(_("By date added"), "date_added") },
-            { radio_row(_("By path"),       "path") },
-            { toggle_row(_("Reverse"),       "bookshelf_sort_all_reverse") },
-            { toggle_row(_("Mixed folders"), "bookshelf_sort_all_mixed") },
+            { radio_btn(_("By title"),      "title") },
+            { radio_btn(_("By date added"), "date_added") },
+            { radio_btn(_("By path"),       "path") },
+            -- Two-up: toggles share a row, distinct from full-width radios.
+            {
+                toggle_btn(_("Reverse"),       "bookshelf_sort_all_reverse"),
+                toggle_btn(_("Mixed folders"), "bookshelf_sort_all_mixed"),
+            },
         }
     elseif chip == "latest" then
         buttons = {
-            { radio_row(_("By date added"), "mtime") },
-            { radio_row(_("By title"),      "title") },
+            { radio_btn(_("By date added"), "mtime") },
+            { radio_btn(_("By title"),      "title") },
         }
     elseif chip == "favorites" then
         buttons = {
-            { radio_row(_("By date added"),    "date_added") },
-            { radio_row(_("By title"),         "title") },
-            { radio_row(_("By recently read"), "recently_read") },
+            { radio_btn(_("By date added"),    "date_added") },
+            { radio_btn(_("By title"),         "title") },
+            { radio_btn(_("By recently read"), "recently_read") },
         }
     elseif chip == "series" or chip == "authors"
             or chip == "genres" or chip == "tags" then
         buttons = {
-            { radio_row(_("By name"),          "name") },
-            { radio_row(_("By latest read"),   "latest_read") },
-            { radio_row(_("By book count"),    "book_count") },
+            { radio_btn(_("By name"),          "name") },
+            { radio_btn(_("By latest read"),   "latest_read") },
+            { radio_btn(_("By book count"),    "book_count") },
         }
     else
         logger.dbg("[bookshelf] _openSortMenu: unknown chip " .. tostring(chip))
         return
     end
 
+    -- Without an anchor, ButtonDialog vertical-centres on screen — too far
+    -- from the pagination the user tapped. With a centred-x anchor at the
+    -- button's y, MovableContainer pops above the button so the dialog reads
+    -- as rising from the pagination.
+    --
+    -- shrink_unneeded_width fits the dialog to the widest button + title
+    -- rather than padding to the full width cap. The anchor closure reads
+    -- the MovableContainer's actual measured width (set during the sizing
+    -- pass before ensureAnchor runs — see movablecontainer.lua:184) so the
+    -- left-edge offset stays correctly centred even after the shrink.
+    local sw       = Screen:getWidth()
+    local sh       = Screen:getHeight()
+    local dialog_w = math.floor(math.min(sw, sh) * 0.7)  -- max width cap
+
     dialog = ButtonDialog:new{
-        -- anchor expects a function returning a Geom (per filemanager.lua's
-        -- ButtonDialog usage), not the widget itself. Reading .dimen lazily
-        -- also avoids depending on paint order at construction time.
-        anchor  = function() return bw._page_text_button and bw._page_text_button.dimen end,
-        buttons = buttons,
+        title                 = _("Sort by"),
+        title_align           = "center",
+        width                 = dialog_w,
+        shrink_unneeded_width = true,
+        -- Floor on the shrunk width so buttons aren't flush with the dialog
+        -- frame. Default is scaleBySize(100), which leaves zero breathing
+        -- room around our short button labels. ~40% of screen width gives
+        -- comfortable horizontal padding inside the dialog.
+        shrink_min_width      = math.floor(Screen:getWidth() * 0.4),
+        buttons               = buttons,
+        anchor                = function()
+            local btn = bw._page_text_button and bw._page_text_button.dimen
+            if not btn then return nil end
+            local actual_w = (dialog.movable and dialog.movable.dimen
+                              and dialog.movable.dimen.w) or dialog_w
+            local gap = Screen:scaleBySize(16)
+            return {
+                x = math.floor((sw - actual_w) / 2),
+                y = btn.y - gap,
+                w = actual_w,
+                h = btn.h,
+            }
+        end,
     }
     UIManager:show(dialog)
 end
