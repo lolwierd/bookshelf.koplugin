@@ -388,27 +388,25 @@ function ChipStrip:_initChips()
                 -- adjacent chip's cell. Some inner padding (Size.
                 -- padding.small per side) keeps the text from
                 -- touching the chip border.
-                max_width = w - 2 * Size.padding.small,
+                max_width = w - 2 * Size.padding.small,  -- breathing room from chip edge
             }
         end
-        -- Reserve a thick border slot on every chip so we can swap its
-        -- colour without shifting the cell_content position. Chips always
-        -- render black-on-paper; InvertedFrame pixel-flips the active chip
-        -- after painting so the inversion is a blitbuffer primitive rather
-        -- than a font-colour path. The border is paper (invisible) normally
-        -- and for active chips (inverted to black); it goes black only when
-        -- pending — drawing a hollow ring as tap feedback.
-        local b = Size.border.thick
-        local border_color = is_pending and Blitbuffer.COLOR_BLACK or paper
+        -- Chips always render black-on-paper; InvertedFrame pixel-flips the
+        -- active chip so the inversion is a blitbuffer primitive (avoids
+        -- TextWidget fgcolor, which some Kindle builds do not honour).
+        -- bordersize=0: a thick border caused a white ring artifact on KT6
+        -- because the FrameContainer border pixels weren't fully covered by
+        -- invertRect on that build. Pending feedback uses a grey background
+        -- instead of a hollow ring — avoids the border entirely.
+        local chip_bg = (is_pending and not is_active) and Blitbuffer.gray(0.75) or paper
         local chip_body = InvertedFrame:new{
             _invert    = is_active,
-            bordersize = b,
-            color      = border_color,
+            bordersize = 0,
             margin     = 0,
             padding    = 0,
-            background = paper,
+            background = chip_bg,
             CenterContainer:new{
-                dimen = Geom:new{ w = w - 2 * b, h = self.height - 2 * b },
+                dimen = Geom:new{ w = w, h = self.height },
                 cell_content,
             },
         }
