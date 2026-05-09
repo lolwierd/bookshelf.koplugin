@@ -275,10 +275,14 @@ end
 
 -- ─── _rebuild ─────────────────────────────────────────────────────────────────
 
+-- Mirrored in bookshelf_settings.lua's _chipsSubItems(); the menu reads the
+-- same default so its checkboxes match what the strip actually renders.
 local _DEFAULT_CHIPS_DISABLED = {
     latest = true, authors = true, genres = true, tags = true,
 }
 local function _resolveDisabledSet()
+    -- Saved-as-empty means the user explicitly enabled every chip; honour
+    -- that rather than falling back to the default disabled set.
     return G_reader_settings:readSetting("bookshelf_chips_disabled")
            or _DEFAULT_CHIPS_DISABLED
 end

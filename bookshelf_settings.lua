@@ -373,11 +373,27 @@ function Settings:_editHeroRegion(key, touchmenu_instance)
     LineEditor.show(key, self._bw, self, touchmenu_instance)
 end
 
+-- Kept in sync with _DEFAULT_CHIPS_DISABLED in bookshelf_widget.lua. The
+-- widget owns the rendering; this menu is the only writer of the
+-- bookshelf_chips_disabled setting. Both files must agree on which chips
+-- are off by default, otherwise the menu shows different state than the
+-- chip strip.
+local _DEFAULT_CHIPS_DISABLED = {
+    latest = true, authors = true, genres = true, tags = true,
+}
+local function _readDisabledSet()
+    local saved = G_reader_settings:readSetting("bookshelf_chips_disabled")
+    if saved then return saved end
+    -- Fresh install: clone the default so the caller can mutate without
+    -- corrupting the module-level constant.
+    local cloned = {}
+    for k, v in pairs(_DEFAULT_CHIPS_DISABLED) do cloned[k] = v end
+    return cloned
+end
+
 -- _chipsSubItems() — drill-down for "Edit shelf tabs". One row per
 -- chip with a checkbox; tapping toggles the chip's disabled flag and
--- (if the bookshelf is live) rebuilds the strip. The home screen
--- defensively shows all four chips if a user disables every one, so
--- this menu can never lock the user out.
+-- (if the bookshelf is live) rebuilds the strip.
 function Settings:_chipsSubItems()
     local CHIP_ORDER  = {
         "all", "recent", "latest", "series", "authors", "genres",
@@ -399,19 +415,20 @@ function Settings:_chipsSubItems()
             text           = CHIP_LABELS[key],
             keep_menu_open = true,
             checked_func = function()
-                local set = G_reader_settings:readSetting("bookshelf_chips_disabled") or {}
+                -- Read-only: indexing is safe on the module-level default
+                -- if no setting saved, since we never mutate here.
+                local set = G_reader_settings:readSetting("bookshelf_chips_disabled")
+                              or _DEFAULT_CHIPS_DISABLED
                 return not set[key]
             end,
             callback = function(touchmenu_instance)
-                local set = G_reader_settings:readSetting("bookshelf_chips_disabled") or {}
+                local set = _readDisabledSet()
                 if set[key] then set[key] = nil else set[key] = true end
-                -- If the user has cleared every override, drop the
-                -- whole key — settings.reader.lua stays minimal.
-                if not next(set) then
-                    G_reader_settings:delSetting("bookshelf_chips_disabled")
-                else
-                    G_reader_settings:saveSetting("bookshelf_chips_disabled", set)
-                end
+                -- Persist the set even when empty: an explicit "everything
+                -- enabled" choice must stick. Falling back to delSetting +
+                -- defaults would silently re-disable the four default-off
+                -- chips the user just turned on.
+                G_reader_settings:saveSetting("bookshelf_chips_disabled", set)
                 G_reader_settings:flush()
                 if self._bw and self._bw._rebuild then
                     self._bw:_rebuild()
