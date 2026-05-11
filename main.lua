@@ -434,24 +434,47 @@ end
 
 -- _safeShow — show bookshelf, doing the right thing depending on whether
 -- the action was invoked from FM (overlay bookshelf directly) or from the
--- reader (route through the standard ReaderUI:onHome() path so the reader
--- closes AND FM is recreated underneath, then schedule the bookshelf show
--- on the next tick).
+-- reader (close the reader, then show bookshelf).
 --
--- Why onHome() vs raw onClose: BookshelfWidget's gesture handling forwards
--- top-zone taps / swipes to FileManager.instance's touch zones (so the
--- standard FM menu is reachable from bookshelf). If the reader was launched
--- directly (start_with=last) FM was never created — calling onClose alone
--- leaves nothing underneath bookshelf and the menu becomes unreachable.
--- onHome calls showFileManager which creates FM if missing.
+-- Three reader-context cases:
+--
+--   1. Reader is open AND bookshelf is already on the UIManager stack
+--      underneath it (the typical "open book FROM bookshelf, dismiss back
+--      to bookshelf" flow now that _openBook leaves the widget on the
+--      stack). Calling ReaderUI:onClose(false) directly is enough —
+--      bookshelf is already painted underneath and just needs a refresh
+--      via the show() warm path. Skips the otherwise-wasted FileManager
+--      build that onHome() would do.
+--
+--   2. Reader is open but bookshelf is NOT on the stack (e.g. user
+--      tapped the gesture from inside Reader on a cold start_with=last
+--      boot). Fall back to ReaderUI:onHome() which calls showFileManager
+--      → an FM instance is created beneath us. Required because
+--      BookshelfWidget forwards top-zone menu gestures to
+--      FileManager.instance; with no FM underneath, those gestures
+--      would have nowhere to land.
+--
+--   3. No reader context (we're in FM or pre-host): just call show().
 function Bookshelf:_safeShow()
     if self.ui and self.ui.document and self.ui.onHome then
-        self.ui:onHome()
-        -- onCloseDocument fires synchronously inside onHome → FM is
-        -- foreground. We schedule bookshelf for the next tick so FM's
-        -- creation/show completes first, leaving FM as the painting
-        -- surface beneath the bookshelf overlay.
-        UIManager:nextTick(function() self:show() end)
+        if self:_isShowing() and self.ui.onClose then
+            -- Suppress onCloseDocument's own nextTick(show) for users with
+            -- start_with=bookshelf — we're about to refresh ourselves and
+            -- two queued shows on the same tick is wasteful.
+            self._handling_safe_show_close = true
+            self.ui:onClose(false)
+            self._handling_safe_show_close = false
+            UIManager:nextTick(function()
+                if self._widget then self:show() end
+            end)
+        else
+            self.ui:onHome()
+            -- onCloseDocument fires synchronously inside onHome → FM is
+            -- foreground. We schedule bookshelf for the next tick so FM's
+            -- creation/show completes first, leaving FM as the painting
+            -- surface beneath the bookshelf overlay.
+            UIManager:nextTick(function() self:show() end)
+        end
     else
         self:show()
     end
@@ -539,6 +562,9 @@ function Bookshelf:onCloseDocument()
     -- another. self.ui.document is still set in the latter case.
     if G_reader_settings:readSetting("start_with") ~= "bookshelf" then return end
     if self.ui and self.ui.document then return end
+    -- _safeShow's fast path closes Reader directly and queues its own
+    -- show() on the next tick; let it do the work without a duplicate.
+    if self._handling_safe_show_close then return end
     -- If Bookshelf is already on the stack (the typical "open book from
     -- home, close back to home" flow now that _openBook leaves it there),
     -- self:show()'s refresh path handles the repaint without ever exposing
