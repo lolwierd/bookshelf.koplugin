@@ -448,6 +448,12 @@ function Repo.buildBook(filepath)
     book.page_num = ds:readSetting("last_page")
     book.book_pct = ds:readSetting("percent_finished")
     book.last_xp  = ds:readSetting("last_xpointer")
+    -- summary.status feeds the cover-progress indicators in
+    -- bookshelf_cover_progress.decide(); read here so the DocSettings
+    -- handle is reused. nil is fine -- decide() treats absent status
+    -- as "new" and renders nothing.
+    local _summary = ds:readSetting("summary")
+    book.status = _summary and _summary.status or nil
     -- BIM skips page count for crengine docs (the unrendered getPageCount()
     -- returns 2-3x the rendered count), so EPUB books have nil page_count
     -- after buildBookMeta. Two sdr-side sources to fall back on, in order:
