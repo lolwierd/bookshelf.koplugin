@@ -2026,7 +2026,6 @@ function BookshelfWidget:_swapShelvesInPlace()
     UIManager:setDirty(self, "ui")
 end
 
--- Rebuild the hero from current state and swap it into _hero_parent[1].
 -- softRefresh — lightweight return-to-bookshelf update. Splits the work
 -- the warm-path show() previously did as a single _rebuild() into two
 -- phases: the hero swap (synchronous, ~10ms — only depends on the current
@@ -2038,6 +2037,13 @@ end
 -- the existing shelves still on screen, then re-sorts a moment later. A
 -- full _rebuild() would have held the EPDC on a black screen for the
 -- whole fetch+sort cost.
+--
+-- The shelf swap is further gated on _needsReaderReturnShelfRefresh: most
+-- chip+sort combos can't have their visible order changed by a single
+-- book closing (e.g. All sorted by title), so for those the deferred
+-- swap is skipped entirely. The just-closed book's spine briefly shows
+-- a stale progress bar until the next page-flip / chip switch — a fair
+-- trade for a snappier return.
 --
 -- Falls back to _rebuild() when the live tree can't be reused (cold widget,
 -- expanded/tall layouts the in-place swap helpers don't handle).
@@ -2060,6 +2066,9 @@ function BookshelfWidget:softRefresh()
     self:_swapHeroInPlace()
     UIManager:setDirty(self, "ui")
     if self._startStatusTimer then self:_startStatusTimer() end
+    if not self:_needsReaderReturnShelfRefresh() then
+        return
+    end
     -- Cancel any earlier deferred shelf swap that hasn't fired (two quick
     -- reader open/close cycles); the later one supersedes.
     if self._soft_refresh_shelves_fn then
@@ -2072,6 +2081,36 @@ function BookshelfWidget:softRefresh()
     UIManager:scheduleIn(0.15, self._soft_refresh_shelves_fn)
 end
 
+-- Does the current chip+sort combination depend on read state? Used by
+-- softRefresh to decide whether closing a book could have reordered the
+-- visible shelves. Chips driven purely by file metadata (title, mtime,
+-- date_added, size) can't be affected; chips driven by read history /
+-- progress can. Drilldown views are skipped — their group membership
+-- can't change just because one of the group's books was read.
+function BookshelfWidget:_needsReaderReturnShelfRefresh()
+    if #self._drilldown_path > 0 then return false end
+    local chip = self.chip
+    if chip == "recent" then return true end
+    if chip == "latest" then return false end
+    if chip == "favorites" then
+        return Repo.getSortKey("favorites") == "recently_read"
+    end
+    if chip == "all" then
+        local sk = Repo.getSortKey("all")
+        return sk == "last_read"
+            or sk == "percent_unopened_first"
+            or sk == "percent_unopened_last"
+            or sk == "percent_natural"
+    end
+    if chip == "series" or chip == "authors"
+       or chip == "genres" or chip == "tags" then
+        return Repo.getSortKey(chip) == "latest_read"
+    end
+    -- Unknown chip: refresh to be safe.
+    return true
+end
+
+-- Rebuild the hero from current state and swap it into _hero_parent[1].
 -- Shared between _previewBook (synchronous swap on user tap) and the async
 -- cover-load completion path. No-op if there's no live tree to swap into.
 --

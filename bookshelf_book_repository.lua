@@ -595,6 +595,17 @@ local _all_cache       = {}  -- { [key] = { shapes = {...}, expires_at = number 
 -- and letting all three readers hit the result is the dominant speedup
 -- (Lutesong's Kindle Color: 20s per chip → ~1-2s, 2000-book library).
 local _light_meta_cache = {}  -- { [key] = { map = {[fp]=record}, expires_at = number } }
+-- Per-file progress cache. DocSettings:open() does a Lua-parse from disk
+-- per call, which dominates loops that read percent / summary.status for
+-- many books in a row (getAll's prefetch on the Home chip is the obvious
+-- one). Caching the parsed result for a short window cuts repeat scans
+-- to memory reads.
+--
+-- Invalidation: onCloseDocument explicitly drops the just-closed file via
+-- invalidateProgressCache(fp); invalidateWalkCache wipes the whole map as
+-- a belt-and-braces refresh for any sideloaded / metadata-edited cases.
+local PROGRESS_CACHE_TTL = 120  -- seconds
+local _progress_cache    = {}   -- filepath → { pct, status, expires_at }
 
 function Repo.invalidateWalkCache()
     _walk_cache       = {}
@@ -603,6 +614,7 @@ function Repo.invalidateWalkCache()
     _genres_cache     = {}
     _all_cache        = {}
     _light_meta_cache = {}
+    _progress_cache   = {}
 end
 
 function Repo.invalidateSeriesCache()
@@ -610,6 +622,39 @@ function Repo.invalidateSeriesCache()
     _authors_cache    = {}
     _genres_cache     = {}
     _light_meta_cache = {}
+end
+
+function Repo.invalidateProgressCache(filepath)
+    if filepath then _progress_cache[filepath] = nil
+    else _progress_cache = {} end
+end
+
+-- Cached read of a file's percent_finished + summary.status. Returns
+-- (pct, status). Either field may be nil. A pcall guards a corrupt sdr
+-- sidecar so the caller's loop survives single-file faults.
+function Repo.readProgress(filepath)
+    if not filepath then return nil, nil end
+    local now = os.time()
+    local cached = _progress_cache[filepath]
+    if cached and cached.expires_at > now then
+        return cached.pct, cached.status
+    end
+    local pct, status
+    local ok_ds, ds = pcall(function() return getDocSettings():open(filepath) end)
+    if ok_ds and ds then
+        local ok_pct, p = pcall(ds.readSetting, ds, "percent_finished")
+        if ok_pct then pct = tonumber(p) end
+        local ok_sum, summary = pcall(ds.readSetting, ds, "summary")
+        if ok_sum and type(summary) == "table" then
+            status = summary.status
+        end
+    end
+    _progress_cache[filepath] = {
+        pct        = pct,
+        status     = status,
+        expires_at = now + PROGRESS_CACHE_TTL,
+    }
+    return pct, status
 end
 
 local function walkBooks(root, depth, out, current_depth)
@@ -1096,29 +1141,22 @@ function Repo.getAll(path, limit, offset)
         end
     end
     if needs_percent then
-        local DocSettings = require("docsettings")
+        -- Route through Repo.readProgress so steady-state re-runs of this
+        -- prefetch (cache TTL expired, but progress cache still warm) skip
+        -- the per-file DocSettings:open() cost. readProgress also handles
+        -- the pcall guard for corrupt .sdr sidecars — a nil _pct sorts
+        -- as "never opened", matching the previous behaviour.
+        --
+        -- summary.status is read so percent_natural can put user-marked-
+        -- complete books in the finished tier even when percent_finished
+        -- < 1 (e.g. user marked complete at 99% read). Without this,
+        -- finished books would sort AHEAD of in-progress books because the
+        -- comparator only looked at percent (issue #17).
         for _, e in ipairs(entries) do
             if e.attr.mode == "file" then
-                -- pcall: a corrupt .sdr sidecar must not abort the prefetch.
-                -- A nil _pct sorts as "never opened" — same as a brand-new file.
-                local ok, ds = pcall(DocSettings.open, DocSettings, e.fp)
-                if ok and ds then
-                    local ok_pct, pct = pcall(ds.readSetting, ds, "percent_finished")
-                    if ok_pct then e._pct = pct end
-                    -- Also pull summary.status so percent_natural can put
-                    -- user-marked-complete books in the finished tier even
-                    -- when percent_finished < 1 (e.g. user marked complete
-                    -- at 99% read). Without this, finished books would sort
-                    -- AHEAD of in-progress books because the comparator only
-                    -- looked at percent (issue #17).
-                    local ok_sum, summary = pcall(ds.readSetting, ds, "summary")
-                    if ok_sum and type(summary) == "table" then
-                        e._status = summary.status
-                    end
-                else
-                    logger.warn("[bookshelf] DocSettings:open failed for", e.fp, ":", ds)
-                end
-                -- no ds:close() — DocSettings doesn't expose one; GC handles it
+                local pct, status = Repo.readProgress(e.fp)
+                e._pct    = pct
+                e._status = status
             end
         end
     end

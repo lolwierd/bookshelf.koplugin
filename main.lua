@@ -552,9 +552,12 @@ function Bookshelf:onCloseDocument()
     -- cached enrichStats fields should be dropped — the hero rebuild that
     -- follows must see the new totals. Targeted to the closed file only.
     local Repo = require("bookshelf_book_repository")
-    if Repo and Repo.invalidateStatsCache and self.ui and self.ui.document
-       and self.ui.document.file then
-        Repo.invalidateStatsCache(self.ui.document.file)
+    if Repo and self.ui and self.ui.document and self.ui.document.file then
+        local fp = self.ui.document.file
+        if Repo.invalidateStatsCache then Repo.invalidateStatsCache(fp) end
+        -- Same reasoning for the progress cache: percent_finished /
+        -- summary.status are now stale for this file specifically.
+        if Repo.invalidateProgressCache then Repo.invalidateProgressCache(fp) end
     end
 
     -- Only re-show Bookshelf if the user is actually returning to "home"
