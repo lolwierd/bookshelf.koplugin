@@ -1525,7 +1525,7 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
         current = Repo.getCurrent()
     end
     if current then Repo.enrichStats(current) end
-    return HeroCard:new{
+    local card = HeroCard:new{
         book         = current,
         width        = content_w,
         height       = hero_h,
@@ -1535,6 +1535,26 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
         device_state = self:_buildDeviceState(),
         on_tap       = function(b) self:_openBook(b) end,
         on_hold      = function(b) self:_openBookMenu(b) end,
+    }
+    if self._focus_zone ~= "hero" then return card end
+    local OverlapGroup = require("ui/widget/overlapgroup")
+    local Widget       = require("ui/widget/widget")
+    local BW           = Size.border.thick
+    local FocusRing    = Widget:extend{}
+    function FocusRing:init()
+        self.dimen = Geom:new{ w = content_w, h = hero_h }
+    end
+    function FocusRing:paintTo(bb, x, y)
+        local c = Blitbuffer.COLOR_BLACK
+        bb:paintRect(x,              y,             content_w, BW, c)
+        bb:paintRect(x,              y + hero_h-BW, content_w, BW, c)
+        bb:paintRect(x,              y,             BW, hero_h, c)
+        bb:paintRect(x + content_w-BW, y,           BW, hero_h, c)
+    end
+    return OverlapGroup:new{
+        dimen = Geom:new{ w = content_w, h = hero_h },
+        card,
+        FocusRing:new{},
     }
 end
 
