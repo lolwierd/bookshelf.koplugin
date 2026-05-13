@@ -2550,6 +2550,10 @@ function BookshelfWidget:_chipNeighbour(direction)
     return keys[((idx - 1 + direction) % n) + 1]
 end
 
+-- _chipKeyNeighbour(key, direction) -> chip key or nil
+-- Like _chipNeighbour but looks up an arbitrary key rather than self.chip.
+-- Used by D-pad chip-row navigation where the focused key != the active chip.
+-- Returns nil when there's only one (or zero) chips in the active list.
 function BookshelfWidget:_chipKeyNeighbour(key, direction)
     local keys = self._active_chip_keys
     if not keys or #keys <= 1 then return nil end
