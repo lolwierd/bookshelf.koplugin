@@ -102,7 +102,7 @@ end
 function ScaledCoverCache:clear()
     logger.dbg(string.format("[bookshelf perf] ScaledCoverCache: clear hits=%d puts=%d evictions=%d",
         self._hits, self._puts, self._evictions))
-    for _, bb in pairs(self._cache) do
+    for _i, bb in pairs(self._cache) do
         if bb and bb.free then pcall(function() bb:free() end) end
     end
     self._cache     = {}

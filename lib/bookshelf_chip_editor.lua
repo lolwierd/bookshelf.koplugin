@@ -1233,7 +1233,7 @@ function Editor:_pickStatusFilter(draft, on_close)
     -- is semantically equivalent to "match any status", so the label
     -- describes the resulting behaviour rather than the action's mechanism.
     local function any_checked()
-        for _ in pairs(draft.filter.statuses) do return false end
+        for _k in pairs(draft.filter.statuses) do return false end
         return true
     end
     local function is_on(v) return draft.filter.statuses[v] == true end

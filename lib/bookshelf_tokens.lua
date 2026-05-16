@@ -449,7 +449,7 @@ function Tokens.expand(format, book, state)
     local result = expandDatetimeBraces(format, state)
     result = expandConditionals(result, book, state)
     local names = tokenNamesByLengthDesc()
-    for _, name in ipairs(names) do
+    for _i, name in ipairs(names) do
         local expander = Tokens.expanders[name]
         result = result:gsub("%%" .. name, function()
             return tostring(expander(book, state) or "")

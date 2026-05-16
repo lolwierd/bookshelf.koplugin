@@ -82,7 +82,7 @@ function Settings:_pickTokenViaLibraryModal(LibraryModal, dialog)
 
     local function items()
         local out = {}
-        for _, t in ipairs(Tokens.CATALOGUE) do
+        for _i, t in ipairs(Tokens.CATALOGUE) do
             if active_chip == "all" or t.category == active_chip then
                 if not search_query or #search_query < 2 then
                     out[#out + 1] = t
@@ -136,7 +136,7 @@ Wrap content in [if:foo]…[/if] to show it only when the token has a value. Add
   [if:batt<20]LOW %batt[/if]]==]),
             chip_strip = function()
                 local out = {}
-                for _, c in ipairs(CHIPS) do
+                for _i, c in ipairs(CHIPS) do
                     out[#out + 1] = { key = c.key, label = c.label, is_active = (c.key == active_chip) }
                 end
                 return out
@@ -254,7 +254,7 @@ function Settings:_pickTokenFallback(dialog)
 
     local items = {}
     local current_cat
-    for _, t in ipairs(Tokens.CATALOGUE) do
+    for _i, t in ipairs(Tokens.CATALOGUE) do
         if t.category ~= current_cat then
             current_cat = t.category
             items[#items + 1] = {
@@ -1114,7 +1114,7 @@ function Settings:_tabsMenuItems()
         },
     }
     local tabs = TabModel.load()
-    for _, tab in ipairs(tabs) do
+    for _i, tab in ipairs(tabs) do
         local tab_id = tab.id
         items[#items + 1] = {
             keep_menu_open = true,
@@ -1122,21 +1122,21 @@ function Settings:_tabsMenuItems()
                 -- Re-read from model so label reflects any edits made via
                 -- the long-press editor without re-opening the menu.
                 local fresh = TabModel.load()
-                for _, t in ipairs(fresh) do
+                for _i, t in ipairs(fresh) do
                     if t.id == tab_id then return t.label end
                 end
                 return tab_id
             end,
             checked_func = function()
                 local fresh = TabModel.load()
-                for _, t in ipairs(fresh) do
+                for _i, t in ipairs(fresh) do
                     if t.id == tab_id then return t.enabled ~= false end
                 end
                 return true
             end,
             callback = function(touchmenu_instance)
                 local fresh = TabModel.load()
-                for _, t in ipairs(fresh) do
+                for _i, t in ipairs(fresh) do
                     if t.id == tab_id then
                         t.enabled = (t.enabled == false) and true or false
                         TabModel.save(fresh)
@@ -1165,7 +1165,7 @@ function Settings:_tabsMenuItems()
             while true do
                 local candidate = "custom_" .. n
                 local taken = false
-                for _, t in ipairs(fresh) do
+                for _i, t in ipairs(fresh) do
                     if t.id == candidate then taken = true; break end
                 end
                 if not taken then break end

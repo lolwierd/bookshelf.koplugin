@@ -317,7 +317,7 @@ function Bookshelf:_extendMenuOrder()
        or type(order["KOMenu:menu_buttons"]) ~= "table" then
         return
     end
-    for _, id in ipairs(order["KOMenu:menu_buttons"]) do
+    for _i, id in ipairs(order["KOMenu:menu_buttons"]) do
         if id == "bookshelf_tab" then return end
     end
     -- Position 2: filemanager_settings stays at [1] so MenuSorter's orphan
@@ -1208,10 +1208,10 @@ function Bookshelf:deletePluginSettings()
         "sort_all_mixed", "sort_all_reverse",
         "check_updates", "dev_branch", "last_install_source",
     }
-    for _, k in ipairs(known) do
+    for _i, k in ipairs(known) do
         G_reader_settings:delSetting(PREFIX .. k)
     end
-    for _, chip in ipairs({ "all", "recent", "latest", "series", "authors",
+    for _i, chip in ipairs({ "all", "recent", "latest", "series", "authors",
                             "genres", "tags", "favorites" }) do
         G_reader_settings:delSetting(PREFIX .. "sort_" .. chip)
     end

@@ -328,8 +328,8 @@ function BookshelfWidget:handleEvent(event)
         if fm and fm.menu and fm.menu._ordered_touch_zones then
             zone_lists[#zone_lists + 1] = fm.menu._ordered_touch_zones
         end
-        for _, zones in ipairs(zone_lists) do
-            for _, tzone in ipairs(zones) do
+        for _i, zones in ipairs(zone_lists) do
+            for _i, tzone in ipairs(zones) do
                 if tzone.gs_range:match(ev) and tzone.handler(ev) then
                     return true
                 end
@@ -389,13 +389,13 @@ end
 -- render, so no payload mutation needed for that path.
 function BookshelfWidget:_scrubFromDrilldown(filepath)
     if not filepath or not self._drilldown_path then return end
-    for _, entry in ipairs(self._drilldown_path) do
+    for _i, entry in ipairs(self._drilldown_path) do
         local payload = entry and entry.payload
         if type(payload) == "table" then
             local lists = { payload.books, payload.series,
                             payload.authors, payload.genres,
                             payload.folders }
-            for _, list in ipairs(lists) do
+            for _i, list in ipairs(lists) do
                 if type(list) == "table" then
                     for i = #list, 1, -1 do
                         local item = list[i]
@@ -423,7 +423,7 @@ end
 -- needed to rebuild each entry via Repo lookups on restore.
 function BookshelfWidget:_serializeDrillPath()
     local out = {}
-    for _, e in ipairs(self._drilldown_path) do
+    for _i, e in ipairs(self._drilldown_path) do
         if e.kind == "folder" then
             out[#out + 1] = { kind = "folder", label = e.label,
                               path = e.payload and e.payload.path }
@@ -463,7 +463,7 @@ end
 -- user doesn't see a broken drill on the next launch.
 function BookshelfWidget:_restoreDrillPath(saved)
     if type(saved) ~= "table" or #saved == 0 then return end
-    for _, e in ipairs(saved) do
+    for _i, e in ipairs(saved) do
         if e.kind == "folder" and e.path then
             self._drilldown_path[#self._drilldown_path + 1] = {
                 kind = "folder", label = e.label,
@@ -629,7 +629,7 @@ function BookshelfWidget:_rebuild()
     -- contain inline nerd-font glyphs); the legacy tab.icon field still
     -- gets prepended for back-compat until the user re-saves and the
     -- editor migrates the record to the merged form.
-    for _, tab in ipairs(TabModel.getActive()) do
+    for _i, tab in ipairs(TabModel.getActive()) do
         local display = tab.label or ""
         if tab.icon and tab.icon ~= "" then
             display = tab.icon .. " " .. display
@@ -644,7 +644,7 @@ function BookshelfWidget:_rebuild()
     -- Fall back to all defaults so the shelves still have a data source
     -- even when the strip is hidden.
     if #active_chips == 0 then
-        for _, tab in ipairs(TabModel.DEFAULTS()) do
+        for _i, tab in ipairs(TabModel.DEFAULTS()) do
             active_chips[#active_chips + 1] = { key = tab.id, label = tab.label }
         end
     end
@@ -652,14 +652,14 @@ function BookshelfWidget:_rebuild()
     -- first surviving chip so render doesn't try to fetch from a
     -- disabled chip's data source.
     local active_in_set = false
-    for _, c in ipairs(active_chips) do
+    for _i, c in ipairs(active_chips) do
         if c.key == self.chip then active_in_set = true; break end
     end
     if not active_in_set then
         -- Skip action chips (current, search) — they have no data source.
         -- Fall back to the first nav chip instead.
         self.chip = active_chips[1].key
-        for _, c in ipairs(active_chips) do
+        for _i, c in ipairs(active_chips) do
             if not c.action then self.chip = c.key; break end
         end
         BookshelfSettings.save("active_chip", self.chip)
@@ -683,7 +683,7 @@ function BookshelfWidget:_rebuild()
     self._active_chip_keys = {}
     self._dpad_chip_keys   = {}
     self._action_chip_keys = {}
-    for _, c in ipairs(active_chips) do
+    for _i, c in ipairs(active_chips) do
         -- Exclude action chips from the swipe-cycle ring (search, current
         -- book, …) — they're actions, not navigable tabs.
         if not c.action then
@@ -1433,7 +1433,7 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
             }
         end
     end
-    for _, item in ipairs(items or {}) do
+    for _i, item in ipairs(items or {}) do
         if item then
             -- Flat-book items (Recent / Latest / drilldown) carry filepath.
             maybe_queue(item.filepath)
@@ -1533,7 +1533,7 @@ function BookshelfWidget:_pollExtraction()
     local max_tries = BIM.max_extract_tries or 3
     local ready_paths   = {}
     local still_pending = {}
-    for _, f in ipairs(files) do
+    for _i, f in ipairs(files) do
         local info = BIM:getBookInfo(f.filepath, false)
         local inprog = tonumber(info and info.in_progress) or 0
         local meta_ready = info and info.has_meta == "Y"
@@ -1627,7 +1627,7 @@ function BookshelfWidget:_fetchChipItems(n)
     -- feedback_image_disposable_shared_book).
     if tip and tip.kind == "search" then
         local fresh = {}
-        for _, f in ipairs(tip.payload.folders or {}) do
+        for _i, f in ipairs(tip.payload.folders or {}) do
             fresh[#fresh + 1] = {
                 kind       = "folder",
                 path       = f.path,
@@ -1635,19 +1635,19 @@ function BookshelfWidget:_fetchChipItems(n)
                 first_book = f.first_book_fp and Repo.buildBookMeta(f.first_book_fp),
             }
         end
-        for _, name in ipairs(tip.payload.author_names or {}) do
+        for _i, name in ipairs(tip.payload.author_names or {}) do
             local g = Repo.findGroup("author", name)
             if g then fresh[#fresh + 1] = g end
         end
-        for _, name in ipairs(tip.payload.series_names or {}) do
+        for _i, name in ipairs(tip.payload.series_names or {}) do
             local g = Repo.findGroup("series", name)
             if g then fresh[#fresh + 1] = g end
         end
-        for _, name in ipairs(tip.payload.genre_names or {}) do
+        for _i, name in ipairs(tip.payload.genre_names or {}) do
             local g = Repo.findGroup("genre", name)
             if g then fresh[#fresh + 1] = g end
         end
-        for _, fp in ipairs(tip.payload.book_fps or {}) do
+        for _i, fp in ipairs(tip.payload.book_fps or {}) do
             local b = Repo.buildBookMeta(fp)
             if b then fresh[#fresh + 1] = b end
         end
@@ -2034,7 +2034,7 @@ function BookshelfWidget:_buildShelfRows(items, content_w, shelf_h, PAD, n_rows)
         -- inside _rebuild isn't visible here. Require lazily so the
         -- dependency stays explicit and idempotent.
         local TabModel = require("lib/bookshelf_tab_model")
-        for _, c in ipairs(TabModel.getActive()) do
+        for _i, c in ipairs(TabModel.getActive()) do
             if c.id == self.chip and c.source and c.source.kind == "single_series" then
                 in_series = true
                 break
@@ -2231,7 +2231,7 @@ function BookshelfWidget:_buildPaginationFooter(content_w, label_h, total_pages)
     --      below us (e.g. SimpleUI's bottom-bar zone) instead of
     --      firing hold_callback. Mutating dimen.h propagates to the
     --      stored GestureRange.range via the shared reference.
-    for _, b in ipairs({first, prev, page_text, next_btn, last}) do
+    for _i, b in ipairs({first, prev, page_text, next_btn, last}) do
         if b.frame then
             b.frame.padding_bottom = (b.frame.padding_bottom or 0) + hit_extension
         end
@@ -2414,7 +2414,7 @@ function BookshelfWidget:_swapShelvesInPlace()
         self._inner_vgroup:resetLayout()
     end
     UIManager:nextTick(function()
-        for _, w in ipairs({ old_top, old_bottom, old_footer }) do
+        for _i, w in ipairs({ old_top, old_bottom, old_footer }) do
             if w and w.free then pcall(function() w:free() end) end
         end
     end)
@@ -2449,7 +2449,7 @@ local function _descendFindSpine(node, fp, depth)
         end
     end
     -- No direct match — descend into children.
-    for _, c in ipairs(node) do
+    for _i, c in ipairs(node) do
         if c then
             local parent, idx, spine = _descendFindSpine(c, fp, depth + 1)
             if parent then return parent, idx, spine end
@@ -2522,7 +2522,7 @@ function BookshelfWidget:_repaintSelectionHighlight(old_fp, new_fp)
         end)
     end
 
-    for _, idx in ipairs({ d.shelf_top_idx, d.shelf_bottom_idx }) do
+    for _i, idx in ipairs({ d.shelf_top_idx, d.shelf_bottom_idx }) do
         local hg = self._inner_vgroup[idx]
         if hg then
             find_and_swap(hg, old_fp, false)
@@ -2567,7 +2567,7 @@ function BookshelfWidget:_refreshSpineInPlace(fp)
     if not fp or not self._inner_vgroup or not self._shelf_dims then return end
     local d = self._shelf_dims
     local replaced_dimen
-    for _, idx in ipairs({ d.shelf_top_idx, d.shelf_bottom_idx }) do
+    for _i, idx in ipairs({ d.shelf_top_idx, d.shelf_bottom_idx }) do
         local hg = self._inner_vgroup[idx]
         if hg then
             local parent, slot_idx, old_spine = _descendFindSpine(hg, fp, 0)
@@ -2959,10 +2959,10 @@ local NIGHTMODE_TOKENS  = { "nightmode" }
 function BookshelfWidget:_anyActiveRegionUses(tokens)
     local Regions = require("lib/bookshelf_hero_regions")
     local resolved = Regions.read()
-    for _, key in ipairs(Regions.ORDER) do
+    for _i, key in ipairs(Regions.ORDER) do
         local r = resolved[key]
         if r and not r.disabled and type(r.template) == "string" then
-            for _, name in ipairs(tokens) do
+            for _i, name in ipairs(tokens) do
                 -- "%name" followed by anything that isn't [A-Za-z0-9_]
                 -- (or end-of-string). %% in a Lua pattern matches a
                 -- literal %.
@@ -4234,7 +4234,7 @@ function BookshelfWidget:_openBookMenu(item)
     -- corresponding tab is enabled in TabModel.
     local TabModel = require("lib/bookshelf_tab_model")
     local enabled = {}
-    for _, tab in ipairs(TabModel.getActive()) do enabled[tab.id] = true end
+    for _i, tab in ipairs(TabModel.getActive()) do enabled[tab.id] = true end
     local nav_rows = {}
     -- Long-press nav rows are JUMPS, not descents — reset the drilldown
     -- path before each so the breadcrumb starts fresh (otherwise repeated
@@ -4462,7 +4462,7 @@ function BookshelfWidget:_openBookMenu(item)
     }
     buttons[#buttons + 1] = { reset_btn, delete_btn }
 
-    for _, row in ipairs(nav_rows) do
+    for _i, row in ipairs(nav_rows) do
         buttons[#buttons + 1] = row
     end
     buttons[#buttons + 1] = { { text = "Cancel", callback = closing() } }
@@ -4558,7 +4558,7 @@ function BookshelfWidget:_drillBackTo(depth)
         self._drilldown_path[#self._drilldown_path] = nil
     end
     if restore_path then
-        for _, entry in ipairs(restore_path) do
+        for _i, entry in ipairs(restore_path) do
             self._drilldown_path[#self._drilldown_path + 1] = entry
         end
     end
@@ -4604,9 +4604,9 @@ function BookshelfWidget:_applyWithinGroupSort(group)
     local SortEngine = require("lib/bookshelf_sort_engine")
     SortEngine.sort(group.books_meta, within)
     local fp_to_book = {}
-    for _, b in ipairs(group.books) do fp_to_book[b.filepath] = b end
+    for _i, b in ipairs(group.books) do fp_to_book[b.filepath] = b end
     local new_books = {}
-    for _, m in ipairs(group.books_meta) do
+    for _i, m in ipairs(group.books_meta) do
         local b = fp_to_book[m.filepath]
         if b then new_books[#new_books + 1] = b end
     end
@@ -4733,11 +4733,11 @@ function BookshelfWidget:_searchAndDrill(query)
     -- _fetchChipItems re-hydrates on every render so covers are always
     -- fresh.
     local author_names, series_names, genre_names = {}, {}, {}
-    for _, g in ipairs(results.authors or {}) do author_names[#author_names + 1] = g.series_name end
-    for _, g in ipairs(results.series  or {}) do series_names[#series_names + 1] = g.series_name end
-    for _, g in ipairs(results.genres  or {}) do genre_names[#genre_names + 1]   = g.series_name end
+    for _i, g in ipairs(results.authors or {}) do author_names[#author_names + 1] = g.series_name end
+    for _i, g in ipairs(results.series  or {}) do series_names[#series_names + 1] = g.series_name end
+    for _i, g in ipairs(results.genres  or {}) do genre_names[#genre_names + 1]   = g.series_name end
     local folders = {}
-    for _, f in ipairs(results.folders or {}) do
+    for _i, f in ipairs(results.folders or {}) do
         folders[#folders + 1] = {
             path          = f.path,
             label         = f.label,
@@ -4745,7 +4745,7 @@ function BookshelfWidget:_searchAndDrill(query)
         }
     end
     local book_fps = {}
-    for _, b in ipairs(results.books or {}) do
+    for _i, b in ipairs(results.books or {}) do
         if b.filepath then book_fps[#book_fps + 1] = b.filepath end
     end
     -- Search is its own top-level mode rather than a nested drill under
