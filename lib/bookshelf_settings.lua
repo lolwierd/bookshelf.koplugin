@@ -960,123 +960,15 @@ function Settings:_pickLatestDepth()
     })
 end
 
--- Strip REMOTE image references from a markdown blob (http(s) URLs that
--- MuPDF / crengine can't fetch over the network from a Kindle). Local
--- relative refs survive so the bundled logo at assets/bookshelf-logo.png
--- renders via the html_resource_directory passed to ScrollHtmlWidget.
--- Also flattens <picture><source ...><img ...></picture> to just the
--- inner <img> -- MuPDF doesn't know the picture element so the wrapper
--- and srcset selectors get dropped, keeping the fallback img.
-local function _stripRemoteImages(md)
-    if not md then return "" end
-    -- Markdown ![alt](http(s)://...)
-    md = md:gsub("!%[[^%]]*%]%(https?://[^%s%)]+%)", "")
-    -- <img src="http://..."> with double or single quotes
-    md = md:gsub("<img[^>]-src=\"https?://[^\"]+\"[^>]*>", "")
-    md = md:gsub("<img[^>]-src='https?://[^']+'[^>]*>", "")
-    -- <picture>...</picture> wrappers: strip the wrapper + the <source>
-    -- variants, leave the inner <img>. MuPDF doesn't understand the
-    -- prefers-color-scheme media query anyway.
-    md = md:gsub("<picture[^>]*>", "")
-    md = md:gsub("</picture>", "")
-    md = md:gsub("<source[^>]->", "")
-    return md
-end
-
--- Convert GFM-style markdown tables to inline HTML <table> blocks. The
--- bundled luamd parser (apps/filemanager/lib/md.lua, ~2018 vintage)
--- has no table support -- it treats table rows as plain paragraphs, so
--- the README's gestures / tokens / config tables come out as one long
--- pipe-delimited mess. Pre-process them to HTML here; mdToHtml passes
--- raw HTML through untouched.
---
--- Detection rule: header row has at least one `|`, separator row is
--- only `|`, `-`, `:`, and whitespace, and contains `---`. Subsequent
--- pipe rows belong to the table until a non-pipe line ends it.
-local function _convertMarkdownTables(md)
-    if not md then return "" end
-    local lines = {}
-    -- Preserve trailing newlines; gmatch with "([^\n]*)\n?" is finicky.
-    for line in (md .. "\n"):gmatch("([^\n]*)\n") do
-        lines[#lines + 1] = line
-    end
-    local function isPipeRow(line)
-        return line and line:find("|") ~= nil
-    end
-    local function isSeparator(line)
-        if not line then return false end
-        return line:match("^%s*|?[%s|:%-]+|?%s*$") ~= nil
-            and line:find("%-%-%-") ~= nil
-    end
-    -- Inline-markdown rendering for table cells. Once a cell is HTML
-    -- it skips luamd's pass, so **bold**, *italic*, `code`, and
-    -- [text](url) need to be rendered here or they'd appear literally
-    -- in the rendered table. Order matters: bold (** **) before
-    -- italic (* *) so the latter doesn't eat the bold delimiters.
-    local function renderInline(s)
-        s = s:gsub("%*%*([^%*]+)%*%*", "<strong>%1</strong>")
-        s = s:gsub("%*([^%*]+)%*",     "<em>%1</em>")
-        s = s:gsub("`([^`]+)`",        "<code>%1</code>")
-        s = s:gsub("%[([^%]]+)%]%(([^%)]+)%)",
-                   "<a href=\"%2\">%1</a>")
-        return s
-    end
-    local function splitCells(row)
-        -- Trim leading/trailing `|` then split on `|`. Cells get
-        -- whitespace-trimmed and inline-md-rendered; empty cells
-        -- produce empty <td>.
-        local trimmed = row:gsub("^%s*|", ""):gsub("|%s*$", "")
-        local cells = {}
-        for cell in (trimmed .. "|"):gmatch("([^|]*)|") do
-            local clean = cell:match("^%s*(.-)%s*$") or ""
-            cells[#cells + 1] = renderInline(clean)
-        end
-        return cells
-    end
-    local out, i = {}, 1
-    local in_code = false
-    while i <= #lines do
-        local line = lines[i]
-        if line:match("^%s*```") then
-            in_code = not in_code
-            out[#out + 1] = line
-            i = i + 1
-        elseif not in_code and isPipeRow(line) and isSeparator(lines[i + 1]) then
-            -- Collect header (i), skip separator (i+1), then all
-            -- subsequent pipe rows.
-            local rows = { line }
-            local j = i + 2
-            while isPipeRow(lines[j]) do
-                rows[#rows + 1] = lines[j]
-                j = j + 1
-            end
-            out[#out + 1] = "<table>"
-            for r, row in ipairs(rows) do
-                local cells = splitCells(row)
-                local tag = (r == 1) and "th" or "td"
-                local parts = { "<tr>" }
-                for _i, c in ipairs(cells) do
-                    parts[#parts + 1] = "<" .. tag .. ">" .. c .. "</" .. tag .. ">"
-                end
-                parts[#parts + 1] = "</tr>"
-                out[#out + 1] = table.concat(parts)
-            end
-            out[#out + 1] = "</table>"
-            i = j
-        else
-            out[#out + 1] = line
-            i = i + 1
-        end
-    end
-    return table.concat(out, "\n")
-end
-
+-- _about() — small popup with the logo, plugin name + installed version,
+-- the one-paragraph description (sourced from _meta.lua so translators
+-- can localise it the same way they localise the plugin's own
+-- description), and the GitHub URL. Deliberately simple -- an earlier
+-- iteration rendered the full README which read as overwhelming.
 function Settings:_about()
-    -- Find the plugin root from this file's own path. settings.lua lives
-    -- at <plugin_dir>/lib/bookshelf_settings.lua, so strip one segment to
-    -- reach _meta.lua and README.md at the plugin root. require("_meta")
-    -- is ambiguous because every koplugin has a _meta and they all
-    -- collide in package.path -- whichever plugin loaded first wins.
+    -- Find the plugin root from this file's path. settings.lua sits at
+    -- <plugin_dir>/lib/<file>.lua so strip one segment to reach
+    -- _meta.lua and assets/.
     local src = debug.getinfo(1, "S").source:match("@(.*)$")
     local plugin_dir = src and src:match("^(.*)/lib/[^/]+%.lua$")
     local meta
@@ -1084,66 +976,18 @@ function Settings:_about()
         local ok, m = pcall(dofile, plugin_dir .. "/_meta.lua")
         if ok then meta = m end
     end
-    local name    = (meta and meta.fullname)    or "Bookshelf"
-    local version = (meta and meta.version)     or "?"
+    local name        = (meta and meta.fullname)    or "Bookshelf"
+    local version     = (meta and meta.version)     or "?"
+    local description = (meta and meta.description) or ""
 
-    -- Load README from the plugin root. The release zip ships it
-    -- alongside _meta.lua. Fall back to the old short InfoMessage if
-    -- either the file or the markdown converter is unavailable (e.g.
-    -- a Kindle build that's stripped apps/filemanager support).
-    local readme
-    if plugin_dir then
-        local f = io.open(plugin_dir .. "/README.md", "rb")
-        if f then
-            readme = f:read("*all")
-            f:close()
-        end
-    end
-    local ok_conv, FileConverter = pcall(require, "apps/filemanager/filemanagerconverter")
-    if not readme or not ok_conv or not FileConverter or not FileConverter.mdToHtml then
-        UIManager:show(InfoMessage:new{
-            text = string.format("%s  v%s\n\n%s",
-                name, version, (meta and meta.description) or ""),
-        })
-        return
-    end
+    -- Hard-coded English URL; not translatable. Display form drops the
+    -- https:// prefix for compactness; the bare host+path reads as a
+    -- URL on its own.
+    local GITHUB_URL = "github.com/AndyHazz/bookshelf.koplugin"
 
-    -- README is the source of truth; no synthetic version header here.
-    -- The installed version is shown by the Updates row in the menu and
-    -- duplicating it at the top of every About view risked drift if a
-    -- future change ever forgot to keep this prepend in sync.
-    readme = _stripRemoteImages(readme)
-    readme = _convertMarkdownTables(readme)
-
-    -- Light stylesheet tuned for e-ink: no colours, generous line height,
-    -- collapsible <details> blocks (the README's reference sections use
-    -- them; crengine renders summaries as bold rows on tap).
-    local stylesheet = [[
-        body { font-family: sans-serif; line-height: 1.4; }
-        h1 { font-size: 1.5em; margin: 0.6em 0 0.4em; }
-        h2 { font-size: 1.25em; margin: 0.6em 0 0.3em; }
-        h3 { font-size: 1.1em;  margin: 0.5em 0 0.25em; }
-        h4 { font-size: 1em;    margin: 0.4em 0 0.2em; font-weight: bold; }
-        p  { margin: 0.4em 0; }
-        ul, ol { margin: 0.3em 0 0.3em 1.4em; }
-        li { margin: 0.15em 0; }
-        code { background-color: #eee; padding: 0 0.2em; font-family: monospace; }
-        pre  { background-color: #f4f4f4; padding: 0.5em; font-family: monospace; }
-        pre code { background-color: transparent; padding: 0; }
-        table { border-collapse: collapse; margin: 0.5em 0; }
-        th, td { border: 1px solid #888; padding: 0.2em 0.5em; }
-        details { margin: 0.3em 0; }
-        details > summary { font-weight: bold; }
-        hr { border: 0; border-top: 1px solid #888; margin: 0.6em 0; }
-        blockquote { border-left: 3px solid #888; padding-left: 0.6em; margin: 0.4em 0; }
-    ]]
-    local html = FileConverter:mdToHtml(readme, name .. " README", stylesheet)
-
-    -- Inline-require the heavy widgets so the menu-tree initialization
-    -- (which happens before the user ever opens the About row) doesn't
-    -- pay the cost of pulling the HTML renderer into memory.
     local Device           = require("device")
     local Screen           = Device.screen
+    local Font             = require("ui/font")
     local Geom             = require("ui/geometry")
     local Size             = require("ui/size")
     local Blitbuffer       = require("ffi/blitbuffer")
@@ -1152,41 +996,55 @@ function Settings:_about()
     local MovableContainer = require("ui/widget/container/movablecontainer")
     local InputContainer   = require("ui/widget/container/inputcontainer")
     local VerticalGroup    = require("ui/widget/verticalgroup")
-    local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
-    local TitleBar         = require("ui/widget/titlebar")
+    local VerticalSpan     = require("ui/widget/verticalspan")
+    local TextBoxWidget    = require("ui/widget/textboxwidget")
+    local TextWidget       = require("ui/widget/textwidget")
     local GestureRange     = require("ui/gesturerange")
 
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local frame_w = math.floor(sw * 0.95)
-    local frame_h = math.floor(sh * 0.92)
+    -- Frame target: ~75% of width on phone-sized portraits, capped so it
+    -- doesn't sprawl on landscape / tablet sizes.
+    local frame_w = math.min(math.floor(sw * 0.8), Screen:scaleBySize(420))
+    local content_w = frame_w - Size.padding.large * 2
 
-    local dialog
-    local title_bar = TitleBar:new{
-        width            = frame_w,
-        -- Plain English string: README body itself is English, and the
-        -- word doesn't translate meaningfully (it's the file's name).
-        -- Excluded from xgettext extraction by skipping the _() wrapper.
-        title            = name .. " README",
-        close_callback   = function() UIManager:close(dialog) end,
-        with_bottom_line = true,
+    local column = VerticalGroup:new{ align = "center" }
+
+    -- Logo at the top, centred. Uses ImageWidget with scale_factor=0
+    -- so it scales to fit logo_w while keeping aspect. The height passed
+    -- to ImageWidget is a sentinel max -- scale_factor=0 ignores it
+    -- once the width fits.
+    if plugin_dir then
+        local logo_path = plugin_dir .. "/assets/bookshelf-logo.png"
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if ok_lfs and lfs and lfs.attributes and lfs.attributes(logo_path) then
+            local ImageWidget = require("ui/widget/imagewidget")
+            local logo_w = math.min(content_w, Screen:scaleBySize(240))
+            column[#column + 1] = ImageWidget:new{
+                file         = logo_path,
+                width        = logo_w,
+                height       = math.floor(logo_w),  -- upper bound; scale_factor=0 picks the actual
+                scale_factor = 0,
+            }
+            column[#column + 1] = VerticalSpan:new{ width = Size.padding.large }
+        end
+    end
+
+    column[#column + 1] = TextWidget:new{
+        text = name .. " v" .. version,
+        face = Font:getFace("smalltfont", 22),
+        bold = true,
     }
-    local title_h = title_bar:getSize().h
-    local body_h  = frame_h - title_h - Size.padding.large * 2
-
-    local html_widget = ScrollHtmlWidget:new{
-        html_body                = html,
-        width                    = frame_w - Size.padding.large * 2,
-        height                   = body_h,
-        -- 22 reads well on PW5 (~270 DPI); the default 24 is for full-
-        -- screen text without competing chrome, and 15 was too tight
-        -- (user feedback). Falls through Screen:scaleBySize so other
-        -- DPIs get a proportional bump.
-        default_font_size        = Screen:scaleBySize(22),
-        -- Resource root: lets crengine/MuPDF resolve relative <img>
-        -- srcs like "assets/bookshelf-logo.png" against the plugin
-        -- directory. Without this, local images render as broken
-        -- placeholders.
-        html_resource_directory  = plugin_dir,
+    column[#column + 1] = VerticalSpan:new{ width = Size.padding.default }
+    column[#column + 1] = TextBoxWidget:new{
+        text      = description,
+        face      = Font:getFace("cfont", 16),
+        width     = content_w,
+        alignment = "center",
+    }
+    column[#column + 1] = VerticalSpan:new{ width = Size.padding.large }
+    column[#column + 1] = TextWidget:new{
+        text = GITHUB_URL,
+        face = Font:getFace("cfont", 14),
     }
 
     local frame = FrameContainer:new{
@@ -1194,13 +1052,10 @@ function Settings:_about()
         padding    = Size.padding.large,
         margin     = 0,
         background = Blitbuffer.COLOR_WHITE,
-        VerticalGroup:new{
-            align = "left",
-            title_bar,
-            html_widget,
-        },
+        column,
     }
 
+    local dialog
     dialog = InputContainer:new{
         align = "center",
         dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh },
@@ -1230,11 +1085,6 @@ function Settings:_about()
             return true
         end
     end
-
-    -- ScrollHtmlWidget reaches back through self.dialog when a long-press
-    -- on text triggers selection highlighting; wire it up so the highlight
-    -- can call setDirty against the dialog container.
-    html_widget.dialog = dialog
 
     UIManager:show(dialog)
 end
