@@ -4,7 +4,7 @@
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-05-17 07:26+0100\n"
+"POT-Creation-Date: 2026-05-17 09:42+0100\n"
 "Language: en_GB\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
@@ -99,7 +99,7 @@ msgstr ""
 msgid "Format"
 msgstr ""
 
-#: lib/bookshelf_chip_editor.lua:178
+#: lib/bookshelf_chip_editor.lua:178 lib/bookshelf_widget.lua:4749
 msgid "Rating"
 msgstr ""
 
@@ -113,7 +113,7 @@ msgstr ""
 #: lib/bookshelf_colour_palette.lua:347 lib/bookshelf_hero_line_editor.lua:397
 #: lib/bookshelf_settings.lua:788 lib/bookshelf_settings.lua:880
 #: lib/bookshelf_settings.lua:936 lib/bookshelf_widget.lua:2322
-#: lib/bookshelf_widget.lua:4795 main.lua:996
+#: lib/bookshelf_widget.lua:4774 lib/bookshelf_widget.lua:5163 main.lua:996
 msgid "Cancel"
 msgstr ""
 
@@ -177,8 +177,8 @@ msgstr ""
 msgid "Delete this chip?? This cannot be undone."
 msgstr ""
 
-#: lib/bookshelf_chip_editor.lua:595 lib/bookshelf_widget.lua:4517
-#: lib/bookshelf_widget.lua:4533
+#: lib/bookshelf_chip_editor.lua:595 lib/bookshelf_widget.lua:4864
+#: lib/bookshelf_widget.lua:4880
 msgid "Delete"
 msgstr ""
 
@@ -218,7 +218,7 @@ msgstr ""
 #: lib/bookshelf_chip_editor.lua:1012 lib/bookshelf_chip_editor.lua:1327
 #: lib/bookshelf_chip_editor.lua:1424 lib/bookshelf_hero_line_editor.lua:86
 #: lib/bookshelf_settings.lua:226 lib/bookshelf_updater.lua:267
-#: lib/bookshelf_widget.lua:4290
+#: lib/bookshelf_widget.lua:4424
 msgid "Close"
 msgstr ""
 
@@ -311,7 +311,7 @@ msgid "Books"
 msgstr ""
 
 #: lib/bookshelf_chip_editor.lua:1407 lib/bookshelf_library_modal.lua:404
-#: lib/bookshelf_widget.lua:4800
+#: lib/bookshelf_widget.lua:5168
 msgid "Search"
 msgstr ""
 
@@ -817,7 +817,7 @@ msgstr ""
 msgid "Current home folder:"
 msgstr ""
 
-#: lib/bookshelf_widget.lua:1855 lib/bookshelf_widget.lua:4404
+#: lib/bookshelf_widget.lua:1855 lib/bookshelf_widget.lua:4610
 msgid "File no longer exists. The bookshelf entry is stale."
 msgstr ""
 
@@ -855,23 +855,55 @@ msgstr ""
 msgid "Bookshelf will load on next launch"
 msgstr ""
 
-#: lib/bookshelf_widget.lua:4283
+#: lib/bookshelf_widget.lua:4323
+msgid "(no title)"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4417
 msgid "Description"
 msgstr ""
 
-#: lib/bookshelf_widget.lua:4532
+#: lib/bookshelf_widget.lua:4476
+msgid "Remove from To Be Read"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4476
+msgid "Add to To Be Read"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4706
+msgid "Tag editor unavailable in this context."
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4730
+msgid "Metadata refresh queued"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4769
+msgid "Clear"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4777
+msgid "Set rating"
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4796
+msgid "File no longer exists."
+msgstr ""
+
+#: lib/bookshelf_widget.lua:4879
 msgid "Delete file permanently?"
 msgstr ""
 
-#: lib/bookshelf_widget.lua:4545
+#: lib/bookshelf_widget.lua:4892
 msgid "Failed to delete file."
 msgstr ""
 
-#: lib/bookshelf_widget.lua:4789
+#: lib/bookshelf_widget.lua:5157
 msgid "Search library"
 msgstr ""
 
-#: lib/bookshelf_widget.lua:4791
+#: lib/bookshelf_widget.lua:5159
 msgid "title, author, series, genre…"
 msgstr ""
 

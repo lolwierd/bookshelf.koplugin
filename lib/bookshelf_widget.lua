@@ -4439,6 +4439,19 @@ function BookshelfWidget:_openBookMenu(item)
     local ButtonDialog   = require("ui/widget/buttondialog")
     local ReadCollection = require("readcollection")
     local bw = self
+    -- Hydrate the rating from DocSettings if it's missing. Shelf book
+    -- records come from Repo.buildBookMeta which deliberately skips the
+    -- per-file DocSettings:open() for speed (rating, percent, status
+    -- live in the sidecar, not BIM). Without this, the menu's Rating
+    -- button always showed ☆☆☆☆☆ for shelf books even when the user
+    -- had set a rating from the hero card or a previous long-press --
+    -- the button is reading book.rating which the shelf record never
+    -- populated. readProgress is cheap (sidecar fast-path, memoised
+    -- via _progress_cache) so doing it once on menu open is fine.
+    if book.rating == nil and book.filepath then
+        local _pct, _status, fresh_rating = Repo.readProgress(book.filepath)
+        book.rating = fresh_rating
+    end
     local ok_fav, in_fav = pcall(function()
         return ReadCollection:isFileInCollection(book.filepath, "favorites")
     end)
@@ -4455,7 +4468,12 @@ function BookshelfWidget:_openBookMenu(item)
     local ok_tbr, in_tbr = pcall(function()
         return ReadCollection:isFileInCollection(book.filepath, TBR_COLL)
     end)
-    local tbr_label = (ok_tbr and in_tbr) and "Remove from TBR" or "Add to TBR"
+    -- Labels mirror SimpleUI's wording so a user familiar with one
+    -- plugin recognises the affordance in the other. Wrapped in _()
+    -- because the phrase is translatable -- SimpleUI translates these
+    -- strings, and an acronym ("TBR") was flagged as confusing.
+    local tbr_label = (ok_tbr and in_tbr)
+        and _("Remove from To Be Read") or _("Add to To Be Read")
     -- ButtonDialog does NOT auto-close on a button tap — each callback has to
     -- call UIManager:close itself. Wrap with a closing helper so all callbacks
     -- close the dialog after their action runs.
