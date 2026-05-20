@@ -5861,6 +5861,14 @@ function BookshelfWidget:_openBookMenu(item)
         local empty  = ("\xE2\x98\x86"):rep(5 - r)
         return filled .. empty
     end
+    -- Forward declaration: the rating_close closure below references
+    -- rating_button inside its body (line 5905 area) to repaint the
+    -- staged-fill on dialog reinit. The local definition is further
+    -- down (~line 5940) inside the same outer scope. Without a
+    -- forward decl here, the reference resolves to a global which is
+    -- nil at runtime — the rating dialog's button callback crashes
+    -- with "attempt to index global 'rating_button' (a nil value)".
+    local rating_button
     local function _openRatingDialog()
         local rating_dialog
         local function rating_close(fn)
@@ -5936,8 +5944,11 @@ function BookshelfWidget:_openBookMenu(item)
     -- close the rating sub-dialog reinits the outer menu so the
     -- Rating button text reflects the new draft value in place.
     -- background is mutated by rating_close (in _openRatingDialog
-    -- above) when the draft value changes.
-    local rating_button
+    -- above) when the draft value changes. The `rating_button` name
+    -- itself is forward-declared above so _openRatingDialog's
+    -- closure captures it as an upvalue rather than a global; we
+    -- assign here (no `local` keyword) so the same upvalue is
+    -- populated for both readers.
     rating_button = {
         text_func  = _ratingLabel,
         background = draft.rating ~= false and STAGED_BG or nil,
