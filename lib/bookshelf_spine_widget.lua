@@ -508,6 +508,7 @@ function SpineWidget:_renderShadowedCard(inner)
         local glyph_w = self:_glyphWidth(glyph_h)
         if glyph_w <= card_w * 0.4 then
             local halo_w = 1
+            local colours = CoverProgress.resolvedColours()
             -- Match the in-progress glyph's positioning exactly. The
             -- in-progress branch (above) bases its lift on
             -- TextWidget:getSize().h (actual rendered height,
@@ -527,7 +528,8 @@ function SpineWidget:_renderShadowedCard(inner)
             local widget_h = probe:getSize().h
             probe:free()
             local outlined = CoverProgress.buildOutlinedGlyphWidget(
-                CoverProgress.GLYPH_BOOKMARK_CHECK, glyph_h, halo_w)
+                CoverProgress.GLYPH_BOOKMARK_CHECK, glyph_h, halo_w,
+                colours.badge_fg, colours.badge_bg)
             local lift = _glyphTopLift(self.show_titles)
             local y_offset = card_h - math.floor(widget_h * lift + 0.5)
             children[#children + 1] = FrameContainer:new{
@@ -550,6 +552,7 @@ function SpineWidget:_renderShadowedCard(inner)
     if indicators.glyph == "complete_tickbox" then
         local TextWidget = require("ui/widget/textwidget")
         local Font       = require("ui/font")
+        local colours    = CoverProgress.resolvedColours()
 
         -- Reference widget measures the page-count pill's natural inner
         -- height. Built with identical face spec to the page-count pill
@@ -582,6 +585,7 @@ function SpineWidget:_renderShadowedCard(inner)
             text = "\xEF\x90\xAE",   -- U+F42E nerd-font check
             face = Font:getFace("smallinfofont", _badgeSize(10)),
             bold = true,
+            fgcolor = colours.badge_fg,
         }
         local VerticalGroup = require("ui/widget/verticalgroup")
         local VerticalSpan  = require("ui/widget/verticalspan")
@@ -592,7 +596,8 @@ function SpineWidget:_renderShadowedCard(inner)
         }
         local pill = FrameContainer:new{
             bordersize     = Size.border.thin,
-            background     = Blitbuffer.COLOR_WHITE,
+            background     = colours.badge_bg,
+            color          = colours.badge_fg,
             radius         = Screen:scaleBySize(3),
             padding_left   = 0,
             padding_right  = 0,
@@ -647,7 +652,8 @@ function SpineWidget:_renderShadowedCard(inner)
             -- close to the bar height.
             badge_widget = FrameContainer:new{
                 bordersize     = Size.border.thin,
-                background     = Blitbuffer.COLOR_WHITE,
+                background     = colours.badge_bg,
+                color          = colours.badge_fg,
                 radius         = Screen:scaleBySize(3),
                 padding_left   = Size.padding.small,
                 padding_right  = Size.padding.small,
@@ -661,6 +667,7 @@ function SpineWidget:_renderShadowedCard(inner)
                     text = "p\xe2\x80\x8a" .. tostring(self.book.page_count),
                     face = Font:getFace("smallinfofont", _badgeSize(12)),
                     bold = true,
+                    fgcolor = colours.badge_fg,
                 },
             }
             local sz = badge_widget:getSize()
@@ -715,9 +722,11 @@ function SpineWidget:_renderShadowedCard(inner)
             and self.book and self.book.series_num then
         local TextWidget     = require("ui/widget/textwidget")
         local Font           = require("ui/font")
+        local colours        = CoverProgress.resolvedColours()
         local badge = FrameContainer:new{
             bordersize     = Size.border.thin,
-            background     = Blitbuffer.COLOR_WHITE,
+            background     = colours.badge_bg,
+            color          = colours.badge_fg,
             radius         = Screen:scaleBySize(3),
             padding_left   = Size.padding.default,
             padding_right  = Size.padding.default,
@@ -745,6 +754,7 @@ function SpineWidget:_renderShadowedCard(inner)
                 text = "#\xe2\x80\x8a" .. tostring(self.book.series_num),
                 face = Font:getFace("smallinfofont", _badgeSize(12)),
                 bold = true,
+                fgcolor = colours.badge_fg,
             },
         }
         local badge_w       = badge:getSize().w

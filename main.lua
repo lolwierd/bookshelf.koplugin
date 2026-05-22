@@ -1350,6 +1350,7 @@ function Bookshelf:deletePluginSettings()
         "chip_flex_widths", "calibre_metadata", "latest_walk_depth",
         "show_close_msg", "show_series_num",
         "progress_fill", "progress_track", "bookmark_color",
+        "badge_fg", "badge_bg",
         "progress_badge_enabled", "progress_bar_enabled",
         "progress_bookmark_enabled", "progress_enabled",
         "sort_all_mixed", "sort_all_reverse",

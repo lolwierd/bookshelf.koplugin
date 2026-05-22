@@ -240,21 +240,26 @@ function M.buildGlyphWidget(glyph_char, size, colour)
     }
 end
 
--- Build a white-with-black-halo glyph. The glyph is painted in BLACK
--- at every cell of a (2*halo_w + 1) x (2*halo_w + 1) offset grid
--- (skipping the centre), then in WHITE at the centre. The offset paints
--- create the outline; the white centre fills the strokes. Used for the
+-- Build a halo'd glyph. The glyph is painted in `halo_color` at every
+-- cell of a (2*halo_w + 1) x (2*halo_w + 1) offset grid (skipping the
+-- centre), then in `centre_color` at the centre. The offset paints
+-- create the outline; the centre paint fills the strokes. Used for the
 -- 'completed' indicator so the bookmark-check stays legible against any
 -- cover artwork without the heavy 'sticker' look of the old badge.
-function M.buildOutlinedGlyphWidget(glyph_char, size, halo_w)
+-- `halo_color` / `centre_color` are Blitbuffer colour objects; both
+-- default to the legacy BLACK halo / WHITE centre pair so callers that
+-- don't pass them keep their existing render.
+function M.buildOutlinedGlyphWidget(glyph_char, size, halo_w, halo_color, centre_color)
     halo_w = halo_w or 1
+    halo_color   = halo_color   or Blitbuffer.COLOR_BLACK
+    centre_color = centre_color or Blitbuffer.COLOR_WHITE
     local widget_w = size + 2 * halo_w
     local widget_h = size + 2 * halo_w
     local FrameContainer = require("ui/widget/container/framecontainer")
     local group = OverlapGroup:new{
         dimen = Geom:new{ w = widget_w, h = widget_h },
     }
-    -- Black offsets in all 8 directions around the centre.
+    -- Halo offsets in all 8 directions around the centre.
     for dy = -halo_w, halo_w do
         for dx = -halo_w, halo_w do
             if dx ~= 0 or dy ~= 0 then
@@ -263,18 +268,18 @@ function M.buildOutlinedGlyphWidget(glyph_char, size, halo_w)
                     padding      = 0,
                     padding_top  = halo_w + dy,
                     padding_left = halo_w + dx,
-                    M.buildGlyphWidget(glyph_char, size, Blitbuffer.COLOR_BLACK),
+                    M.buildGlyphWidget(glyph_char, size, halo_color),
                 }
             end
         end
     end
-    -- White centre glyph.
+    -- Centre glyph.
     group[#group + 1] = FrameContainer:new{
         bordersize   = 0,
         padding      = 0,
         padding_top  = halo_w,
         padding_left = halo_w,
-        M.buildGlyphWidget(glyph_char, size, Blitbuffer.COLOR_WHITE),
+        M.buildGlyphWidget(glyph_char, size, centre_color),
     }
     return group
 end
@@ -293,6 +298,13 @@ local DEFAULT_TRACK    = { grey = 0xFF }
 -- Bookmark (in-progress glyph) keeps the pre-2.2.5 look — same dark-grey
 -- value the glyph picked up when it used to read from progress_fill.
 local DEFAULT_BOOKMARK = { grey = 0x40 }
+-- Badge defaults preserve the existing hard-coded pill look (black text on
+-- a white fill, thin black border) and the halo'd completed-bookmark look
+-- (black outline around a white check). Mapping:
+--   pill  : background = badge_bg, text + border = badge_fg
+--   check : halo       = badge_fg, centre        = badge_bg
+local DEFAULT_BADGE_FG = { grey = 0x00 }
+local DEFAULT_BADGE_BG = { grey = 0xFF }
 
 -- Returns colour values resolved to Blitbuffer objects for the current
 -- screen mode. Called per cover paint; relies on bookshelf_colour's
@@ -302,10 +314,14 @@ function M.resolvedColours()
     local fill_raw     = BookshelfSettings.read("progress_fill")  or DEFAULT_FILL
     local track_raw    = BookshelfSettings.read("progress_track") or DEFAULT_TRACK
     local bookmark_raw = BookshelfSettings.read("bookmark_color") or DEFAULT_BOOKMARK
+    local badge_fg_raw = BookshelfSettings.read("badge_fg")       or DEFAULT_BADGE_FG
+    local badge_bg_raw = BookshelfSettings.read("badge_bg")       or DEFAULT_BADGE_BG
     return {
         fill     = Colour.parseColorValue(fill_raw,     is_colour),
         track    = Colour.parseColorValue(track_raw,    is_colour),
         bookmark = Colour.parseColorValue(bookmark_raw, is_colour),
+        badge_fg = Colour.parseColorValue(badge_fg_raw, is_colour),
+        badge_bg = Colour.parseColorValue(badge_bg_raw, is_colour),
     }
 end
 
@@ -316,9 +332,13 @@ function M.rawColours()
         fill     = BookshelfSettings.read("progress_fill")  or DEFAULT_FILL,
         track    = BookshelfSettings.read("progress_track") or DEFAULT_TRACK,
         bookmark = BookshelfSettings.read("bookmark_color") or DEFAULT_BOOKMARK,
+        badge_fg = BookshelfSettings.read("badge_fg")       or DEFAULT_BADGE_FG,
+        badge_bg = BookshelfSettings.read("badge_bg")       or DEFAULT_BADGE_BG,
         fill_default     = DEFAULT_FILL,
         track_default    = DEFAULT_TRACK,
         bookmark_default = DEFAULT_BOOKMARK,
+        badge_fg_default = DEFAULT_BADGE_FG,
+        badge_bg_default = DEFAULT_BADGE_BG,
     }
 end
 

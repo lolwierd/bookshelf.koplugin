@@ -792,6 +792,36 @@ function Settings:_coloursSubItems()
             end,
         },
         {
+            text_func = function()
+                return _("Badge foreground") .. ": " .. valueLabel("badge_fg")
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                pickColour("badge_fg", "badge_fg", 100,
+                    _("Badge foreground (% black)"), touchmenu_instance)
+            end,
+            hold_callback = function(touchmenu_instance)
+                BookshelfSettings.delete("badge_fg")
+                markDirty()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+        {
+            text_func = function()
+                return _("Badge background") .. ": " .. valueLabel("badge_bg")
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                pickColour("badge_bg", "badge_bg", 0,
+                    _("Badge background (% black)"), touchmenu_instance)
+            end,
+            hold_callback = function(touchmenu_instance)
+                BookshelfSettings.delete("badge_bg")
+                markDirty()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+        {
             text = _("Reset to default colours"),
             separator = true,
             keep_menu_open = true,
@@ -799,6 +829,8 @@ function Settings:_coloursSubItems()
                 BookshelfSettings.delete("progress_fill")
                 BookshelfSettings.delete("progress_track")
                 BookshelfSettings.delete("bookmark_color")
+                BookshelfSettings.delete("badge_fg")
+                BookshelfSettings.delete("badge_bg")
                 markDirty()
                 if touchmenu_instance then touchmenu_instance:updateItems() end
             end,
