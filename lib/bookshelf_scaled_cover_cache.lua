@@ -74,16 +74,17 @@ local function _bbBytes(bb)
 end
 
 local ScaledCoverCache = {
-    -- Two bounds, both enforced on every put (see _evictIfNeeded):
-    --   * _capacity   -- soft cap on entry COUNT (the user's cover_cache_size
-    --                    setting). Lets the user tune working-set size.
-    --   * _byte_budget -- HARD cap on resident bytes. The real RAM safety net:
-    --                    a fixed entry count can't bound RAM because per-entry
-    --                    size varies ~5x (shelf vs hero) and ~4x (grayscale vs
-    --                    colour). 24 MiB holds ~370 grayscale shelf covers but
-    --                    self-limits to ~20-40 large colour covers -- safe on
-    --                    every device with the same constant.
-    _capacity    = 32,
+    -- The cache is bounded by RAM, in BYTES -- the only unit that actually
+    -- maps to memory, since per-entry size varies ~5x (shelf vs hero), ~4x
+    -- (grayscale 1 B/px vs colour RGB32), and with DPI / layout. The user-
+    -- facing setting is an MB budget that feeds _byte_budget (see the widget's
+    -- _applyCoverCacheBudget); 24 MiB is the default RAM allocation.
+    --
+    -- _capacity is a non-user-facing entry-COUNT backstop, kept only to bound
+    -- the O(n) _order scans in get/put and guard against a pathological
+    -- many-tiny-covers case. It is set high enough that the byte budget always
+    -- binds first for normal budgets, so in practice RAM is the sole limit.
+    _capacity    = 1024,
     _byte_budget = 24 * 1024 * 1024,
     _bytes       = 0,  -- running sum of resident entry bytes (see _sizes)
     _cache    = {},    -- filepath → bb
@@ -94,12 +95,10 @@ local ScaledCoverCache = {
     _evictions= 0,     -- perf: evictions this session
 }
 
--- setCapacity(n) — soft cap on entry COUNT. Raising it lets more covers
--- (e.g. preloaded next-page / other-chip covers) stay resident; lowering it
--- evicts down immediately. This is the user-facing knob, but it is NOT the
--- RAM bound: _byte_budget (the hard ceiling enforced alongside it) is what
--- actually keeps memory safe regardless of how large the cached covers are.
--- So a generous count is safe to set -- the byte budget catches it.
+-- setCapacity(n) — adjust the entry-COUNT backstop. Not user-facing: the RAM
+-- bound is _byte_budget (driven by the MB setting). Retained for completeness
+-- and any internal tuning; raising it lets more covers stay resident (until
+-- the byte budget binds), lowering it evicts down immediately.
 function ScaledCoverCache:setCapacity(n)
     n = tonumber(n)
     if not n then return end

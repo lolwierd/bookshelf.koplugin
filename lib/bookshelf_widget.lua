@@ -5415,12 +5415,20 @@ local CHIP_PRELOAD_DELAY_S  = 1.0
 -- complete, short enough that chip preload resumes promptly when idle.
 local CHIP_PRELOAD_YIELD_S  = 0.25
 
--- Keep the cover cache sized to the user's setting. Applied on every page
--- turn (cheap) so it tracks the setting even when preload itself is off --
--- a bigger cache also helps plain back-and-forth browsing.
-function BookshelfWidget:_applyCoverCacheCapacity()
-    local n = BookshelfSettings.read("cover_cache_size") or 32
-    require("lib/bookshelf_scaled_cover_cache"):setCapacity(n)
+-- Apply the user's cover-cache RAM budget (in MB). Called on every page turn
+-- (cheap) so the setting tracks live even when preload is off -- a bigger
+-- budget also helps plain back-and-forth browsing.
+local COVER_CACHE_DEFAULT_MB = 24
+function BookshelfWidget:_applyCoverCacheBudget()
+    -- One-time migration: the cache used to be sized by entry COUNT
+    -- (cover_cache_size). It's now an explicit RAM budget in MB, so discard the
+    -- stale count key -- everyone starts fresh on the MB default. Cheap: the
+    -- read returns nil once deleted, so this no-ops after the first call.
+    if BookshelfSettings.read("cover_cache_size") ~= nil then
+        BookshelfSettings.delete("cover_cache_size")
+    end
+    local mb = BookshelfSettings.read("cover_cache_mb") or COVER_CACHE_DEFAULT_MB
+    require("lib/bookshelf_scaled_cover_cache"):setByteBudget(mb * 1024 * 1024)
 end
 
 function BookshelfWidget:_cancelPreload()
@@ -5718,7 +5726,7 @@ function BookshelfWidget:_maybeStartChipPreload()
     -- cause is pinned; e-ink devices keep the warm-up.
     if Device:isAndroid() then return end
     if #(self._drilldown_path or {}) ~= 0 then return end
-    self:_applyCoverCacheCapacity()
+    self:_applyCoverCacheBudget()
     self._chip_preload_fn = function() self:_chipPreloadStep() end
     UIManager:scheduleIn(CHIP_PRELOAD_DELAY_S, self._chip_preload_fn)
 end
@@ -5865,7 +5873,7 @@ end
 -- setting that's now removed).
 function BookshelfWidget:_schedulePreload(direction)
     self:_cancelPreload()
-    self:_applyCoverCacheCapacity()
+    self:_applyCoverCacheBudget()
     if Device:isAndroid() then return end  -- v2.3.1 crash defence; see _maybeStartChipPreload
     self._preload_dir = direction
     self._preload_fn = function() self:_preloadStep() end
