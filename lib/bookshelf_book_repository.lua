@@ -2221,6 +2221,21 @@ function Repo.searchBooks(query, limit)
     return out
 end
 
+-- _isTitleCase(s): true when every word starts with an uppercase letter and
+-- the string isn't entirely uppercase -- "Southern Reach" yes; "southern
+-- reach", "Southern reach", "SOUTHERN REACH" no. Used when case-insensitive
+-- grouping merges spelling variants ("southern reach" / "Southern Reach"):
+-- prefer a Title Case variant for the displayed stack label, else first-seen.
+local function _isTitleCase(s)
+    if not s or s == "" then return false end
+    if s == s:upper() then return false end          -- all-caps
+    for word in s:gmatch("%S+") do
+        local c = word:match("^(%a)")                 -- first alpha char of the word
+        if c and c ~= c:upper() then return false end
+    end
+    return true
+end
+
 -- _groupShapeCmp(priority_or_key): used by series / authors / genres / tags
 -- group sorters. Accepts either a v1.1 single key string OR a v1.2 priority
 -- list. When a string is passed, lifts it via the legacy map.
@@ -2431,21 +2446,27 @@ function Repo.getSeriesGroups(limit, offset, sort_priority_override, filter, opt
         local book = _lightMetaForFp(light_cache, c.fp)
         if book and book.series_name then
             local sname = book.series_name
-            if not groups[sname] then
-                groups[sname] = { series_name = sname, books = {}, latest = 0, _seen = {} }
-                order[#order + 1] = sname
+            -- Bucket case-insensitively so "Southern Reach" and "southern
+            -- reach" merge into one stack. Display the first-seen spelling,
+            -- but upgrade to a Title Case variant if one shows up.
+            local skey = sname:lower()
+            local g = groups[skey]
+            if not g then
+                g = { series_name = sname, books = {}, latest = 0, _seen = {} }
+                groups[skey] = g
+                order[#order + 1] = skey
+            elseif _isTitleCase(sname) and not _isTitleCase(g.series_name) then
+                g.series_name = sname
             end
-            if not groups[sname]._seen[book.filepath] then
-                groups[sname]._seen[book.filepath] = true
-                groups[sname].books[#groups[sname].books + 1] = {
+            if not g._seen[book.filepath] then
+                g._seen[book.filepath] = true
+                g.books[#g.books + 1] = {
                     filepath   = book.filepath,
                     series_num = book.series_num,
                 }
             end
             local t = read_time[book.filepath] or c.mtime or 0
-            if t > groups[sname].latest then
-                groups[sname].latest = t
-            end
+            if t > g.latest then g.latest = t end
         end
     end
     -- Flatten to list. Sort runs at hydrate time on the cached shapes (see
@@ -2813,6 +2834,14 @@ local function _buildGroups(group_kind, key_fn, multi)
                             }
                             groups[lookup_k] = g
                             order[#order + 1] = lookup_k
+                        elseif group_kind ~= "author"
+                                and _isTitleCase(raw_k)
+                                and not _isTitleCase(g.series_name) then
+                            -- Case-insensitive kinds (e.g. genre) merge
+                            -- spelling variants; upgrade the displayed label
+                            -- to a Title Case spelling when one appears.
+                            -- Authors keep their format-driven display.
+                            g.series_name = raw_k
                         end
                         if not g._seen[book.filepath] then
                             g._seen[book.filepath] = true
