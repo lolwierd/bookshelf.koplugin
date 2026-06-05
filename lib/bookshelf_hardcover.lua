@@ -448,6 +448,38 @@ function Hardcover.getCacheStats()
     }
 end
 
+-- True when the external Hardcover plugin's API module is loadable -- i.e.
+-- the plugin is installed AND enabled. KOReader only adds ENABLED plugins to
+-- package.path (pluginloader.lua), so a require of a disabled/uninstalled
+-- plugin's module fails. Memoised: the enable-state can't change without a
+-- KOReader restart, which reloads this module anyway.
+local _available
+function Hardcover.isAvailable()
+    if _available == nil then
+        local ok, Api = pcall(require, "hardcover/lib/hardcover_api")
+        _available = (ok and Api ~= nil and type(Api.query) == "function") or false
+    end
+    return _available
+end
+
+-- True when the user has any stored Hardcover data: a linked book, a cached
+-- rating, or a prior ratings fetch. Lets cache-backed UI (and the settings
+-- menu) persist for someone who used Hardcover and then removed the plugin.
+function Hardcover.hasData()
+    local ok, stats = pcall(Hardcover.getCacheStats)
+    if not ok or type(stats) ~= "table" then return false end
+    return (stats.linked or 0) > 0
+        or (stats.rated or 0) > 0
+        or stats.fetched_at ~= nil
+end
+
+-- Gate for the "Hardcover enrichment" settings menu: shown when the plugin is
+-- available OR the user already has data, hidden only for someone who has
+-- never used Hardcover and doesn't have the plugin installed.
+function Hardcover.shouldShowEnrichmentUI()
+    return Hardcover.isAvailable() or Hardcover.hasData()
+end
+
 function Hardcover.getCachedRating(book_id)
     if not book_id then return nil end
     return _ratingFromCacheEntry(_readRatingsCache()[tostring(book_id)])

@@ -1150,7 +1150,7 @@ end
 -- in the main bookshelf menu. Keeps the top level uncluttered while still
 -- giving each surface its own sub-screen.
 function Settings:_settingsSubItems()
-    return {
+    local items = {
         {
             text     = _("Edit layout") .. "…",
             help_text = _("Open a small overlay that lets you cycle through"
@@ -1186,19 +1186,27 @@ function Settings:_settingsSubItems()
                 return self:_expandedShelfSubItems()
             end,
         },
-        {
+    }
+    -- Hardcover enrichment: hidden for users who have never used Hardcover
+    -- and don't have the plugin installed; shown when the plugin is available
+    -- OR the user already has Hardcover data (links / cached ratings), so
+    -- past users keep access to their cached data after removing the plugin.
+    local ok_hc, HC = pcall(require, "lib/bookshelf_hardcover")
+    if ok_hc and HC and HC.shouldShowEnrichmentUI and HC.shouldShowEnrichmentUI() then
+        items[#items + 1] = {
             text                = _("Hardcover enrichment"),
             sub_item_table_func = function()
                 return self:_hardcoverSubItems()
             end,
-        },
-        {
-            text                = _("Advanced settings"),
-            sub_item_table_func = function()
-                return self:_advancedSubItems()
-            end,
-        },
+        }
+    end
+    items[#items + 1] = {
+        text                = _("Advanced settings"),
+        sub_item_table_func = function()
+            return self:_advancedSubItems()
+        end,
     }
+    return items
 end
 
 local function _formatCacheTime(ts)
