@@ -426,5 +426,42 @@ test("sanitiseReviewHtml: keeps a single intra-paragraph break", function()
     eq(out, "<p>line one<br>line two</p>", "single intra-paragraph break lost:")
 end)
 
+test("autoLinkReportHtml: lists linked books and counts no-id (exact mode)", function()
+    local html = Tokens.autoLinkReportHtml{
+        best_guess = false,
+        linked  = { { name = "Time Shelter", matched = "Time Shelter", author = "Georgi Gospodinov" } },
+        nomatch = { { name = "Obscure Title" } },
+        no_id   = 184,
+    }
+    assert(html:find("Auto%-link report"), "missing title")
+    assert(html:find("Time Shelter", 1, true), "linked book name missing")
+    assert(html:find("Georgi Gospodinov", 1, true), "matched author missing")
+    assert(html:find("Linked %(1%)"), "linked count missing")
+    assert(html:find("Not matched %(1%)"), "not-matched section missing")
+    assert(html:find("No identifier %(184%)"), "no-id count missing")
+    assert(html:find("Obscure Title", 1, true), "not-matched name missing")
+end)
+
+test("autoLinkReportHtml: best-guess shows score and no no-id section", function()
+    local html = Tokens.autoLinkReportHtml{
+        best_guess = true,
+        linked  = { { name = "Dune", matched = "Dune", author = "Frank Herbert", score = 97 } },
+        nomatch = {},
+        no_id   = 0,
+    }
+    assert(html:find("97%%"), "confidence score missing")
+    assert(not html:find("No identifier"), "no-id section should be absent in best-guess mode")
+end)
+
+test("autoLinkReportHtml: escapes HTML in names/titles", function()
+    local html = Tokens.autoLinkReportHtml{
+        best_guess = false,
+        linked  = { { name = "A & B <x>", matched = "M & N" } },
+        nomatch = {},
+    }
+    assert(html:find("A &amp; B &lt;x&gt;", 1, true), "name not escaped: " .. html)
+    assert(not html:find("<x>", 1, true), "raw angle bracket leaked")
+end)
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

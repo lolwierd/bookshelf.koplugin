@@ -474,6 +474,84 @@ function Tokens.reviewsHtml(payload)
     return table.concat(out, "\n")
 end
 
+-- autoLinkReportHtml(data): the HTML body for the post-scan auto-link report,
+-- rendered in the shared reviews modal. Lists what got linked (so the user can
+-- verify each match) and what didn't; the "no identifier" bucket is a count,
+-- not hundreds of lines.
+--   data = {
+--     best_guess = bool,        -- which mode ran (affects wording)
+--     cancelled  = bool,
+--     linked  = { { name=, matched=, author=, score= }, ... },
+--     nomatch = { { name= }, ... },   -- searched/had id but no confident hit
+--     no_id   = N,              -- skipped, exact mode only
+--     errors  = N,
+--   }
+function Tokens.autoLinkReportHtml(data)
+    data = type(data) == "table" and data or {}
+    local linked  = type(data.linked) == "table" and data.linked or {}
+    local nomatch = type(data.nomatch) == "table" and data.nomatch or {}
+    local DOT = " \xC2\xB7 "  -- " · "
+    local ARROW = " \xE2\x86\x92 "  -- " → "
+    local out = {}
+
+    out[#out + 1] = "<h1>" .. (data.cancelled and "Auto-link report (cancelled)"
+        or "Auto-link report") .. "</h1>"
+
+    -- Summary line.
+    local summary = { string.format("Linked %d", #linked) }
+    summary[#summary + 1] = string.format("Not matched %d", #nomatch)
+    if not data.best_guess and tonumber(data.no_id) and data.no_id > 0 then
+        summary[#summary + 1] = string.format("No identifier %d", data.no_id)
+    end
+    if tonumber(data.errors) and data.errors > 0 then
+        summary[#summary + 1] = string.format("Errors %d", data.errors)
+    end
+    out[#out + 1] = '<p class="rating">' .. table.concat(summary, DOT) .. "</p>"
+
+    -- Linked: one line per book, local name -> matched Hardcover title/author.
+    out[#out + 1] = "<hr/>"
+    out[#out + 1] = string.format("<p><b>Linked (%d)</b></p>", #linked)
+    if #linked == 0 then
+        out[#out + 1] = "<p>Nothing linked.</p>"
+    else
+        local items = {}
+        for _, e in ipairs(linked) do
+            local line = "<b>" .. _escHtml(e.name or "?") .. "</b>" .. ARROW
+                .. _escHtml(e.matched or "?")
+            if e.author and e.author ~= "" then
+                line = line .. " \xE2\x80\x94 " .. _escHtml(e.author)  -- em dash
+            end
+            if tonumber(e.score) then
+                line = line .. DOT .. string.format("%d%%", e.score)
+            end
+            items[#items + 1] = "<li>" .. line .. "</li>"
+        end
+        out[#out + 1] = "<ul>" .. table.concat(items, "\n") .. "</ul>"
+    end
+
+    -- Not matched: candidates for Manual link.
+    if #nomatch > 0 then
+        out[#out + 1] = "<hr/>"
+        out[#out + 1] = string.format(
+            "<p><b>Not matched (%d)</b> -- try Manual link</p>", #nomatch)
+        local items = {}
+        for _, e in ipairs(nomatch) do
+            items[#items + 1] = "<li>" .. _escHtml(e.name or "?") .. "</li>"
+        end
+        out[#out + 1] = "<ul>" .. table.concat(items, "\n") .. "</ul>"
+    end
+
+    -- No identifier: a single count line (exact mode only).
+    if not data.best_guess and tonumber(data.no_id) and data.no_id > 0 then
+        out[#out + 1] = "<hr/>"
+        out[#out + 1] = string.format(
+            "<p><b>No identifier (%d)</b><br/>Skipped -- no ISBN or Hardcover id embedded. Use Best guess or Manual link for these.</p>",
+            data.no_id)
+    end
+
+    return table.concat(out, "\n")
+end
+
 local function pct(v) return string.format("%d%%", math.floor((v or 0) * 100 + 0.5)) end
 
 Tokens.expanders.page_num   = function(b) return b and b.page_num and tostring(b.page_num) or "" end
