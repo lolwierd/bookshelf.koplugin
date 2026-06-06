@@ -6485,8 +6485,11 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs)
     local ext_cover = fresh.cover_image_path
     local thumb_bb, thumb_disposable
     if ext_cover then
+        -- Native (true-aspect) load: the box below is derived from the bb's own
+        -- dimensions, so a non-2:3 Hardcover cover isn't stretched tall/narrow
+        -- the way a fixed w*h resize would. The cache owns the bb.
         local ok_img, ImageSource = pcall(require, "lib/bookshelf_image_source")
-        thumb_bb = ok_img and ImageSource.loadImage(ext_cover, thumb_w, thumb_w * 2) or nil
+        thumb_bb = ok_img and ImageSource.loadImageNative(ext_cover) or nil
         thumb_disposable = false
     end
     if not thumb_bb and fresh.cover_bb then
@@ -6539,9 +6542,9 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs)
         thumb_widget.onTap = function()
             if ext_for_viewer then
                 local ok_img, ImageSource = pcall(require, "lib/bookshelf_image_source")
-                local sw_ = Screen:getWidth()
-                local pv_bb = ok_img and ImageSource.loadImage(
-                    ext_for_viewer, sw_, sw_ * 2) or nil
+                -- Native load: ImageViewer fits it to the screen preserving
+                -- aspect. A fixed w*h resize here stretched the cover.
+                local pv_bb = ok_img and ImageSource.loadImageNative(ext_for_viewer) or nil
                 if pv_bb then
                     UIManager:show(require("ui/widget/imageviewer"):new{
                         image            = pv_bb,
