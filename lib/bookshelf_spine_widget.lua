@@ -84,6 +84,9 @@ end
 -- Scaled with cover width but floored so tiny columns don't render
 -- a glyph too small to read. 80% of the original sizing so the glyph
 -- doesn't crowd the title text in expanded (title-view) mode.
+-- Returns the BASE (100%-scale) status-glyph height. Call sites wrap this
+-- in _badgeSize() to apply the user's Cover badge size, and pin overhang to
+-- the base via _baseGlyphRenderedH so growth goes inward (issue #92).
 local function _glyphSize(card_w)
     local px = math.max(Screen:scaleBySize(9), math.floor(card_w * 0.132))
     return px
@@ -109,17 +112,44 @@ local function _glyphTopLift(show_titles)
     return GLYPH_TOP_LIFT_REGULAR
 end
 
+-- When the Cover badge size enlarges a bottom-anchored bookmark glyph,
+-- this fraction of the EXTRA height extends the visible dangle downward;
+-- the remainder grows inward (up, under the cover/progress bar). The
+-- in-progress bookmark's in-cover portion is hidden by the progress bar,
+-- so a pinned dangle (share = 0) would make the glyph appear to vanish
+-- upward as it grows. 1.0 = full proportional dangle (overhangs as much
+-- as a naively scaled glyph); 0.5 splits the difference — the dangle
+-- visibly grows at half the overhang of full proportional (issue #92).
+local GLYPH_DANGLE_GROWTH_SHARE = 0.5
+
 -- Horizontal inset of the glyph from the card's left edge.
 local function _glyphLeftInset()
     return Size.padding.small + Screen:scaleBySize(2)
 end
 
 -- Cover-badge font scale alias: delegates to CoverProgress.badgeSize so
--- the page-count badge, series-number badge, count badge, and tickbox
--- glyph share one source of truth for the user's cover_badge_font_scale
--- nudge setting. Keep the short local alias so the call sites below
--- stay terse.
+-- the page-count badge, series-number badge, count badge, tickbox glyph
+-- AND the status glyphs (in-progress bookmark, finished bookmark,
+-- favourite heart/star) share one source of truth for the user's
+-- cover_badge_font_scale setting (the "Cover badge size" dialog). Keep
+-- the short local alias so the call sites below stay terse.
 local _badgeSize = CoverProgress.badgeSize
+
+-- Rendered (measured) height of a glyph at its UNSCALED base size. Status
+-- glyphs anchor their overhang to this so enlarging the Cover badge size
+-- grows them toward the cover centre rather than further off the edge
+-- (issue #92): the off-cover dangle stays pinned to the 100%-scale
+-- footprint while the inner edge extends inward. When the user scale is
+-- 100% (glyph_h == base_h) the already-measured scaled height is reused;
+-- otherwise a throwaway probe at the base size measures it.
+local function _baseGlyphRenderedH(glyph_char, base_h, glyph_h, scaled_widget_h, face_name)
+    if base_h == glyph_h then return scaled_widget_h end
+    local probe = CoverProgress.buildGlyphWidget(
+        glyph_char, base_h, Blitbuffer.COLOR_BLACK, face_name)
+    local h = probe:getSize().h
+    probe:free()
+    return h
+end
 
 -- Pixel thickness of the progress bar (rounded pill on top of cover).
 -- Bookends-style rounded look needs more vertical room than a stripe.
@@ -565,7 +595,8 @@ function SpineWidget:_renderShadowedCard(inner)
     --    glyph sits inside the cover, bottom at card_h - 0.35*glyph_h).
     if indicators.glyph == "in_progress" then
         local colors = CoverProgress.resolvedColors()
-        local glyph_h = _glyphSize(card_w)
+        local base_h  = _glyphSize(card_w)
+        local glyph_h = _badgeSize(base_h)
         local glyph_w = self:_glyphWidth(glyph_h)
         if glyph_w <= card_w * 0.4 then
             local halo_w = 1
@@ -588,7 +619,18 @@ function SpineWidget:_renderShadowedCard(inner)
                 colors.border,      -- halo (shared "Border color")
                 colors.bookmark)    -- centre fill (user-tunable bookmark color)
             local lift = _glyphTopLift(self.show_titles)
-            local y_offset = card_h - math.floor(widget_h * lift + 0.5)
+            -- Pin the below-card dangle to the UNSCALED footprint so a
+            -- larger Cover badge size lifts the top inward and the bottom
+            -- overhang stays put (issue #92), rather than dangling further.
+            local base_widget_h = _baseGlyphRenderedH(
+                CoverProgress.GLYPH_BOOKMARK, base_h, glyph_h, widget_h)
+            -- Dangle grows partly downward (visible) and partly inward so
+            -- the bookmark gets visibly larger without burying itself
+            -- behind the cover (issue #92).
+            local dangle_h = base_widget_h
+                + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
+            local y_offset = card_h
+                + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
             children[#children + 1] = FrameContainer:new{
                 bordersize   = 0,
                 padding      = 0,
@@ -631,7 +673,8 @@ function SpineWidget:_renderShadowedCard(inner)
     --     any cover. This is the pre-v2.1 design, restored as an opt-in
     --     after Reddit feedback that the v2.1 tickbox was too heavy.
     if indicators.glyph == "complete_bookmark" then
-        local glyph_h = _glyphSize(card_w)
+        local base_h  = _glyphSize(card_w)
+        local glyph_h = _badgeSize(base_h)
         local glyph_w = self:_glyphWidth(glyph_h)
         if glyph_w <= card_w * 0.4 then
             local halo_w   = 1
@@ -664,7 +707,19 @@ function SpineWidget:_renderShadowedCard(inner)
                 colors.complete_bookmark,  -- centre fill (user-tunable)
                 colors.shadow)             -- shadow (always dark on screen)
             local lift = _glyphTopLift(self.show_titles)
-            local y_offset = card_h - math.floor(widget_h * lift + 0.5)
+            -- Same inward-growth anchor as the in-progress glyph: the
+            -- below-card dangle is pinned to the unscaled footprint so a
+            -- larger Cover badge size grows the check toward the centre,
+            -- not further off the bottom edge (issue #92).
+            local base_widget_h = _baseGlyphRenderedH(
+                CoverProgress.GLYPH_BOOKMARK_CHECK, base_h, glyph_h, widget_h)
+            -- Dangle grows partly downward (visible) and partly inward so
+            -- the finished bookmark gets visibly larger without burying
+            -- itself behind the cover (issue #92).
+            local dangle_h = base_widget_h
+                + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
+            local y_offset = card_h
+                + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
             children[#children + 1] = FrameContainer:new{
                 bordersize   = 0,
                 padding      = 0,
@@ -704,7 +759,12 @@ function SpineWidget:_renderShadowedCard(inner)
         }
         local page_count_h = ref:getSize().h
         ref:free()
-        local inner_h = math.floor(page_count_h * 0.55)
+        -- 0.65 of the page-count pill: a touch larger than the original
+        -- 0.55 so the finished tickbox reads less "tiny" out of the box
+        -- (issue #92). Still a subtle bordered pill, well short of the
+        -- heavy v2.1 sticker that drew Reddit pushback. Scales further via
+        -- the Cover badge size dialog (page_count_h is _badgeSize-derived).
+        local inner_h = math.floor(page_count_h * 0.65)
 
         -- Check glyph at 10pt: a touch larger than the conservative 8pt
         -- so the tick has more presence inside the small square. The
@@ -714,7 +774,7 @@ function SpineWidget:_renderShadowedCard(inner)
         -- inside a VerticalGroup biases the bbox-centred placement
         -- downward, so the rendered check lands at the pill's visual
         -- centre.
-        local check_face, check_bold = BFont:getFace("smallinfofont", _badgeSize(10), { bold = true })
+        local check_face, check_bold = BFont:getFace("smallinfofont", _badgeSize(11), { bold = true })
         local check_widget = TextWidget:new{
             text = "\xEF\x90\xAE",   -- U+F42E nerd-font check
             face = check_face,
@@ -919,7 +979,7 @@ function SpineWidget:_renderShadowedCard(inner)
     if (not self.is_bulk_selected)
             and (not self.suppress_favorite_badge)
             and fp
-            and BookshelfSettings.isTrue("show_fav_badge") then
+            and BookshelfSettings.nilOrTrue("show_fav_badge") then
         local rc_ok, rc = pcall(require, "readcollection")
         local in_fav = rc_ok and rc and rc.coll
                        and rc.coll.favorites
@@ -928,8 +988,11 @@ function SpineWidget:_renderShadowedCard(inner)
             -- 70% of bookmark size: the star glyph is intrinsically wider
             -- than the bookmark at the same point size, so the star reads
             -- as bigger when nominal sizes match. 70% brings the optical
-            -- weight roughly in line.
-            local glyph_h = math.floor(_glyphSize(card_w) * 0.70)
+            -- weight roughly in line. base_h is the unscaled footprint
+            -- (for the inward-growth anchor); glyph_h applies the user's
+            -- Cover badge size (issue #92).
+            local base_h  = math.floor(_glyphSize(card_w) * 0.70)
+            local glyph_h = _badgeSize(base_h)
             local glyph_w = self:_glyphWidth(glyph_h)
             if glyph_w <= card_w * 0.4 then
                 local colors  = CoverProgress.resolvedColors()
@@ -971,14 +1034,21 @@ function SpineWidget:_renderShadowedCard(inner)
                 -- artwork. More overhang than the previous 25% so the star
                 -- clearly nestles into the top edge rather than sitting on
                 -- it, but still lighter than the bookmark's 50% dangle.
+                -- Pin the above-cover overhang to the UNSCALED footprint so
+                -- a larger Cover badge size grows the glyph DOWN into the
+                -- artwork rather than further above the top edge (issue #92).
                 local top_lift = 0.35
-                local y_offset = -math.floor(widget_h * top_lift + 0.5) - halo_w
+                local base_widget_h = _baseGlyphRenderedH(
+                    fav_glyph, base_h, glyph_h, widget_h, "symbols")
+                local y_offset = -math.floor(base_widget_h * top_lift + 0.5) - halo_w
                 -- Both star and bookmark anchor on _glyphLeftInset(), but
                 -- the star is 70% of the bookmark's nominal height so its
                 -- centroid falls noticeably to the left of the bookmark's.
-                -- Shift right by half the size difference so the two
-                -- glyphs read as visually aligned in the same column.
-                local center_shift = math.floor((_glyphSize(card_w) - glyph_h) / 2)
+                -- Shift right by half the size difference (at the current
+                -- scale, so the columns stay aligned as both grow) so the
+                -- two glyphs read as visually aligned in the same column.
+                local center_shift =
+                    math.floor((_badgeSize(_glyphSize(card_w)) - glyph_h) / 2)
                 local x_offset = _glyphLeftInset() - halo_w + center_shift
                 outlined.overlap_offset = { x_offset, y_offset }
                 children[#children + 1] = outlined

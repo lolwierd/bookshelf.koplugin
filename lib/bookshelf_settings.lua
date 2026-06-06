@@ -788,9 +788,11 @@ function Settings:_coverDisplaySubItems()
                   _("Show page count"), true, true),
         -- Cover-badge font scale moved to Settings -> Text size (#60).
         -- Favourites icon at top-left of covers for books in the favourites
-        -- collection. Defaults off; opt-in visual marker.
+        -- collection. Defaults ON: favouriting a book should mark it without
+        -- a second opt-in (render gate uses nilOrTrue to match). Users who
+        -- explicitly turn it off keep it off.
         toggleRow("show_fav_badge",
-                  _("Show favourites icon"), false, true),
+                  _("Show favourites icon"), false, false),
         -- Favourite icon glyph: heart (default; reads distinctly from the
         -- rating stars) or star. The chosen icon also selects which colour
         -- the Colors -> Favourite entry edits.
@@ -1238,7 +1240,7 @@ function Settings:_pickCoverBadgeFontScale(touchmenu_instance)
         -- 70% alpha. Both surprise in a nudge context; lock the
         -- dialog to its own three close buttons.
         dismissable = false,
-        title = _("Badge font scale"),
+        title = _("Cover badge size"),
         buttons = {
             {
                 { text = "-10", callback = function() nudge(-10) end },
