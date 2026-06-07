@@ -7386,27 +7386,81 @@ end
 -- strip HTML tags and decode entities; the viewer renders plain
 -- text with paragraph breaks preserved.
 function BookshelfWidget:_showFullDescription(book)
-    if not book or not book.description or book.description == "" then return end
+    if not book then return end
     local Tokens = require("lib/bookshelf_tokens")
-    -- Render the description as formatted HTML (paragraphs, emphasis, lists)
-    -- in the same scrollable modal the reviews use, via the shared sanitiser
-    -- (whitelisted tags, attributes stripped, break-runs collapsed). Falls
-    -- back to the plain-text cleaner if sanitising yields nothing usable.
-    local html = Tokens.sanitiseReviewHtml(book.description)
-    if not html or html:gsub("%s+", "") == "" then
-        local text = Tokens.cleanDescription(book.description) or ""
-        if text == "" then return end
-        html = "<p>" .. (text:gsub("\n\n+", "</p><p>"):gsub("\n", "<br>")) .. "</p>"
+    -- Render a raw description (either source) to HTML. Two shapes:
+    --   * EPUB / Calibre blurbs are HTML (<p>, <b>, <br>, …) -> keep the markup
+    --     via the shared sanitiser (whitelisted tags, attributes stripped).
+    --   * Hardcover blurbs are PLAIN TEXT with \n\n paragraph breaks and no
+    --     tags -> the HTML renderer would collapse those newlines into a single
+    --     block, so convert paragraph/line breaks to HTML instead.
+    -- A real tag is "<" immediately followed by an (optional "/" then a) letter
+    -- -- e.g. <p> or </p>. This deliberately does NOT match prose like "x < y"
+    -- (space after "<"), so plain-text blurbs with a stray angle bracket still
+    -- take the plain-text path.
+    local function toHtml(raw)
+        if type(raw) ~= "string" or raw == "" then return nil end
+        local html
+        if raw:find("</?%a") then html = Tokens.sanitiseReviewHtml(raw) end
+        if not html or html:gsub("%s+", "") == "" then
+            local text = Tokens.cleanDescription(raw) or ""
+            if text == "" then return nil end
+            local esc = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+            html = "<p>" .. (esc:gsub("\n\n+", "</p><p>"):gsub("\n", "<br>")) .. "</p>"
+        end
+        return html
     end
+
+    -- The book's OWN (embedded / Calibre) description and Hardcover's. enrichBook
+    -- stashes file_description (the original, even when Hardcover's is the one
+    -- shown) and hardcover_description_text. For an un-enriched book there's no
+    -- Hardcover text and book.description is its own.
+    local file_desc
+    if book.file_description ~= nil then
+        file_desc = book.file_description
+    elseif not book.hardcover_description then
+        file_desc = book.description
+    end
+    local file_html = toHtml(file_desc)
+    local hc_html   = toHtml(book.hardcover_description_text
+        or (book.hardcover_description and book.description) or nil)
+    if not file_html and not hc_html then return end
+
     local title = book.title or _("Description")
     if book.author then title = title .. " — " .. book.author end
+
     local ReviewsModal = require("lib/bookshelf_reviews_modal")
-    UIManager:show(ReviewsModal:new{
-        title     = title,
-        html_body = html,
-        -- No on_refresh: a description doesn't refresh, so the modal shows a
-        -- single Close button.
-    })
+    local args = { title = title }
+    if file_html and hc_html then
+        -- Both available: a Book / Hardcover toggle at the top. Default to
+        -- whichever description the hero currently shows.
+        args.tabs = {
+            { label = _("Book"),      html = file_html },   -- 1 = book's own
+            { label = _("Hardcover"), html = hc_html },     -- 2 = Hardcover
+        }
+        args.active_tab = book.hardcover_description and 2 or 1
+        -- On close, adopt the description of the tab being viewed: switching to
+        -- the other tab and closing changes what the hero (and the book's other
+        -- surfaces) use -- same effect as the per-book "Use Hardcover
+        -- description" toggle. Only writes when the choice actually changed.
+        args.on_tab_close = function(active_idx)
+            local use_hc = (active_idx == 2)
+            if use_hc ~= (book.hardcover_description == true) then
+                local ok_hc, Hardcover = pcall(require, "lib/bookshelf_hardcover")
+                if ok_hc and Hardcover and Hardcover.setUseDescription then
+                    Hardcover.setUseDescription(book.filepath, use_hc)
+                    self:_refreshHardcoverEnrichmentView(
+                        "hardcover-use-description", book.filepath)
+                end
+            end
+        end
+    else
+        -- Single source: show it, and note Hardcover-sourced descriptions.
+        args.html_body = hc_html or file_html
+        if hc_html and not file_html then args.subtitle = _("(from Hardcover)") end
+    end
+    -- No on_refresh: a description doesn't refresh, so the footer is Close only.
+    UIManager:show(ReviewsModal:new(args))
 end
 
 function BookshelfWidget:_showHardcoverReviews(book, opts)
