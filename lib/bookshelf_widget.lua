@@ -431,6 +431,20 @@ function BookshelfWidget:handleEvent(event)
         -- unaffected.
         if Device.screen_saver_lock then return false end
 
+        local ev = event.args[1]
+        if ev and ev.ges == "multiswipe" and ev.multiswipe_directions then
+            local fm = require("apps/filemanager/filemanager").instance
+            local settings_data = fm and fm.gestures and fm.gestures.settings_data
+            local reader_gestures = settings_data and settings_data.data
+                and settings_data.data.gesture_reader
+            local reader_name = "multiswipe_" .. tostring(ev.multiswipe_directions):gsub(" ", "_")
+            local reader_actions = reader_gestures and reader_gestures[reader_name]
+            if reader_actions and reader_actions.suspend then
+                logger.info("[bookshelf] reader suspend gesture handled:", reader_name)
+                return self:onRequestSuspend()
+            end
+        end
+
         -- Children first: let our own widget tree (chevron buttons, chip
         -- strip, hero, shelf covers, swipe zones) consume the gesture
         -- before falling through to FM. KOReader's normal dispatch is
@@ -440,7 +454,6 @@ function BookshelfWidget:handleEvent(event)
 
         local fm = require("apps/filemanager/filemanager").instance
         if not fm then return false end
-        local ev = event.args[1]
         local user_gestures = (fm.gestures and fm.gestures.gestures) or {}
 
         -- Walk every FM module's touch zones, not just fm + fm.menu.
