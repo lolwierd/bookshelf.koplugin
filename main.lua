@@ -143,39 +143,52 @@ local function _installBroadcastTag()
     end
 end
 
--- KOReader's suspend path expects either ReaderUI.instance or
--- FileManager.instance while setting up the sleep screen. Bookshelf can be
--- the visible home while neither exists, so provide a minimal temporary host
--- for the screensaver setup only in that narrow case.
+-- When Bookshelf is the visible home overlay, KOReader may briefly have no
+-- ReaderUI.instance or FileManager.instance during home/lifecycle transitions.
+-- Stock Screensaver:setup requires one of those host instances; without it,
+-- the suspend path can continue far enough to inhibit input without drawing a
+-- sleep screen. Provide a minimal FileManager-like host only for that narrow
+-- window, then restore the original state immediately after setup.
 local function _installScreensaverHostFallback()
+    if UIManager._bookshelf_screensaver_host_wrapped then return end
+
     local ok_ss, Screensaver = pcall(require, "ui/screensaver")
-    if not ok_ss or not Screensaver or Screensaver._bookshelf_setup_wrapped then return end
-    if type(Screensaver.setup) ~= "function" then return end
+    if not ok_ss or type(Screensaver) ~= "table"
+            or type(Screensaver.setup) ~= "function" then
+        return
+    end
 
-    Screensaver._bookshelf_setup_wrapped = true
+    UIManager._bookshelf_screensaver_host_wrapped = true
     local orig_setup = Screensaver.setup
-    Screensaver.setup = function(self_ss, ...)
-        local ReaderUI = require("apps/reader/readerui")
-        local FileManager = require("apps/filemanager/filemanager")
-        if ReaderUI.instance or FileManager.instance then
-            return orig_setup(self_ss, ...)
-        end
 
-        local top = UIManager:getTopmostVisibleWidget()
-        if top ~= _live_widget then
-            return orig_setup(self_ss, ...)
-        end
-
-        local previous_fm = FileManager.instance
-        FileManager.instance = {
+    local function makeFallbackUI()
+        return {
             bookinfo = {
                 expandString = function(_, text) return text end,
             },
         }
-        local ok, ret = pcall(orig_setup, self_ss, ...)
-        FileManager.instance = previous_fm
-        if not ok then error(ret) end
-        return ret
+    end
+
+    Screensaver.setup = function(self_ss, ...)
+        local ok_rui, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+        local has_host = (ok_rui and ReaderUI and ReaderUI.instance)
+            or (ok_fm and FileManager and FileManager.instance)
+        local restore_fm
+
+        if not has_host and ok_fm and FileManager then
+            if _live_widget and UIManager:isWidgetShown(_live_widget) then
+                local old_instance = FileManager.instance
+                FileManager.instance = makeFallbackUI()
+                restore_fm = function()
+                    FileManager.instance = old_instance
+                end
+            end
+        end
+
+        local ok, err = pcall(orig_setup, self_ss, ...)
+        if restore_fm then restore_fm() end
+        if not ok then error(err) end
     end
 end
 
