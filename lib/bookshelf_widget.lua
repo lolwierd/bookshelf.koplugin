@@ -4518,6 +4518,13 @@ function BookshelfWidget:onNetworkDisconnected()
     _device_state_expires_at = 0
     self:_gatedRepaint(WIFI_TOKENS, 0.3)
 end
+
+function BookshelfWidget:onRequestSuspend()
+    logger.info("[bookshelf] RequestSuspend handled by BookshelfWidget")
+    UIManager:suspend()
+    return true
+end
+
 -- KOReader broadcasts ToggleNightMode (no-arg toggle) AND SetNightMode
 -- (pass true/false) — both routed to DeviceListener which actually flips
 -- night_mode and dirty-marks "all" widgets. Bookshelf needs its own
