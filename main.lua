@@ -81,6 +81,16 @@ local _overlay_open_path = nil
 -- section, false again before our deferred work runs the show. (Pattern
 -- adapted from komadorirobin's fork.)
 local _suppress_close_document_show = false
+-- Reader->home can make FileManager emit PathChanged for the just-read
+-- book's folder while Bookshelf is being restored. Treat that as a return
+-- transition, not a user folder jump, so the active chip stays selected.
+local _suppress_path_changed_until = 0
+
+local function _suppressPathChangedFor(seconds)
+    _suppress_path_changed_until = math.max(
+        _suppress_path_changed_until or 0,
+        _gettime() + (seconds or 3))
+end
 -- True once the cold-boot start_with=bookshelf takeover has run. Only the
 -- first FileManager init of the session (app start) should auto-raise
 -- Bookshelf; later FM inits are reader-close re-instantiations, where the
@@ -133,6 +143,42 @@ local function _installBroadcastTag()
     end
 end
 
+-- KOReader's suspend path expects either ReaderUI.instance or
+-- FileManager.instance while setting up the sleep screen. Bookshelf can be
+-- the visible home while neither exists, so provide a minimal temporary host
+-- for the screensaver setup only in that narrow case.
+local function _installScreensaverHostFallback()
+    local ok_ss, Screensaver = pcall(require, "ui/screensaver")
+    if not ok_ss or not Screensaver or Screensaver._bookshelf_setup_wrapped then return end
+    if type(Screensaver.setup) ~= "function" then return end
+
+    Screensaver._bookshelf_setup_wrapped = true
+    local orig_setup = Screensaver.setup
+    Screensaver.setup = function(self_ss, ...)
+        local ReaderUI = require("apps/reader/readerui")
+        local FileManager = require("apps/filemanager/filemanager")
+        if ReaderUI.instance or FileManager.instance then
+            return orig_setup(self_ss, ...)
+        end
+
+        local top = UIManager:getTopmostVisibleWidget()
+        if top ~= _live_widget then
+            return orig_setup(self_ss, ...)
+        end
+
+        local previous_fm = FileManager.instance
+        FileManager.instance = {
+            bookinfo = {
+                expandString = function(_, text) return text end,
+            },
+        }
+        local ok, ret = pcall(orig_setup, self_ss, ...)
+        FileManager.instance = previous_fm
+        if not ok then error(ret) end
+        return ret
+    end
+end
+
 -- Remove leftover v1.1.x bookshelf_*.lua files from the plugin root that
 -- KOReader's archive extractor (Device:unpackArchive) leaves behind when a
 -- user upgrades over the top of an older install. Every helper now lives
@@ -175,6 +221,7 @@ end
 
 function Bookshelf:init()
     _installBroadcastTag()
+    _installScreensaverHostFallback()
     -- Run once per init -- no settings flag needed because the clean is
     -- idempotent and cheap (one lfs.dir scan over the plugin root).
     _cleanLegacyLayout()
@@ -908,6 +955,7 @@ function Bookshelf:_safeShow()
     end
     UIManager:forceRePaint()  -- commit the InfoMessage before onClose blocks
     _suppress_close_document_show = true
+    _suppressPathChangedFor(10)
     UIManager:nextTick(function()
         self.ui:onClose(false)
         if self.ui and self.ui.showFileManager then
@@ -1124,6 +1172,8 @@ function Bookshelf:onPathChanged(path)
     if self.ui and self.ui.document then return end
     if not (_live_widget and UIManager:isWidgetShown(_live_widget)) then return end
     if not path or path == "" then return end
+    if _gettime() < (_suppress_path_changed_until or 0) then return end
+    _suppress_path_changed_until = 0
     -- Absorb the single PathChanged that FileManager fires while Bookshelf is
     -- taking over the home screen (same path the overlay opened over).
     -- Consume it ONCE, then forget. Previously the snapshot stayed set for the
@@ -1224,6 +1274,7 @@ function Bookshelf:onCloseDocument()
     -- from KOReader's own menu): schedule show so bookshelf reappears
     -- on the next tick. self:show()'s refresh path handles the repaint
     -- without exposing FileManager.
+    _suppressPathChangedFor(10)
     UIManager:nextTick(function()
         self:show()
     end)
@@ -1591,7 +1642,7 @@ function Bookshelf:onBookMetadataChanged(prop_updated)
     end
     if Repo.invalidateBookCache then
         Repo.invalidateBookCache("BookMetadataChanged"
-            .. (prop_updated and (":" .. prop_updated) or ""))
+            .. (prop_updated and (":" .. tostring(prop_updated)) or ""))
     end
     if not _live_widget then return end
     if self:_isShowing() then
