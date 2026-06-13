@@ -76,6 +76,10 @@ local function buildFace(diam, now, scale_pct)
     local min_len    = r * 0.78
     local hour_len   = r * 0.50
     local tail_len   = math.max(w(4), r * 0.10) -- run past centre
+    -- Rim painted a touch lighter than the black ticks/hands. A fixed grey
+    -- works in both modes: night-mode framebuffer inversion flips rim and
+    -- hands together, so the rim stays the softer line either way.
+    local RIM_INK    = 0x55
 
     local Face = Widget:extend{}
     function Face:init() self.dimen = Geom:new{ w = diam, h = diam } end
@@ -85,14 +89,15 @@ local function buildFace(diam, now, scale_pct)
         local sqrt, abs, floor = math.sqrt, math.abs, math.floor
         local x0, y0 = x, y
         local x1b, y1b = x + diam - 1, y + diam - 1
-        -- Blend black over (px,py) by coverage in [0,1] (over-composite: the
-        -- existing pixel is darkened toward black, so it works on any bg and
-        -- overlapping strokes compound correctly).
-        local function blend(px, py, cov)
+        -- Blend `ink` (0 = black, default) over (px,py) by coverage in [0,1]
+        -- (over-composite: existing pixel moves toward ink, so it works on any
+        -- bg and overlapping strokes compound correctly).
+        local function blend(px, py, cov, ink)
             if cov <= 0 or px < x0 or px > x1b or py < y0 or py > y1b then return end
             if cov > 1 then cov = 1 end
+            ink = ink or 0
             local g = bb:getPixel(px, py):getColor8().a
-            bb:setPixel(px, py, Blitbuffer.Color8(floor(g * (1 - cov) + 0.5)))
+            bb:setPixel(px, py, Blitbuffer.Color8(floor(g * (1 - cov) + ink * cov + 0.5)))
         end
         -- Capsule (thick segment) from (ax,ay) to (bx,by), full width wd.
         local function line(ax, ay, bx, by, wd)
@@ -118,7 +123,7 @@ local function buildFace(diam, now, scale_pct)
         local maxr = floor(rc + ht + 1)
         for py = cy - maxr, cy + maxr do
             for px = cx - maxr, cx + maxr do
-                blend(px, py, ht + 0.5 - abs(sqrt((px - cx) ^ 2 + (py - cy) ^ 2) - rc))
+                blend(px, py, ht + 0.5 - abs(sqrt((px - cx) ^ 2 + (py - cy) ^ 2) - rc), RIM_INK)
             end
         end
         for i = 0, 11 do
@@ -185,7 +190,11 @@ end
 return {
     key   = "analogue_clock", -- stable id stored in user menus; never change it
     title = _("Analogue clock"),
-    render = function(width, scale_pct)
+    -- `preview` (3rd arg, set by the module chooser) forces the small face
+    -- size (the date line is kept): the chooser's preview cell is fixed-height,
+    -- so a large square sized to the cell width would overflow it. The live
+    -- menu calls render with no 3rd arg and honours the user's size setting.
+    render = function(width, scale_pct, preview)
         local Blitbuffer      = require("ffi/blitbuffer")
         local Fonts           = require("lib/bookshelf_fonts")
         local TextWidget      = require("ui/widget/textwidget")
@@ -201,7 +210,7 @@ return {
         -- with tight uniform vertical padding. "large" is inset by an equal,
         -- larger margin on every side (it would otherwise fill the width and
         -- sit tight top/bottom). Padding is uniform: top, clock-to-date, bottom.
-        local size = readSize()
+        local size = preview and "small" or readSize()
         local pad, diam
         if size == "large" then
             pad  = px(12)
