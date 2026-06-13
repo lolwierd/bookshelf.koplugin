@@ -4724,6 +4724,30 @@ function BookshelfWidget:onResume()
     end
 end
 
+-- Auto-rotate (gyro) + manual rotate. KOReader's gesture/gyro layer sends a
+-- SetRotationMode event through the main loop's sendEvent rather than
+-- broadcasting it (device/input.lua), so "only widgets that know how to handle
+-- a rotation will do so" -- a widget opts in by implementing this handler.
+-- ReaderView and FileManager both do, which is why the book auto-rotates but
+-- the bookshelf homescreen didn't: it had rotation-aware layout (_rebuild reads
+-- the swapped Screen dims) but no event handler to trigger it, so it only
+-- caught up when some other action forced a repaint (issue #123).
+--
+-- _rebuild re-reads Screen:getWidth/Height (which swap on rotation) and
+-- re-lays-out for the new orientation, so a single rebuild + full (flashing)
+-- refresh handles both the portrait<->landscape and 180-degree-flip cases and
+-- clears e-ink ghosting from the old orientation. Returns true to consume:
+-- bookshelf is the visible homescreen and has fully handled the rotation.
+function BookshelfWidget:onSetRotationMode(mode)
+    local old_mode = Screen:getRotationMode()
+    if mode ~= nil and mode ~= old_mode then
+        Screen:setRotationMode(mode)
+        self:_rebuild()
+        UIManager:setDirty(self, "full")
+    end
+    return true
+end
+
 -- Swipe gesture handlers. Layering by Y-position and state, most specific
 -- first:
 --   1. Swipe in the hero region → cycle previewed book on the shelf
