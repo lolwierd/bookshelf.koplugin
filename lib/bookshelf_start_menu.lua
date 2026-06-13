@@ -281,9 +281,31 @@ function StartMenu:_buildRow(entry, w, focused, in_flyout)
             icon_text = FOLDER_ICON_OPEN
         end
     end
-    local icon = TextWidget:new{
-        text = icon_text or " ", face = self._icon_face, fgcolor = fg,
-    }
+    local icon
+    local img_name = Model.imageIconName(icon_text)
+    if img_name then
+        local IconWidget = require("ui/widget/iconwidget")
+        local isz = (self._icon_face and self._icon_face.size) or Screen:scaleBySize(22)
+        local iw = IconWidget:new{
+            icon = img_name,
+            width = isz,
+            height = isz,
+            alpha = true,   -- render as-is (SVG/PNG own colours honoured)
+        }
+        -- Missing-file guard: a row referencing an icon the user no longer has
+        -- degrades to a blank icon column (the label still shows) rather than
+        -- KOReader's "icon-not-found" glyph.
+        if iw.file and iw.file:find("icon-not-found", 1, true) then
+            if iw.free then iw:free() end
+            icon = TextWidget:new{ text = " ", face = self._icon_face, fgcolor = fg }
+        else
+            icon = iw
+        end
+    else
+        icon = TextWidget:new{
+            text = icon_text or " ", face = self._icon_face, fgcolor = fg,
+        }
+    end
     -- Label budget mirrors _measurePanelWidth via the shared chrome width.
     -- TextWidget max_width must stay positive (makeLine aborts otherwise).
     local label_max = math.max(Screen:scaleBySize(40),
