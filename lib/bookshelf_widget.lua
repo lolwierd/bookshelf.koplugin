@@ -4,6 +4,8 @@
 --
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
+local Focus           = require("lib/bookshelf_focus")
+local TextSegments    = require("lib/bookshelf_text_segments")
 local FrameContainer  = require("ui/widget/container/framecontainer")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -623,6 +625,21 @@ local NAV_FLUSH_DELAY = 3
 -- file NOT covered by G_reader_settings autosave, so we must own these
 -- flush points ourselves.
 function BookshelfWidget:_persistNavState()
+    local drill = self:_serializeDrillPath()
+    -- Change-guard: _rebuild runs on many non-navigation events (cover-
+    -- extraction polls, onResume, metadata refreshes), and each call used to
+    -- mark the state dirty and schedule a flush even when chip / cursor / page
+    -- / drill were identical -- a needless full rewrite of bookshelf.lua (flash
+    -- wear). Skip entirely when nothing actually moved since the last persist.
+    local snap = {}
+    for _i, e in ipairs(drill) do
+        snap[#snap + 1] = (e.kind or "") .. "\2" .. (e.path or e.query or e.label or "")
+    end
+    snap = tostring(self.chip) .. "\1" .. tostring(self._cursor) .. "\1"
+        .. tostring(self.page) .. "\1" .. table.concat(snap, "\3")
+    if snap == self._nav_snapshot then return end
+    self._nav_snapshot = snap
+
     BookshelfSettings.saveDeferred("active_chip", self.chip)
     -- Cursor is the primary persisted state; active_page is also written
     -- for back-compat with older bookshelf versions that didn't know
@@ -630,7 +647,7 @@ function BookshelfWidget:_persistNavState()
     -- still land on a sensible page).
     BookshelfSettings.saveDeferred("active_cursor", self._cursor)
     BookshelfSettings.saveDeferred("active_page", self.page)
-    BookshelfSettings.saveDeferred("drill_path", self:_serializeDrillPath())
+    BookshelfSettings.saveDeferred("drill_path", drill)
     self._nav_dirty = true
     self:_scheduleNavFlush()
 end
@@ -1066,7 +1083,13 @@ function BookshelfWidget:_rebuild()
         local hsize = (BookshelfSettings.read("hero_size") == "large") and "large" or "regular"
         local hero_target = math.floor(available * (HERO_HEIGHT_FRAC[hsize] or 0.30))
         local lo = math.floor(slot_h_natural * SHELF_PACK_FLOOR)
-        local hi = math.floor(slot_h_natural * 1.05)   -- ShelfRow STRETCH_CAP
+        -- Cap shelf height at natural 2:3 (no vertical stretch). Spare
+        -- vertical slack flows to the hero instead of inflating the shelf
+        -- covers off-aspect -- the hero wins the leftover-space competition,
+        -- and every cover (hero + shelves) renders at a matching 2:3 ratio.
+        -- (Floor stays at SHELF_PACK_FLOOR=1.0: squashing below natural would
+        -- shrink covers horizontally too, reopening the PW5 side-gap problem.)
+        local hi = math.floor(slot_h_natural * 1.0)
         local raw = math.floor((available - hero_target) / n_shelves)
         shelf_h = math.max(1, math.min(hi, math.max(lo, raw)))
         hero_h  = math.max(hero_target, available - n_shelves * shelf_h)
@@ -1601,13 +1624,16 @@ function BookshelfWidget:_rebuild()
             allow_mirroring = false,
             empty_frame,
         }
-        if self._selection:isActive() then
-            local empty_footer = self:_buildFooterRow(content_w, 1, FOOTER_H)
-            empty_overlap[#empty_overlap + 1] = BottomContainer:new{
-                dimen = Geom:new{ w = self.width, h = self.height - FOOTER_BOTTOM_MARGIN },
-                empty_footer,
-            }
-        end
+        -- Always build the footer on an empty tab: it hosts the start-menu
+        -- hamburger (and, in selection mode, the bucket+✕ bar). The gate
+        -- used to be `if self._selection:isActive()`, which dropped the
+        -- launcher whenever a tab had no items -- e.g. an empty Series tab
+        -- left the user with no way to open the start menu.
+        local empty_footer = self:_buildFooterRow(content_w, 1, FOOTER_H)
+        empty_overlap[#empty_overlap + 1] = BottomContainer:new{
+            dimen = Geom:new{ w = self.width, h = self.height - FOOTER_BOTTOM_MARGIN },
+            empty_footer,
+        }
         self[1] = empty_overlap
         logger.dbg(string.format("[bookshelf perf] _rebuild: EMPTY total=%.0fms chip=%s",
             (_gettime() - _perf_t0) * 1000, _perf_chip))
@@ -1885,17 +1911,29 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
     local max_tries = BIM.max_extract_tries or 3
     local files = {}
     local seen  = {}
-    -- Extract at hero-sized specs uniformly. BIM stores ONE bb per book,
-    -- and the hero slot is bigger than the shelf slot — so caching at hero
-    -- size keeps both paths sharp (shelf downscales cleanly; the existing
-    -- spine_widget comment notes downscale is the corruption-free path).
-    -- Caching at slot size and letting hero upscale leaves the hero
-    -- pixelated for the previewed/last-read book even after re-extraction.
-    local cover_specs = {
+    -- Two extraction specs, by where the book is shown:
+    --   * HERO book -> hero-sized spec (the currently-reading card is the
+    --     one place a cover is drawn large, so it earns the bigger bitmap).
+    --   * Every other book -> SLOT-sized spec. Those only ever appear in a
+    --     shelf cell, and BIM stores ONE bb per book at the largest size ever
+    --     requested. Judging shelf covers against the hero target re-queued
+    --     covers that already dwarf the slot (e.g. 446x696 cached vs a
+    --     ~225x337 small-size slot) as "cover-too-small"; worse, the hero
+    --     target drifts with layout/mode/preview, so the same covers crossed
+    --     the 0.8 tolerance back and forth and re-extracted on every page
+    --     (the per-page shimmer). Slot-sized covers downscale cleanly and
+    --     the target is stable, so each book heals once and stays put.
+    -- The hero book is queued FIRST (below) so seen[] keeps its larger spec
+    -- when the same book also appears in a shelf row.
+    local slot_specs = {
+        max_cover_w = slot_w,
+        max_cover_h = slot_h,
+    }
+    local hero_specs = {
         max_cover_w = math.max(slot_w, hero_w or slot_w),
         max_cover_h = math.max(slot_h, hero_h or slot_h),
     }
-    local function maybe_queue(fp)
+    local function maybe_queue(fp, specs)
         if not fp or seen[fp] then return end
         seen[fp] = true
         -- pcall-guarded: BIM can throw a SQLite error when its DB is being
@@ -1927,7 +1965,7 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
         elseif info.cover_fetched == nil then
             reason = "no-cover-attempt-but-max-tries"
         elseif info.has_cover == "Y" and inprog < max_tries
-                and BookshelfWidget._coverNeedsResize(info, cover_specs) then
+                and BookshelfWidget._coverNeedsResize(info, specs) then
             -- Cached cover was extracted at a smaller spec than the current
             -- slot needs (e.g. the user previously browsed in FM list-mode,
             -- which extracts at ~30px wide; bookshelf wants ~150px). Re-queue
@@ -1949,17 +1987,31 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
         if needs then
             files[#files + 1] = {
                 filepath    = fp,
-                cover_specs = cover_specs,
+                cover_specs = specs,
             }
         end
     end
+    -- Hero book (preview / lastfile) FIRST, at hero size. It may not appear
+    -- in the visible shelf items — e.g. series drilldown shows other titles
+    -- in the series while the hero stays on the user's currently-reading
+    -- book — so queue it explicitly. Queued before the shelf loop so seen[]
+    -- keeps its larger hero_specs if the same book also sits in a shelf row.
+    local hero_fp
+    if self._preview_book and self._preview_book.filepath then
+        hero_fp = self._preview_book.filepath
+    else
+        -- Path only - don't pay getCurrent()'s BIM read just to learn
+        -- which file to queue (issue #103's side door).
+        hero_fp = Repo.currentFilepath and Repo.currentFilepath()
+    end
+    if hero_fp then maybe_queue(hero_fp, hero_specs) end
     for _i, item in ipairs(items or {}) do
         if item then
             -- Flat-book items (Recent / Latest / drilldown) carry filepath.
-            maybe_queue(item.filepath)
+            maybe_queue(item.filepath, slot_specs)
             -- Folder items (Home chip drilldown) carry first_book.
             if item.first_book then
-                maybe_queue(item.first_book.filepath)
+                maybe_queue(item.first_book.filepath, slot_specs)
             end
             -- Group items (series / authors / genres / tags) carry a books
             -- array. series_stack renders books[1] as the front cover plus
@@ -1969,24 +2021,11 @@ function BookshelfWidget:_kickOffMissingMetaExtraction(items, slot_w, slot_h, he
             if item.books then
                 for i = 1, math.min(3, #item.books) do
                     local b = item.books[i]
-                    if b then maybe_queue(b.filepath) end
+                    if b then maybe_queue(b.filepath, slot_specs) end
                 end
             end
         end
     end
-    -- Hero book (preview / lastfile) may not appear in the visible shelf
-    -- items — e.g. series drilldown shows other titles in the series while
-    -- the hero stays on the user's currently-reading book. Queue it
-    -- explicitly so its cover gets the hero-sized extraction.
-    local hero_fp
-    if self._preview_book and self._preview_book.filepath then
-        hero_fp = self._preview_book.filepath
-    else
-        -- Path only - don't pay getCurrent()'s BIM read just to learn
-        -- which file to queue (issue #103's side door).
-        hero_fp = Repo.currentFilepath and Repo.currentFilepath()
-    end
-    if hero_fp then maybe_queue(hero_fp) end
     logger.dbg(string.format("[bookshelf perf] _kickOffMeta: queued=%d displayed=%d",
         #files, #(items or {})))
     logger.dbg(string.format(
@@ -2193,6 +2232,14 @@ function BookshelfWidget:_pollExtraction()
     end
     local max_tries = BIM.max_extract_tries or 3
     local ready_paths   = {}
+    -- Subset of ready_paths whose extraction included a COVER (had
+    -- cover_specs). These need their ScaledCoverCache entry dropped before
+    -- the re-render: the bb we seeded on first paint may be an UPSCALE of a
+    -- too-small thumbnail (blurry), and the re-render skips re-decoding while
+    -- has(fp) is true -- so without the drop it repaints the stale blurry bb
+    -- and the cover only sharpens once a larger (hero) render forces a fresh
+    -- decode, i.e. when the user taps it (issue #125).
+    local ready_cover_paths = {}
     local still_pending = {}
     local gave_up_count = 0
     for _i, f in ipairs(files) do
@@ -2228,6 +2275,7 @@ function BookshelfWidget:_pollExtraction()
         local outcome
         if meta_ready and inprog == 0 and cover_ready then
             ready_paths[f.filepath] = true
+            if f.cover_specs then ready_cover_paths[f.filepath] = true end
             outcome = "READY"
         elseif info and inprog >= max_tries then
             -- BIM gave up on this file; stop watching it.
@@ -2278,6 +2326,18 @@ function BookshelfWidget:_pollExtraction()
         end)
     end
     if next(ready_paths) and self._inner_vgroup and self._shelf_dims then
+        -- A just-extracted cover is sharper than whatever we seeded on first
+        -- paint -- which, for a thumbnail that started smaller than the slot,
+        -- was an upscale (blurry). Drop those stale ScaledCoverCache entries
+        -- so the re-render below decodes the fresh BIM cover instead of
+        -- repainting the cached blurry bb. Without this the cover only
+        -- sharpens once a larger (hero) render forces a fresh decode, i.e.
+        -- when the user taps the book (issue #125). drop() is a no-op when
+        -- there's no entry (the no-cover -> cover case never seeded one).
+        if next(ready_cover_paths) then
+            local ScaledCoverCache = require("lib/bookshelf_scaled_cover_cache")
+            for fp in pairs(ready_cover_paths) do ScaledCoverCache:drop(fp) end
+        end
         -- _swapShelvesInPlace re-fetches Book records (which re-query
         -- BIM) and re-arms polling for whatever is still missing.
         self:_swapShelvesInPlace()
@@ -2632,13 +2692,16 @@ end
 
 -- ─── Navigation ───────────────────────────────────────────────────────────────
 
--- _openBook(book)  — open ReaderUI for the given book WITHOUT closing
--- the home screen. The Reader is shown on top in UIManager's stack;
--- when the Reader closes, Bookshelf is exposed automatically with no
+-- _openBook(book, after_open_callback)  — open ReaderUI for the given book
+-- WITHOUT closing the home screen. The Reader is shown on top in UIManager's
+-- stack; when the Reader closes, Bookshelf is exposed automatically with no
 -- intermediate FileManager flash. (Closing Bookshelf first leaves
 -- FileManager visible for one paint cycle before the close-document
 -- handler shows a fresh Bookshelf instance back on top.)
-function BookshelfWidget:_openBook(book)
+-- after_open_callback (optional) is handed to ReaderUI:showReader and runs
+-- with the ready ReaderUI once the document is open — same hook the bookmark
+-- browser's "View in book" uses to jump to a position after opening.
+function BookshelfWidget:_openBook(book, after_open_callback)
     if not book or not book.filepath then return end
     -- Stale records (Send-to-Kindle moved/removed the file after BIM cached
     -- the path) crash KOReader's filemanagerbookinfo:show via lfs.attributes
@@ -2669,7 +2732,7 @@ function BookshelfWidget:_openBook(book)
     self._hero_current_memo = nil
     self:_stopStatusTimer()
     local ReaderUI = require("apps/reader/readerui")
-    ReaderUI:showReader(book.filepath)
+    ReaderUI:showReader(book.filepath, nil, nil, nil, after_open_callback)
 end
 
 -- _buildHero — constructs a HeroCard reflecting current preview / lastfile.
@@ -3174,6 +3237,11 @@ function BookshelfWidget:_buildPaginationFooter(content_w, label_h, total_pages)
     }
     local page_text = Button:new{
         text = string.format("Page %d of %d", self.page, total_pages),
+        -- Adopt the Bookshelf UI font (a FontList-resolvable face), like the
+        -- rest of the chrome; falls back to cfont in follow mode. Button
+        -- resolves text_font_face via Font:getFace, and the UI-font setting
+        -- stores a resolvable face, so the name can be passed straight in.
+        text_font_face = BFont.getUIFontFace() or "cfont",
         text_font_size = 15,
         width      = slot(SLOT_PAGE),
         callback   = function() bw:_openPageJump() end,
@@ -3238,6 +3306,20 @@ end
 
 -- ─── Selection overlay ────────────────────────────────────────────────────────
 
+-- Bottom hit-zone extension baked into every footer button's frame
+-- (padding_bottom). Exposed as a class constant so other widgets that
+-- overlay a footer button's region (e.g. the start menu's close glyph
+-- over the hamburger) can subtract the same amount.
+BookshelfWidget.FOOTER_HIT_EXTENSION = Screen:scaleBySize(12)
+
+-- Stroke thickness of the custom-painted footer art (the hamburger bars,
+-- and the start menu's close X painted over them). Exposed as a class
+-- constant so the start menu can paint its X at EXACTLY the same weight —
+-- a glyph X always read heavier than the painted bars. Formula matches
+-- _buildStartMenuIcon's bar_t: art square scaled at 32, bars at ~art/14.
+BookshelfWidget.FOOTER_STROKE_W =
+    math.max(1, math.floor(Screen:scaleBySize(32) / 14))
+
 -- _wrapAsFooterButton(content_widget, frame_width, focused, on_tap)
 -- Wraps an arbitrary content widget in the same FrameContainer
 -- structure KOReader's Button widget produces internally — same
@@ -3250,7 +3332,7 @@ function BookshelfWidget:_wrapAsFooterButton(content_widget, frame_width, focuse
     local HorizontalSpan  = require("ui/widget/horizontalspan")
     local focus_border    = Screen:scaleBySize(4)
     local focus_radius    = Screen:scaleBySize(4)
-    local hit_extension   = Screen:scaleBySize(12)
+    local hit_extension   = BookshelfWidget.FOOTER_HIT_EXTENSION
     -- Focus swap: when focused, paint a focus_border-thick ring at the
     -- frame edge; when not focused, reserve the same space as
     -- transparent margin. Outer footprint stays constant.
@@ -3368,6 +3450,46 @@ function BookshelfWidget:_buildBucketIcon(focused, frame_width)
     end)
 end
 
+-- _buildStartMenuIcon(focused, frame_width) — Footer hamburger; opens the start menu. Hidden in multi-select (the close-X takes the slot).
+-- Custom-painted three bars rather than the obvious U+2630 glyph: the
+-- fallback face that renders U+2630 has a font box far taller than the
+-- art size (odd ascent/descent), which both inflated the button frame
+-- (so it reached up under the start-menu panel) and left the bar ink
+-- sitting below the chevrons' vertical midline. Painting the bars
+-- directly (same precedent as _buildBucketIcon) keeps the geometry
+-- deterministic: the box is exactly art_size tall, bars centered.
+function BookshelfWidget:_buildStartMenuIcon(focused, frame_width)
+    local art_size = Screen:scaleBySize(32)
+    frame_width    = frame_width or art_size
+    local bar_w    = art_size
+    -- Thin black bars: solid horizontal rects read heavier than the
+    -- chevrons' anti-aliased diagonal arms at equal pixel width, so the
+    -- bars run thinner (art_size/14 vs the arms' ~1/12) to land at the
+    -- same VISUAL stroke weight. Single source: FOOTER_STROKE_W (the
+    -- start menu's close X consumes the same constant).
+    local bar_t    = BookshelfWidget.FOOTER_STROKE_W
+    local span     = math.floor(art_size * 0.62)
+    local gap      = math.max(1, math.floor((span - 3 * bar_t) / 2))
+    span = 3 * bar_t + 2 * gap
+    local Widget = require("ui/widget/widget")
+    local BarsWidget = Widget:extend{}
+    function BarsWidget:getSize() return Geom:new{ w = bar_w, h = art_size } end
+    function BarsWidget:paintTo(bb, x, y)
+        local top = y + math.floor((art_size - span) / 2)
+        for i = 0, 2 do
+            bb:paintRect(x, top + i * (bar_t + gap), bar_w, bar_t,
+                Blitbuffer.COLOR_BLACK)
+        end
+    end
+    local bw_ref = self
+    local btn = self:_wrapAsFooterButton(BarsWidget:new{}, frame_width, focused, function()
+        bw_ref:_openStartMenu()
+        return true
+    end)
+    self._burger_dimen = btn.dimen
+    return btn
+end
+
 -- _buildExitIcon(focused) — Renders the close icon as the mdi-close nerd-
 -- font glyph (U+E855) via KOReader's bundled `symbols` font face. Earlier
 -- iterations rasterised the X pixel-by-pixel because paintLine isn't in
@@ -3405,6 +3527,15 @@ function BookshelfWidget:_buildExitIcon(focused, frame_width)
         end
         return true
     end)
+end
+
+-- _startMenuPosition() — sanitised read of the start-menu position
+-- setting: "left" (default; an absent or unknown value reads as left),
+-- "right", or "off".
+function BookshelfWidget:_startMenuPosition()
+    local v = BookshelfSettings.read("start_menu_position", "left")
+    if v == "right" or v == "off" then return v end
+    return "left"
 end
 
 -- _buildFooterRow(content_w, total_pages, footer_h) — the screen-anchored
@@ -3458,7 +3589,28 @@ function BookshelfWidget:_buildFooterRow(content_w, total_pages, footer_h)
             dimen = Geom:new{ w = self.width, h = footer_h },
             bucket_icon,
         }
+    else
+        local menu_pos = self:_startMenuPosition()
+        if menu_pos == "off" then
+            -- No hamburger this build: clear the stashed dimen so a
+            -- stale region from a previous build can't anchor the
+            -- start-menu close indicator (defensive; _openStartMenu
+            -- also no-ops when off).
+            self._burger_dimen = nil
+        else
+            local nav_strip_w  = math.floor(content_w * 0.75)
+            local side_strip_w = math.floor((self.width - nav_strip_w) / 2)
+            local burger_focused = (self._focus_zone == "footer")
+                and (self._footer_cursor_btn == "menu")
+            local burger = self:_buildStartMenuIcon(burger_focused, side_strip_w, footer_h)
+            local Container = menu_pos == "right" and RightContainer or LeftContainer
+            row[#row + 1] = Container:new{
+                dimen = Geom:new{ w = self.width, h = footer_h },
+                burger,
+            }
+        end
     end
+    self._footer_h_last = footer_h
     self._footer_row_widget = row
     return row
 end
@@ -4611,6 +4763,30 @@ function BookshelfWidget:onResume()
     end
 end
 
+-- Auto-rotate (gyro) + manual rotate. KOReader's gesture/gyro layer sends a
+-- SetRotationMode event through the main loop's sendEvent rather than
+-- broadcasting it (device/input.lua), so "only widgets that know how to handle
+-- a rotation will do so" -- a widget opts in by implementing this handler.
+-- ReaderView and FileManager both do, which is why the book auto-rotates but
+-- the bookshelf homescreen didn't: it had rotation-aware layout (_rebuild reads
+-- the swapped Screen dims) but no event handler to trigger it, so it only
+-- caught up when some other action forced a repaint (issue #123).
+--
+-- _rebuild re-reads Screen:getWidth/Height (which swap on rotation) and
+-- re-lays-out for the new orientation, so a single rebuild + full (flashing)
+-- refresh handles both the portrait<->landscape and 180-degree-flip cases and
+-- clears e-ink ghosting from the old orientation. Returns true to consume:
+-- bookshelf is the visible homescreen and has fully handled the rotation.
+function BookshelfWidget:onSetRotationMode(mode)
+    local old_mode = Screen:getRotationMode()
+    if mode ~= nil and mode ~= old_mode then
+        Screen:setRotationMode(mode)
+        self:_rebuild()
+        UIManager:setDirty(self, "full")
+    end
+    return true
+end
+
 -- Swipe gesture handlers. Layering by Y-position and state, most specific
 -- first:
 --   1. Swipe in the hero region → cycle previewed book on the shelf
@@ -4859,7 +5035,20 @@ function BookshelfWidget:onBSFocusDown()
                 self:_refreshBucket()
                 return true
             end
-            if total <= 1 then return true end   -- single page: footer has nothing actionable
+            if total <= 1 then
+                -- Single page: pagination buttons are disabled, but the
+                -- start-menu slot is still reachable (selection is off here;
+                -- the active-selection branch above exits before this point).
+                if self:_startMenuPosition() == "off" then
+                    -- ...unless the start menu is hidden: nothing in the
+                    -- footer is focusable, so keep focus in the grid.
+                    return true
+                end
+                self._footer_cursor_btn = "menu"
+                self._focus_zone        = "footer"
+                self:_swapFooterInPlace()
+                return true
+            end
             self._footer_cursor_btn = "next"
             self._focus_zone        = "footer"
             self:_swapFooterInPlace()
@@ -4880,26 +5069,34 @@ function BookshelfWidget:onBSFocusDown()
     return true
 end
 
--- _footerNeighbour(cur, page, total, dir)
+-- _footerNeighbour(cur, page, total, dir, sel_active, menu_pos)
 -- Returns the key of the nearest enabled footer button in direction dir
 -- (dir=1 for right, dir=-1 for left), or nil if there is none.
-local _FOOTER_ORDER = {"first","prev","page","next","last"}
-local function _footerBtnEnabled(k, page, total)
+-- menu_pos is the start-menu position setting ("left"/"right"/"off"):
+-- two static order tables (rather than one runtime-built list) keep the
+-- d-pad order matching the on-screen order - the menu slot sits before
+-- the chevrons when the hamburger is on the left and after them when it
+-- is on the right. "off" disables the slot via _footerBtnEnabled.
+local _FOOTER_ORDER_LEFT  = {"menu","first","prev","page","next","last"}
+local _FOOTER_ORDER_RIGHT = {"first","prev","page","next","last","menu"}
+local function _footerBtnEnabled(k, page, total, sel_active, menu_pos)
+    if k == "menu" then return not sel_active and menu_pos ~= "off" end
     if k == "first" or k == "prev" then return page > 1 end
     if k == "page"                  then return true end
     -- "next" or "last"
     return page < total
 end
-local function _footerNeighbour(cur, page, total, dir)
+local function _footerNeighbour(cur, page, total, dir, sel_active, menu_pos)
+    local order = menu_pos == "right" and _FOOTER_ORDER_RIGHT or _FOOTER_ORDER_LEFT
     local cur_i = 0
-    for i, k in ipairs(_FOOTER_ORDER) do
+    for i, k in ipairs(order) do
         if k == cur then cur_i = i; break end
     end
     if cur_i == 0 then return nil end
     local i = cur_i + dir
-    while i >= 1 and i <= #_FOOTER_ORDER do
-        local k = _FOOTER_ORDER[i]
-        if _footerBtnEnabled(k, page, total) then return k end
+    while i >= 1 and i <= #order do
+        local k = order[i]
+        if _footerBtnEnabled(k, page, total, sel_active, menu_pos) then return k end
         i = i + dir
     end
     return nil
@@ -4955,7 +5152,8 @@ function BookshelfWidget:onBSFocusLeft()
 
     if self._focus_zone == "footer" then
         local total   = self._total_pages or 1
-        local new_btn = _footerNeighbour(self._footer_cursor_btn, self.page, total, -1)
+        local new_btn = _footerNeighbour(self._footer_cursor_btn, self.page, total, -1,
+            self._selection:isActive(), self:_startMenuPosition())
         if new_btn then
             self._footer_cursor_btn = new_btn
             self:_swapFooterInPlace()
@@ -5016,7 +5214,8 @@ function BookshelfWidget:onBSFocusRight()
 
     if self._focus_zone == "footer" then
         local total   = self._total_pages or 1
-        local new_btn = _footerNeighbour(self._footer_cursor_btn, self.page, total, 1)
+        local new_btn = _footerNeighbour(self._footer_cursor_btn, self.page, total, 1,
+            self._selection:isActive(), self:_startMenuPosition())
         if new_btn then
             self._footer_cursor_btn = new_btn
             self:_swapFooterInPlace()
@@ -5147,7 +5346,10 @@ function BookshelfWidget:onBSKbPress()
     if self._focus_zone == "footer" then
         local btn   = self._footer_cursor_btn
         local total = self._total_pages or 1
-        if btn == "first" and self.page > 1 then
+        if btn == "menu" and not self._selection:isActive() then
+            self:_openStartMenu()
+            return true
+        elseif btn == "first" and self.page > 1 then
             self._cursor = 1
             self:_syncPageFromCursor()
             self._footer_cursor_btn = "next"
@@ -5276,8 +5478,31 @@ function BookshelfWidget:_setActiveChip(key)
     -- coalesced flush; a sync save here added a ~140ms file write to
     -- every chip swipe.
     BookshelfSettings.saveDeferred("active_chip", key)
+    -- Switching chips never changes the hero: it shows the previewed /
+    -- currently-reading book, which is independent of the active chip
+    -- (_setActiveChip doesn't touch _preview_book, and _rebuild re-resolves
+    -- the hero to the same book, so it rebuilds pixel-identical). Refreshing
+    -- the whole widget therefore re-flashed the hero on e-ink for no reason
+    -- (issue #124). Capture the hero's painted bottom edge and scope the
+    -- refresh to the chip strip + shelves + footer below it; the hero region
+    -- is left untouched. Falls back to a full refresh if the hero hasn't
+    -- painted yet (no dimen).
+    local prev_hero  = self._hero_parent and self._hero_parent[1]
+    local hero_dimen = prev_hero and prev_hero.dimen
     self:_rebuild()
-    UIManager:setDirty(self, "ui")
+    if hero_dimen and hero_dimen.h then
+        local below_y = hero_dimen.y + hero_dimen.h
+        UIManager:setDirty(self, function()
+            return "ui", Geom:new{
+                x = 0,
+                y = below_y,
+                w = self.width,
+                h = self.height - below_y,
+            }
+        end)
+    else
+        UIManager:setDirty(self, "ui")
+    end
     logger.dbg(string.format(
         "[bookshelf perf] chip-switch: from=%s to=%s flash=%.0fms rebuild=%.0fms TOTAL=%.0fms",
         _diag_from, key,
@@ -6936,7 +7161,10 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
     -- bordered rounded rectangle, packed into rows that wrap to
     -- text_w. Pill text is rendered UPPERCASED (small-caps style) --
     -- KOReader's TextWidget has no small-caps font variant, so the
-    -- :upper() fallback is the convention. Padding is symmetric on
+    -- uppercase fallback is the convention. TextSegments.upper is
+    -- UTF-8-aware (Lua's :upper() leaves accented letters untouched,
+    -- so "videojáték" would render "VIDEOJáTéK" -- issue #130).
+    -- Padding is symmetric on
     -- both axes for a balanced look. Built only when the caller passes
     -- pill_specs -- the collection-manager call site for instance
     -- passes nil because it doesn't want nav-into-self affordances.
@@ -6956,7 +7184,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
         -- front (the packing pass needs them to greedily wrap).
         local function _buildPill(label_text, on_tap_cb)
             local label_w = TextWidget_:new{
-                text = (label_text or ""):upper(),
+                text = TextSegments.upper(label_text or ""),
                 face = pill_face,
                 bold = pill_bold,
             }
@@ -7376,7 +7604,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
 
     local function _buildPill(label_text, on_tap_cb)
         local label_w = TextWidget_:new{
-            text = (label_text or ""):upper(),
+            text = TextSegments.upper(label_text or ""),
             face = pill_face,
             bold = pill_bold,
         }
@@ -8024,7 +8252,7 @@ function BookshelfWidget:_openHardcoverMenu(book)
             -- the in-place refresh path scopes its setDirty to the spine /
             -- hero rect, so repaint the dialog explicitly here.
             if dialog and dialog.reinit then
-                dialog:reinit()
+                Focus.reinit(dialog)
                 UIManager:setDirty(dialog, "ui")
             end
         end,
@@ -8039,7 +8267,7 @@ function BookshelfWidget:_openHardcoverMenu(book)
             -- See use_cover_button: reinit rebuilds the checkbox text but
             -- the scoped in-place refresh no longer repaints the dialog.
             if dialog and dialog.reinit then
-                dialog:reinit()
+                Focus.reinit(dialog)
                 UIManager:setDirty(dialog, "ui")
             end
         end,
@@ -9903,6 +10131,19 @@ function BookshelfWidget:_expandFolder(folder)
 end
 
 -- ─── Dismiss / passthrough ───────────────────────────────────────────────────
+
+function BookshelfWidget:_openStartMenu()
+    -- Defensive: with the start menu off there is no footer button and
+    -- no focusable "menu" slot, so nothing should reach this - but a
+    -- stale dispatcher action or queued gesture must not open it anyway.
+    if self:_startMenuPosition() == "off" then return end
+    local ok, StartMenu = pcall(require, "lib/bookshelf_start_menu")
+    if not ok or not StartMenu then
+        logger.warn("[bookshelf] start menu unavailable:", tostring(StartMenu))
+        return
+    end
+    StartMenu.open(self, self._footer_h_last or Screen:scaleBySize(40), self._burger_dimen)
+end
 
 function BookshelfWidget:onClose()
     UIManager:close(self)
