@@ -417,7 +417,7 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     -- painting and we couldn't pin it); otherwise just the individually-blocked
     -- ones. Either way the row renders as a removable, tappable fallback.
     local blocked = self._safe_mode or Breaker.isBlocked(Store, entry.module)
-    local inner
+    local inner, errored
     if def and not blocked then
         -- Force getSize() INSIDE the breaker's armed window: TextBoxWidget
         -- shaping (the likely segfault site) happens during measurement, not
@@ -432,6 +432,7 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
         end)
         inner = ok and widget or nil
         if not ok then
+            errored = true
             logger.warn("[bookshelf] start menu module render failed:",
                 entry.module, widget)
         end
@@ -443,6 +444,10 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
             -- the user isn't locked out (issue #163). Tapping retries it; a
             -- long-press still removes the row like any other.
             label = T(_("%1 (disabled - tap to retry)"), label)
+        elseif errored then
+            -- render threw a (catchable) Lua error: show it inline and log the
+            -- detail, rather than rendering nothing or taking the menu down.
+            label = T(_("%1 (error)"), label)
         end
         inner = TextWidget:new{
             text = label,
