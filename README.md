@@ -31,6 +31,8 @@ A friendly home screen for KOReader. Browse your library by series, author, genr
 3. Restart KOReader.
 4. Open KOReader's menu and set **Start with -> Bookshelf**. Without this, KOReader opens its standard file browser on launch; you can still open Bookshelf manually from the menu.
 
+   > The **Start with** setting only appears in the menu of KOReader's **File Manager** screen, not while a book is open. If you can't find it, close the book first (or launch KOReader without one open), then open the menu from the file browser.
+
 > **You also need CoverBrowser enabled** (Settings -> More plugins -> CoverBrowser). It supplies the covers and metadata Bookshelf uses. If it's disabled, Bookshelf shows a one-time notice and steps aside to KOReader's standard file browser.
 
 Once it's running, the top menu has a **Bookshelf** section with everything else: chips, the book detail view, collections, updates, and settings.
