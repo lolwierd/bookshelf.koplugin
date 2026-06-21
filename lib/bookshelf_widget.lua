@@ -10829,11 +10829,12 @@ end
 
 -- ─── Dismiss / passthrough ───────────────────────────────────────────────────
 
-function BookshelfWidget:_openStartMenu()
-    -- Defensive: with the start menu off there is no footer button and
-    -- no focusable "menu" slot, so nothing should reach this - but a
-    -- stale dispatcher action or queued gesture must not open it anyway.
-    if self:_startMenuPosition() == "off" then return end
+-- force: open even when the start menu is set to Off. Set only by the explicit
+-- "open start menu" gesture action; the footer button / focus slot leave it nil
+-- so the Off guard still protects against a stale dispatcher action or queued
+-- gesture.
+function BookshelfWidget:_openStartMenu(force)
+    if not force and self:_startMenuPosition() == "off" then return end
     local ok, StartMenu = pcall(require, "lib/bookshelf_start_menu")
     if not ok or not StartMenu then
         logger.warn("[bookshelf] start menu unavailable:", tostring(StartMenu))
@@ -10844,9 +10845,11 @@ function BookshelfWidget:_openStartMenu()
 end
 
 -- Open the full-screen micro-module grid (Micro-modules placement ==
--- "fullscreen"), launched by the footer grid button.
-function BookshelfWidget:_openMicroModulesFullscreen()
-    if BookshelfSettings.microPlacement() ~= "fullscreen" then return end
+-- "fullscreen"), launched by the footer grid button. force: open even when
+-- placement isn't "fullscreen" -- set only by the explicit gesture action; the
+-- footer button leaves it nil so the placement guard still applies there.
+function BookshelfWidget:_openMicroModulesFullscreen(force)
+    if not force and BookshelfSettings.microPlacement() ~= "fullscreen" then return end
     local ok, Mod = pcall(require, "lib/bookshelf_micro_fullscreen")
     if not ok or not Mod then
         logger.warn("[bookshelf] micro-module fullscreen unavailable:", tostring(Mod))

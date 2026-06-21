@@ -851,6 +851,23 @@ function Bookshelf:onDispatcherRegisterActions()
         title    = _("Bookshelf: open bulk action menu"),
         general  = true,
     })
+    -- Open the start menu / full-screen micro-module view by gesture, so they're
+    -- reachable in the reader without the launcher buttons shown (or in the
+    -- library). A bound gesture is an explicit request, so it opens regardless
+    -- of the button-visibility settings AND the Off settings (start menu = Off,
+    -- micro placement = Off) -- see the force flag in the handlers.
+    Dispatcher:registerAction("bookshelf_open_start_menu", {
+        category = "none",
+        event    = "BookshelfOpenStartMenu",
+        title    = _("Bookshelf: open start menu"),
+        general  = true,
+    })
+    Dispatcher:registerAction("bookshelf_open_micro_modules", {
+        category = "none",
+        event    = "BookshelfOpenMicroModules",
+        title    = _("Bookshelf: open micro-modules"),
+        general  = true,
+    })
 end
 
 -- _raiseInPlace — splice the live BookshelfWidget to the top of
@@ -1175,6 +1192,29 @@ function Bookshelf:onToggleBookshelf()
         UIManager:close(_live_widget)
     else
         self:_safeShow()
+    end
+    return true
+end
+
+-- Gesture actions: open the start menu / full-screen micro-module view. In the
+-- reader they use the self-contained reader openers (no widget needed); in the
+-- library they open over the live widget, forcing past the Off guards since a
+-- bound gesture is an explicit request. From the raw FileManager with bookshelf
+-- closed there's no widget to open onto, so it's a no-op.
+function Bookshelf:onBookshelfOpenStartMenu()
+    if self.ui and self.ui.document then
+        self:_openReaderStartMenu()
+    elseif _live_widget and _live_widget._openStartMenu then
+        _live_widget:_openStartMenu(true)
+    end
+    return true
+end
+
+function Bookshelf:onBookshelfOpenMicroModules()
+    if self.ui and self.ui.document then
+        self:_openReaderMicroModules()
+    elseif _live_widget and _live_widget._openMicroModulesFullscreen then
+        _live_widget:_openMicroModulesFullscreen(true)
     end
     return true
 end
