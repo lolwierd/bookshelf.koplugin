@@ -23,8 +23,32 @@ local logger          = require("logger")
 local Screen          = Device.screen
 local Model           = require("lib/bookshelf_start_menu_model")
 local Modules         = require("lib/bookshelf_start_menu_modules")
+local Breaker         = require("lib/bookshelf_module_breaker")
 local Store           = require("lib/bookshelf_settings_store")
 local _               = require("lib/bookshelf_i18n").gettext
+local T               = require("ffi/util").template
+
+-- When the "Disable micro-modules" advanced setting is on, micro-module
+-- entries are hidden from the start menu (the model keeps them, so re-enabling
+-- restores them). Returns a fresh structure — folders are shallow-copied so
+-- filtering their children never mutates the (possibly by-reference) stored
+-- model.
+local function stripModules(items)
+    local out = {}
+    for _i, e in ipairs(items) do
+        if e.type ~= "module" then
+            if e.type == "folder" and e.children then
+                local copy = {}
+                for k, v in pairs(e) do copy[k] = v end
+                copy.children = stripModules(e.children)
+                out[#out + 1] = copy
+            else
+                out[#out + 1] = e
+            end
+        end
+    end
+    return out
+end
 
 -- Paints its single child at a fixed offset within the overlay.
 local OffsetContainer = WidgetContainer:extend{ x_off = 0, y_off = 0 }
@@ -106,14 +130,46 @@ local StartMenu = InputContainer:extend{}
 -- Entry point used by bookshelf_widget. bottom_inset = footer height (+margin).
 -- burger_dimen: live Geom of the hamburger InputContainer (optional); when
 -- provided the overlay paints an opaque close glyph over that region.
-function StartMenu.open(bw, bottom_inset, burger_dimen)
+-- context: "library" (home screen, default) | "reader" (in-reader launcher).
+-- Items whose scope is set to the other context are filtered out (#scope feat).
+function StartMenu.open(bw, bottom_inset, burger_dimen, context)
+    -- In reader context there's no bookshelf widget to repaint the area an
+    -- in-place rebuild vacates (e.g. a closed folder flyout), so the flyout
+    -- pixels would linger. Target ReaderUI instead, so the page beneath repaints
+    -- and clears it. (In the library, bw -- the bookshelf -- does this.)
+    local under = (context == "reader")
+        and package.loaded["apps/reader/readerui"]
+        and package.loaded["apps/reader/readerui"].instance or nil
+    -- No burger_dimen => no footer button to sit above (gesture-opened). In that
+    -- case ignore the passed inset and balance the bottom gap to the side margin
+    -- in init() (once _margin is known), so the panel is evenly inset from the
+    -- bottom and the side. With a button, sit above it plus a small gap.
+    local no_button = (burger_dimen == nil)
     local menu = StartMenu:new{
-        bw           = bw,
-        bottom_inset = bottom_inset + Screen:scaleBySize(6),
-        burger_dimen = burger_dimen,
+        bw            = bw,
+        bottom_inset  = no_button and 0 or (bottom_inset + Screen:scaleBySize(6)),
+        _balance_bottom_margin = no_button,
+        burger_dimen  = burger_dimen,
+        context       = (context == "reader") and "reader" or "library",
+        _repaint_under = under,
     }
     UIManager:show(menu, "ui", menu._dirty_region)
     StartMenu._live = menu -- test/introspection hook; cleared in onCloseWidget
+end
+
+-- Model.load() filtered by the "In start menu" micro-module surface toggle.
+-- Display-only: mutations go through bookshelf_start_menu_edit's own fresh
+-- Model.load, so the stored model (with its module entries) is never touched by
+-- the filtering -- toggling the surface back on restores the cards untouched.
+function StartMenu:_loadItems()
+    local items = Model.load()
+    if not Store.microInStartMenu() then
+        items = stripModules(items)
+    end
+    -- Hide entries scoped to the other context (library vs the in-reader
+    -- launcher). nil scope shows in both, so default menus are unaffected.
+    items = Model.filterByScope(items, self.context or "library")
+    return items
 end
 
 function StartMenu:init()
@@ -121,6 +177,15 @@ function StartMenu:init()
     -- per open (init runs once per StartMenu instance; _reload does not
     -- re-init). Modules key per-open caches on it — see the README.
     pcall(Modules.bumpGeneration)
+    -- Crash recovery (issue #163): if the LAST open armed but never painted
+    -- (a paint-pass segfault, or a render hard-crash safeText didn't prevent),
+    -- the marker is still on disk - open in SAFE MODE with every module
+    -- suppressed so the user can still get in and remove the culprit. Prevention
+    -- is safeText; this is just the recovery net. openCrashed must be read
+    -- BEFORE armOpen re-arms it for this open.
+    local ok_o, crashed = pcall(Breaker.openCrashed, Store)
+    self._safe_mode = (ok_o and crashed) or false
+    pcall(Breaker.armOpen, Store)
     self.dimen = Geom:new{ x = 0, y = 0,
         w = Screen:getWidth(), h = Screen:getHeight() }
     -- Side margin matches the bookshelf's own side gap (same formula as
@@ -130,12 +195,18 @@ function StartMenu:init()
     self._margin = math.min(
         math.floor(Size.padding.fullscreen * 2 * 0.8),
         math.floor(Screen:getWidth() * 0.03))
+    -- Gesture-opened with no footer button: mirror the side margin onto the
+    -- bottom so the panel is evenly inset (the horizontal anchor already
+    -- mirrors _margin left/right, so this balances all three edges).
+    if self._balance_bottom_margin then
+        self.bottom_inset = self._margin
+    end
     -- Chrome constants shared by row building and the pagination budget.
     self._focus_border = Screen:scaleBySize(2) -- row margin/border swap
     self._panel_border = Screen:scaleBySize(2) -- panel FrameContainer border
     self._panel_pad    = Screen:scaleBySize(3) -- panel FrameContainer padding
     self:_applyFontScale()
-    self._items    = Model.load()
+    self._items    = self:_loadItems()
     -- Open on the LAST page (the menu is anchored bottom-left, so the final
     -- rows sit by the thumb). Seeding the page past the end makes the first
     -- build clamp it to the real last page; _build runs once per open, so this
@@ -376,7 +447,10 @@ function StartMenu:_buildRow(entry, w, focused, in_flyout)
     end
     function row:onTap(_a, ges)
         if flyoutOwns(ges) then return false end
-        sm:_activate(entry); return true
+        -- Pass the tapped row's painted rect so a keep_open re-render can scope
+        -- its refresh to this row and below, rather than flashing the whole
+        -- panel (rows above the tapped one shouldn't redraw).
+        sm:_activate(entry, self.dimen and self.dimen:copy()); return true
     end
     function row:onHold(_a, ges)
         if flyoutOwns(ges) then return false end
@@ -398,20 +472,79 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     local card_margin = math.floor(self._pad / 2) -- inset from panel edges
     local card_pad    = self._pad
     local inner_w     = inner_w_frame - 2 * card_margin - 2 * card_pad
-    local inner
-    if def then
-        local ok, widget = pcall(def.render, inner_w, self._scale_pct or 100)
+    -- Parent-owned scoped refresh for THIS module's row: passed to render() as
+    -- the 5th arg so a module can refresh itself after async work (weather /
+    -- daily_fun / trivia) via the parent instead of a full-screen setDirty or
+    -- a hardcoded StartMenu._live:_reload. `row` is forward-declared; the
+    -- closure reads it at call time (after the row is built + painted), so the
+    -- async fire scopes the reload from this row down (cards above don't
+    -- redraw). Mirrors the hero's per-cell refresh.
+    local sm = self
+    local row
+    local function refresh()
+        if sm._reload then sm:_reload(row and row.dimen and row.dimen:copy()) end
+    end
+    -- In safe mode every module is suppressed (a previous open crashed before
+    -- painting); the row renders as a removable, tappable fallback instead.
+    local blocked = self._safe_mode
+    local inner, errored
+    if def and not blocked then
+        -- Render under pcall so a Lua error degrades to an "(error)" row rather
+        -- than taking down the build. Force getSize() inside the guard so any
+        -- layout/shaping error is caught here too. No disk writes on this path.
+        -- The render still gets the scoped refresh (5th arg) for async redraws.
+        local ok, widget = Breaker.guard(function()
+            local wgt = def.render({
+                width = inner_w, height = nil,
+                scale = self._scale_pct or 100,
+                preview = false, refresh = refresh, shape = nil, entry = entry,
+                surface = "start_menu", bw = self.bw, menu = self,
+                config = require("lib/bookshelf_module_kit").entryConfig(entry, nil),
+            })
+            if wgt then wgt:getSize() end
+            return wgt
+        end)
         inner = ok and widget or nil
         if not ok then
+            errored = true
             logger.warn("[bookshelf] start menu module render failed:",
                 entry.module, widget)
         end
     end
     if not inner then
+        local label = (def and def.title) or entry.module
+        if blocked then
+            -- This module crashed the menu last open and was auto-disabled so
+            -- the user isn't locked out (issue #163). Tapping retries it; a
+            -- long-press still removes the row like any other.
+            label = T(_("%1 (disabled - tap to retry)"), label)
+        elseif errored then
+            -- render threw a (catchable) Lua error: show it inline and log the
+            -- detail, rather than rendering nothing or taking the menu down.
+            label = T(_("%1 (error)"), label)
+        end
         inner = TextWidget:new{
-            text = (def and def.title) or entry.module,
+            text = label,
             face = self._row_face, fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            max_width = math.max(1, inner_w),
         }
+    end
+    -- Resize hysteresis: hold this module's previous rendered height across
+    -- re-renders unless the content changed by more than ~half a line, so a
+    -- slightly taller/shorter async re-render (weather / trivia / etc.) doesn't
+    -- shuffle every row below it a few pixels (a visible glitch). Slight shrink
+    -- pads; slight grow clips a few px of trailing whitespace; a significant
+    -- change adopts the new height. Per StartMenu instance, keyed by entry id.
+    if entry.id then
+        local iw, ih = inner:getSize().w, inner:getSize().h
+        self._module_heights = self._module_heights or {}
+        local prev = self._module_heights[entry.id]
+        if prev and math.abs(ih - prev) <= Screen:scaleBySize(6) then
+            local ClipContainer = require("lib/bookshelf_clip_container")
+            inner = ClipContainer:new{ w = iw, h = prev, bg = Modules.CARD_BG, inner }
+        else
+            self._module_heights[entry.id] = ih
+        end
     end
     -- Pad content to the card's full inner width so the card spans the
     -- panel (minus its margins) regardless of the module's natural width.
@@ -450,8 +583,9 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
         padding_bottom = card_margin,
         card_row,
     }
-    local sm = self
-    local row = InputContainer:new{ dimen = frame:getSize(), frame }
+    -- Assign the forward-declared `row`/`sm` (see top of _buildModuleRow) so
+    -- the refresh closure binds to this row, not a shadowing local.
+    row = InputContainer:new{ dimen = frame:getSize(), frame }
     if Device:isTouchDevice() then
         row.ges_events = {
             Tap  = { GestureRange:new{ ges = "tap",  range = row.dimen } },
@@ -465,7 +599,10 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     end
     function row:onTap(_a, ges)
         if flyoutOwns(ges) then return false end
-        sm:_activate(entry); return true
+        -- Pass the tapped row's painted rect so a keep_open re-render can scope
+        -- its refresh to this row and below, rather than flashing the whole
+        -- panel (rows above the tapped one shouldn't redraw).
+        sm:_activate(entry, self.dimen and self.dimen:copy()); return true
     end
     function row:onHold(_a, ges)
         if flyoutOwns(ges) then return false end
@@ -817,21 +954,25 @@ function StartMenu:_build()
     self._burger_region = nil
     if self.burger_dimen and self.burger_dimen.w > 0 then
         local bd = self.burger_dimen
-        -- padding_bottom baked into bd.h by _wrapAsFooterButton
-        local hit_ext = (self.bw and self.bw.FOOTER_HIT_EXTENSION)
-            or Screen:scaleBySize(12)
-        local visual_h = bd.h - hit_ext
-        local ind_y    = bd.y
-        -- Clip the indicator to below the panel's bottom edge: the burger
-        -- frame can be taller than the footer band (it is vertically
-        -- centered into it), and an unclipped opaque white frame would
-        -- erase the panel's bottom-left border corner.
+        -- Mask EXACTLY the hamburger's art cell (art × art), centred on the
+        -- button's centre x at the art-box top (focusBorder() below the frame
+        -- top -- the same anchor the painted bars use). NOT the full button
+        -- frame: bd spans the whole side strip, so an opaque box that wide
+        -- blanks out everything beside the glyph (e.g. a reader progress bar).
+        local FG  = require("lib/bookshelf_footer_geom")
+        local art = FG.barMetrics().art
+        local cx    = bd.x + math.floor(bd.w / 2)
+        local box_x = cx - math.floor(art / 2)
+        local box_y = bd.y + FG.focusBorder()
+        local box_h = art
+        -- Clip to below the panel's bottom edge so the opaque box never erases
+        -- the panel's bottom-left border corner.
         local panel_bottom = sh - self.bottom_inset
-        if ind_y < panel_bottom then
-            visual_h = visual_h - (panel_bottom - ind_y)
-            ind_y = panel_bottom
+        if box_y < panel_bottom then
+            box_h = box_h - (panel_bottom - box_y)
+            box_y = panel_bottom
         end
-        visual_h = math.max(0, visual_h) -- short dimens: never go negative
+        box_h = math.max(0, box_h) -- short dimens: never go negative
         -- Custom-painted X, NOT a glyph: the close X replaces the painted
         -- hamburger bars in the same slot, so the two must read at the SAME
         -- stroke weight — and glyph strokes can't be tuned (U+2715 was the
@@ -840,12 +981,11 @@ function StartMenu:_build()
         -- (BookshelfWidget.FOOTER_STROKE_W), traced as stroke×stroke squares
         -- stepped 1px along both diagonals — renders clean at e-ink sizes,
         -- same precedent as _buildStartMenuIcon's painted bars.
-        local art_size = Screen:scaleBySize(32)
-        local stroke   = (self.bw and self.bw.FOOTER_STROKE_W)
-            or math.max(1, math.floor(art_size / 14))
+        local stroke = (self.bw and self.bw.FOOTER_STROKE_W)
+            or math.max(1, math.floor(art / 14))
         -- Ink footprint matches the bars' span (~62% of the art square),
         -- which also tracks the old glyph's ~70%-of-em ink box.
-        local xspan = math.floor(art_size * 0.62)
+        local xspan = math.floor(art * 0.62)
         local Widget  = require("ui/widget/widget")
         local XWidget = Widget:extend{}
         function XWidget:getSize() return Geom:new{ w = xspan, h = xspan } end
@@ -862,7 +1002,7 @@ function StartMenu:_build()
         end
         local glyph = XWidget:new{}
         local centered = CenterContainer:new{
-            dimen = Geom:new{ w = bd.w, h = visual_h },
+            dimen = Geom:new{ w = art, h = box_h },
             glyph,
         }
         local close_frame = FrameContainer:new{
@@ -872,10 +1012,10 @@ function StartMenu:_build()
             centered,
         }
         group[#group + 1] = OffsetContainer:new{
-            x_off = bd.x, y_off = ind_y, close_frame,
+            x_off = box_x, y_off = box_y, close_frame,
         }
-        self._burger_region = Geom:new{ x = bd.x, y = ind_y,
-            w = bd.w, h = visual_h }
+        self._burger_region = Geom:new{ x = box_x, y = box_y,
+            w = art, h = box_h }
     end
 
     self[1] = group
@@ -890,9 +1030,15 @@ function StartMenu:_build()
 end
 
 -- Rebuild from the store and repaint (after edits / paging / flyout toggle).
-function StartMenu:_reload()
+function StartMenu:_reload(scope_rect)
     local old_region = self._dirty_region
-    self._items = Model.load()
+    -- Snapshot each panel's rect (not just their union): a bottom-anchored
+    -- flyout can grow UPWARD while the union bbox stays fixed (root's top still
+    -- dominates, the flyout's bottom stays pinned above the footer), so the
+    -- union alone misses a flyout height change. Compare panels individually.
+    local old_root = self._root_region and self._root_region:copy()
+    local old_fly  = self._flyout_region and self._flyout_region:copy()
+    self._items = self:_loadItems()
     -- Page clamping is handled in _build() after the overflow loop determines
     -- the effective max_rows; don't pre-reset here with the nominal value.
     if self._page < 1 then self._page = 1 end
@@ -909,14 +1055,38 @@ function StartMenu:_reload()
             self:_build()
         end
     end
-    local region = self._dirty_region:copy()
-    if old_region then region = region:combine(old_region) end
+    local region
+    local d = self._dirty_region
+    -- A panel is BOTTOM-anchored (root_y = bottom - height; the flyout shifts
+    -- up when it would overrun the footer). When a module's height changes its
+    -- panel grows/shrinks and every row ABOVE the changed one moves with it.
+    -- Detect that by comparing EACH panel's rect before/after the rebuild (the
+    -- union can stay fixed even when the flyout moves — see the snapshot above).
+    local function _rectMoved(a, b)
+        if not a or not b then return a ~= b end -- appeared / disappeared
+        return a.x ~= b.x or a.y ~= b.y or a.w ~= b.w or a.h ~= b.h
+    end
+    local panel_moved = _rectMoved(old_root, self._root_region)
+        or _rectMoved(old_fly, self._flyout_region)
+    if scope_rect and d and not panel_moved then
+        -- Scoped reload (a keep_open module re-render at the SAME height):
+        -- refresh only from the tapped row's top down to the panel bottom, so
+        -- module cards ABOVE the tapped one don't redraw. NOT combined with
+        -- old_region (the whole-panel rect) — that would re-expand to the full
+        -- panel and defeat the scoping.
+        local bottom = d.y + d.h
+        local top = math.max(d.y, scope_rect.y)
+        region = Geom:new{ x = d.x, y = top, w = d.w, h = math.max(1, bottom - top) }
+    else
+        region = self._dirty_region:copy()
+        if old_region then region = region:combine(old_region) end
+    end
     -- Dirty the widget BELOW us: UIManager repaints from the first dirty
     -- widget up the stack, and this overlay only paints its panels, so a
     -- shrinking rebuild would otherwise leave the vacated area's old pixels
     -- on screen. Repainting the bookshelf underneath restores the backdrop
     -- before we paint on top.
-    UIManager:setDirty(self.bw or self, function() return "ui", region end)
+    UIManager:setDirty(self.bw or self._repaint_under or self, function() return "ui", region end)
 end
 
 function StartMenu:_toggleFlyout(folder_id)
@@ -930,25 +1100,63 @@ function StartMenu:_close()
     UIManager:close(self, "ui", self._dirty_region)
 end
 
+-- Clear the open-in-progress marker once the first paint has actually
+-- completed: if a module segfaults the paint pass, InputContainer.paintTo
+-- never returns, the marker stays set, and the next open detects the crash and
+-- enters safe mode (issue #163). Gated on a flag so it fires once per survived
+-- paint; _activate resets the flag when leaving safe mode so a retry's paint
+-- is re-evaluated.
+function StartMenu:paintTo(bb, x, y)
+    InputContainer.paintTo(self, bb, x, y)
+    if not self._open_painted then
+        self._open_painted = true
+        pcall(Breaker.endOpen, Store)
+    end
+end
+
 function StartMenu:onCloseWidget()
     if StartMenu._live == self then StartMenu._live = nil end
     if self[1] and self[1].free then self[1]:free() end
 end
 
-function StartMenu:_activate(entry)
+function StartMenu:_activate(entry, tap_rect)
     if entry.type == "folder" then
         self:_toggleFlyout(entry.id)
         return
     end
     if self._unresolved_ids and self._unresolved_ids[entry.id] then return end
     if entry.type == "module" then
+        -- Safe-mode open (a previous open crashed before painting): every
+        -- module is suppressed. Tapping any of them means "turn modules back
+        -- on": leave safe mode and reload so they render again. Re-arm the
+        -- open marker and reset the paint flag so a fresh paint-pass crash on
+        -- retry is still caught on the next open.
+        if self._safe_mode then
+            self._safe_mode = false
+            self._open_painted = false
+            pcall(Breaker.armOpen, Store)
+            self:_reload()
+            return
+        end
         -- Resolve before closing: a module without a tap target is a no-op
         -- (the menu stays open) rather than a close-for-nothing.
         local def = Modules.get(entry.module)
         if not (def and def.on_tap) then return end
         -- on_tap receives a context table (modules that ignore the arg keep
         -- working): bw = the bookshelf widget, menu = this start menu.
-        local ctx = { bw = self.bw, menu = self }
+        local menu = self
+        local ctx = { bw = self.bw, menu = self, entry = entry, surface = "start_menu" }
+        -- Per-instance save: persist a change the module made to ctx.entry into
+        -- the start-menu list, then reload. (Mirrors the hero ctx.save.)
+        function ctx.save()
+            local Model = require("lib/bookshelf_start_menu_model")
+            local items = Model.load()
+            local list, i = Model.findById(items, entry.id)
+            if list and i then list[i] = entry end
+            Model.save(items)
+            menu:_reload()
+        end
+        ctx.config = require("lib/bookshelf_module_kit").entryConfig(entry, ctx.save)
         -- keep_open may be a boolean or a function(ctx) -> bool resolved at
         -- tap time (e.g. quote_of_day keeps the menu only for its "New
         -- quote" tap action). pcall: a broken module must not wedge the
@@ -968,92 +1176,25 @@ function StartMenu:_activate(entry)
                 logger.warn("[bookshelf] start menu module tap failed:",
                     entry.module, err)
             end
-            self:_reload()
+            self:_reload(tap_rect)
             return
         end
         self:_close()
-        UIManager:nextTick(function() def.on_tap(ctx) end)
+        -- Contain a broken on_tap: the menu has already closed, so an unguarded
+        -- error here would surface as an unhandled nextTick crash.
+        UIManager:nextTick(function()
+            local ok, err = pcall(def.on_tap, ctx)
+            if not ok then
+                logger.warn("[bookshelf] start menu module tap failed:",
+                    entry.module, err)
+            end
+        end)
         return
     end
     local bw = self.bw
     self:_close()
     UIManager:nextTick(function()
-        if entry.internal == "close" then
-            if bw and bw.onClose then
-                bw:onClose()
-                -- bw:onClose() is UIManager:close() with no refresh args:
-                -- that repaints the widgets it reveals into the buffer but
-                -- enqueues NO screen refresh (UIManager:_refresh drops a
-                -- nil mode), so on e-ink only our scoped menu-close region
-                -- got flushed and the rest of the screen kept stale
-                -- bookshelf pixels. "all" re-flags the whole remaining
-                -- window stack for repaint; "full" enqueues the
-                -- full-screen refresh that flushes the result.
-                UIManager:setDirty("all", "full")
-            end
-        elseif entry.internal == "settings" then
-            -- Host the plugin's FULL top-level menu (hero card, shelf tabs,
-            -- collections, hardcover, settings, ...), not just the settings
-            -- subtree: probe the live plugin module's addToMainMenu (the
-            -- same technique the plugin scanner uses) and assemble the
-            -- entries in the canonical MENU_ORDER from main.lua.
-            local MenuHost = require("lib/bookshelf_menu_host")
-            local S = require("lib/bookshelf_settings")
-            S._bw = bw
-            local items
-            local ok_probe = pcall(function()
-                local fm_mod = package.loaded["apps/filemanager/filemanager"]
-                local fm  = fm_mod and fm_mod.instance
-                local mod = fm and fm.bookshelf
-                if not (mod and type(mod.addToMainMenu) == "function") then
-                    return
-                end
-                local probe = {}
-                mod:addToMainMenu(probe)
-                -- Plugin instances inherit class fields, so MENU_ORDER
-                -- resolves from the Bookshelf class; if it ever moves,
-                -- fall back to the probe's keys alphabetically.
-                local order = mod.MENU_ORDER
-                if type(order) ~= "table" then
-                    order = {}
-                    for k in pairs(probe) do order[#order + 1] = k end
-                    table.sort(order)
-                end
-                local out = {}
-                for _i, key in ipairs(order) do
-                    local it = probe[key]
-                    if type(it) == "table" and key ~= "bookshelf_tab" then
-                        out[#out + 1] = it
-                    end
-                end
-                if #out > 0 then items = out end
-            end)
-            if not (ok_probe and items) then
-                -- Fallback: the settings subtree (pre-probe behavior).
-                items = S:_settingsSubItems()
-            end
-            MenuHost.show{
-                title = _("Bookshelf"),
-                item_table = items,
-            }
-        elseif type(entry.plugin) == "table" then
-            -- FM plugin launcher: resolve against the LIVE FileManager
-            -- instance at activation time (the stored method name may be
-            -- the scanner's re-probe sentinel). No full-screen dirty
-            -- needed - the launched plugin shows its own UI.
-            local PluginScan = require("lib/bookshelf_plugin_scan")
-            local launch = PluginScan.resolve(entry.plugin.key, entry.plugin.method)
-            if launch then
-                local ok_l, err = pcall(launch)
-                if not ok_l then
-                    logger.warn("[bookshelf] start menu plugin launch failed:",
-                        entry.plugin.key, err)
-                end
-            end
-        elseif type(entry.action) == "table" then
-            local ok, Dispatcher = pcall(require, "dispatcher")
-            if ok then Dispatcher:execute(entry.action) end
-        end
+        require("lib/bookshelf_action_exec").dispatch(entry, bw)
     end)
 end
 
@@ -1119,7 +1260,7 @@ function StartMenu:_rebuild_only()
     self:_build()
     local region = self._dirty_region:copy()
     if old_region then region = region:combine(old_region) end
-    UIManager:setDirty(self.bw or self, function() return "ui", region end)
+    UIManager:setDirty(self.bw or self._repaint_under or self, function() return "ui", region end)
 end
 
 -- Ensure focus points at a visible focusable. If the focused panel itself is
@@ -1173,7 +1314,7 @@ function StartMenu:onSMFocusDown()
             if self._page < pages then
                 self._flyout_for = nil
                 self._page = self._page + 1
-                self._items = Model.load()
+                self._items = self:_loadItems()
                 self:_rebuild_only()
                 self._focus.entry_id = self:_firstFocusable("root")
                 self:_rebuild_only()
@@ -1221,7 +1362,7 @@ function StartMenu:onSMFocusUp()
         if total > max_rows and self._page > 1 then
             self._flyout_for = nil
             self._page = self._page - 1
-            self._items = Model.load()
+            self._items = self:_loadItems()
             self:_rebuild_only()
             self._focus.entry_id = self:_lastFocusable("root")
             self:_rebuild_only()

@@ -54,14 +54,17 @@ local Bookshelf = WidgetContainer:extend{
 -- Canonical order of the plugin's main-menu entries. Consumed by the
 -- KOMenu order hook below AND by the start menu's "Bookshelf menu"
 -- action, which probes addToMainMenu and hosts these in this order.
+-- Display order, banded with separators (set on the last item of each band in
+-- addToMainMenu): actions (Open, Selection) | customise (Edit, Chips,
+-- Collections) | configure (Hardcover, Settings) | meta (Updates, About).
 Bookshelf.MENU_ORDER = {
     "bookshelf_toggle",
+    "bookshelf_selection_mode",
     "bookshelf_hero_card",
     "bookshelf_shelf_tabs",
     "bookshelf_collections",
     "bookshelf_hardcover",
     "bookshelf_settings",
-    "bookshelf_selection_mode",
     "bookshelf_updates",
     "bookshelf_about",
 }
@@ -114,6 +117,15 @@ end
 -- and opened a book from the raw FileManager stay in the FileManager on
 -- close, while a cold boot still lands on Bookshelf (issue #110).
 local _did_initial_takeover = false
+-- One-shot: set by onCloseDocument when a book opened from the RAW FileManager
+-- (shelf not parked, _isShowing() false) is closing back to the home view.
+-- KOReader's showFileManager on that close fires a Show event, and onShow would
+-- otherwise use it to hijack the FileManager back into Bookshelf -- breaking the
+-- same #110 "stay in the FileManager" intent that onCloseDocument honours. The
+-- next onShow consumes and clears this, so cold-boot / gesture takeovers (no
+-- preceding close) are unaffected. A short timed clear is a backstop for a close
+-- that, for whatever reason, opens no FileManager.
+local _skip_next_onshow_takeover = false
 
 -- Close a TouchMenu we received as the first callback argument. Used
 -- whenever a menu callback changes the visible UI layer (e.g. opens or
@@ -298,6 +310,10 @@ function Bookshelf:init()
         UIManager:nextTick(function()
             self:_wireFastFileBrowserTab(true)
         end)
+        -- Persistent in-reader Bookshelf launcher (opt-in). Painted into
+        -- ReaderView so it survives page turns; a touch zone over it opens the
+        -- start menu.
+        self:_setupReaderButtons()
     end
 
     -- Register Dispatcher actions so users can bind gestures / keys to
@@ -590,7 +606,6 @@ function Bookshelf:addToMainMenu(menu_items)
             -- Always close the menu so the user lands on the new state.
             _closeTouchMenu(touchmenu_instance)
         end,
-        separator = true,
     }
 
     menu_items.bookshelf_hero_card = {
@@ -656,6 +671,8 @@ function Bookshelf:addToMainMenu(menu_items)
             S._bw = _live_widget
             return S:_settingsSubItems()
         end,
+        -- End the configure band (Hardcover, Settings) before Updates / About.
+        separator = true,
     }
 
     menu_items.bookshelf_selection_mode = {
@@ -675,6 +692,7 @@ function Bookshelf:addToMainMenu(menu_items)
                 _live_widget:onBookshelfToggleSelectionMode()
             end
         end,
+        -- End the actions band (Open, Selection) before the customise entries.
         separator = true,
     }
 
@@ -704,6 +722,9 @@ function Bookshelf:show()
     -- splits paint + deferred shelf reload.
     local _diag_t0 = _gettime()
     local _diag_branch
+    -- Backstop for issue #172: an intentional shelf show must always paint, so
+    -- lift any leftover transition-paint suppression on the live widget.
+    if _live_widget then _live_widget._suppress_transition_paint = false end
     -- Stash the plugin ref for settings callbacks (hideMenu, color picker).
     -- addToMainMenu also stashes it, but FileManagerMenu builds its item
     -- table lazily on first menu open - the start menu's "Bookshelf
@@ -890,6 +911,23 @@ function Bookshelf:onDispatcherRegisterActions()
         title    = _("Bookshelf: open bulk action menu"),
         general  = true,
     })
+    -- Open the start menu / full-screen micro-module view by gesture, so they're
+    -- reachable in the reader without the launcher buttons shown (or in the
+    -- library). A bound gesture is an explicit request, so it opens regardless
+    -- of the button-visibility settings AND the Off settings (start menu = Off,
+    -- micro placement = Off) -- see the force flag in the handlers.
+    Dispatcher:registerAction("bookshelf_open_start_menu", {
+        category = "none",
+        event    = "BookshelfOpenStartMenu",
+        title    = _("Bookshelf: open start menu"),
+        general  = true,
+    })
+    Dispatcher:registerAction("bookshelf_open_micro_modules", {
+        category = "none",
+        event    = "BookshelfOpenMicroModules",
+        title    = _("Bookshelf: open micro-modules"),
+        general  = true,
+    })
 end
 
 -- _raiseInPlace — splice the live BookshelfWidget to the top of
@@ -922,6 +960,9 @@ function Bookshelf:_raiseInPlace()
         end
     end
     if not idx then return false end
+    -- Returning to the shelf from the reader: lift any issue #172 transition
+    -- paint suppression, or the raise below would repaint nothing.
+    _live_widget._suppress_transition_paint = false
     if idx ~= #stack then
         local entry = table.remove(stack, idx)
         table.insert(stack, entry)
@@ -1015,6 +1056,178 @@ end
 -- the rest based on whether Bookshelf is the live home.
 -- `force` re-installs the callback even when we've already wrapped this
 -- menu instance. Needed because another home-screen-replacement plugin can
+-- Persistent in-reader launcher button (opt-in via reader_launcher_button).
+-- Registers a ReaderView module that paints the hamburger into the reader frame
+-- (survives page turns, no e-ink ghosting -- the Bookends overlay mechanism),
+-- plus a touch zone over it that opens the start menu. Reader context only.
+-- Re-runnable: also called after a settings change (start-menu position, micro
+-- placement, the launcher toggle) so the reader launchers update live instead of
+-- only on book reopen. Clears the previous registration first, then sets up the
+-- current state.
+function Bookshelf:_setupReaderButtons()
+    local Device = require("device")
+    if not (self.ui and self.ui.view and self.ui.document) then return end
+    if not Device:isTouchDevice() then return end
+    -- overrides take our small corner zones ahead of the page-turn / highlight /
+    -- footer taps; those zones work normally everywhere outside the button.
+    local OV = {
+        "tap_forward", "tap_backward",
+        "readerhighlight_tap", "readerhighlight_tap_select_mode",
+        "readerfooter_tap", "readermenu_tap",
+    }
+    -- Tear down any prior launcher registration so a re-setup reflects the
+    -- current settings rather than stacking duplicates / stale-position zones.
+    pcall(function()
+        self.ui:unRegisterTouchZones({
+            { id = "bookshelf_launcher_tap", overrides = OV },
+            { id = "bookshelf_grid_tap",     overrides = OV } })
+    end)
+    if self.ui.view.view_modules then
+        self.ui.view.view_modules.bookshelf_launcher = nil
+    end
+    self._reader_buttons = nil
+
+    if not BookshelfSettings.read("reader_launcher_button", false) then return end
+    local ok, ReaderButtons = pcall(require, "lib/bookshelf_reader_buttons")
+    if not ok or not ReaderButtons then return end
+    -- Mirror the home-screen footer's own gating so the reader matches it:
+    --   * hamburger only when start_menu_position ~= "off", on that side;
+    --   * grid button only in "fullscreen" placement (the one case the footer
+    --     shows a grid button), on the corner opposite the start menu (default
+    --     right when the start menu is off).
+    local menu_pos = BookshelfSettings.read("start_menu_position", "left")
+    local show_hamburger = menu_pos ~= "off"
+    local side = (menu_pos == "right") and "right" or "left"
+    local show_grid = BookshelfSettings.microFullscreenButton()
+    local grid_side = (menu_pos == "left") and "right"
+        or ((menu_pos == "right") and "left" or "right")
+    if not (show_hamburger or show_grid) then return end -- nothing to show
+    self._reader_buttons = ReaderButtons:new{
+        side = side, grid_side = grid_side,
+        show_hamburger = show_hamburger, show_grid = show_grid }
+    self.ui.view:registerViewModule("bookshelf_launcher", self._reader_buttons)
+    local Screen = Device.screen
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local function zone(id, rect, handler)
+        return {
+            id = id, ges = "tap",
+            screen_zone = { ratio_x = rect.x / sw, ratio_y = rect.y / sh,
+                            ratio_w = rect.w / sw, ratio_h = rect.h / sh },
+            handler = function(_ges) handler(); return true end,
+            overrides = OV,
+        }
+    end
+    local zones = {}
+    if show_hamburger then
+        zones[#zones + 1] = zone("bookshelf_launcher_tap", ReaderButtons.tapRect(side),
+            function() self:_openReaderStartMenu() end)
+    end
+    if show_grid then
+        zones[#zones + 1] = zone("bookshelf_grid_tap",
+            ReaderButtons.gridTapRect(grid_side),
+            function() self:_openReaderMicroModules() end)
+    end
+    self.ui:registerTouchZones(zones)
+end
+
+-- Re-align the reader launcher after a screen-geometry change (device rotation
+-- or a desktop window resize -- issue #196). The painted glyph self-heals (the
+-- view module repaints from the current screen size, and footer_geom drops a
+-- remembered rect captured at a different geometry), but the touch zones were
+-- registered from the old-geometry anchor, so re-register them. Coalesced onto
+-- one nextTick: a desktop resize-drag fires many events, and deferring lets the
+-- Screen dimensions settle before we recompute. _setupReaderButtons self-guards
+-- to the reader+touch context, so this is a no-op elsewhere.
+function Bookshelf:_scheduleReaderButtonResetup()
+    if self._reader_resetup_pending then return end
+    self._reader_resetup_pending = true
+    UIManager:nextTick(function()
+        self._reader_resetup_pending = false
+        self:_setupReaderButtons()
+    end)
+end
+
+-- NOTE: these must NOT return true -- the events also drive ReaderView's own
+-- rotation/resize handling, so we observe and let them propagate.
+function Bookshelf:onSetRotationMode()
+    self:_scheduleReaderButtonResetup()
+end
+
+function Bookshelf:onScreenResize()
+    self:_scheduleReaderButtonResetup()
+end
+
+-- Open the full-screen micro-module overlay from the reader (v1). No bookshelf
+-- widget exists here, so a minimal context shim stands in for `bw`: enough for
+-- the overlay to render + navigate the grid, position its close-X / hamburger,
+-- and open the start menu. No status line (no _currentHeroBook /
+-- _buildDeviceState), and widget-dependent module taps no-op (HeroModules._tap
+-- pcalls on_tap). pcall'd so a context gap can't crash the reader.
+function Bookshelf:_openReaderMicroModules()
+    local ok, Mod = pcall(require, "lib/bookshelf_micro_fullscreen")
+    if not ok or not Mod then return end
+    local Screen     = require("device").screen
+    local FooterGeom = require("lib/bookshelf_footer_geom")
+    local ReaderButtons = require("lib/bookshelf_reader_buttons")
+    local outer = self
+    local side = BookshelfSettings.read("start_menu_position", "left")
+    if side ~= "right" then side = "left" end
+    local grid_side = (side == "left") and "right" or "left"
+    local shim = {
+        FOOTER_HIT_EXTENSION = FooterGeom.hitExtension(),
+        FOOTER_STROKE_W      = FooterGeom.barMetrics().bar_t,
+        _hero_cells          = {},
+        -- Use the REAL footer button frames (remembered from shelf mode) so the
+        -- overlay's close-X / hamburger land exactly where they do on the home
+        -- screen -- the close glyph centres in the full frame (h minus the hit
+        -- extension), not the small tap box. Fall back to the tap rects only
+        -- before the bookshelf has been shown this session.
+        _micromod_dimen      = FooterGeom.rememberedGridRect(grid_side)
+                               or ReaderButtons.gridTapRect(grid_side),
+        _burger_dimen        = FooterGeom.rememberedButtonRect(side)
+                               or ReaderButtons.tapRect(side),
+        _startMenuPosition   = function()
+            local p = BookshelfSettings.read("start_menu_position", "left")
+            return (p == "right" or p == "off") and p or "left"
+        end,
+        _openStartMenu = function() outer:_openReaderStartMenu() end,
+    }
+    pcall(function() Mod.open(shim, shim._micromod_dimen, Screen:scaleBySize(48)) end)
+end
+
+-- Open the start menu from the reader. No bookshelf widget exists here, but
+-- StartMenu tolerates a nil bw (setDirty falls back to the menu itself, footer
+-- constants fall back to defaults); pcall'd so a context gap can't crash the
+-- reader. burger_dimen = the launcher rect, so the close-X lands on it.
+function Bookshelf:_openReaderStartMenu()
+    local ok, StartMenu = pcall(require, "lib/bookshelf_start_menu")
+    if not ok or not StartMenu then return end
+    local Screen = require("device").screen
+    local side = BookshelfSettings.read("start_menu_position", "left")
+    if side ~= "right" then side = "left" end
+    -- Is the persistent launcher hamburger actually on screen? (same gate as
+    -- _setupReaderButtons: the reader button must be enabled AND the start menu
+    -- not set to off.)
+    local button_showing =
+        BookshelfSettings.read("reader_launcher_button", false) == true
+        and BookshelfSettings.read("start_menu_position", "left") ~= "off"
+    if button_showing then
+        -- A hamburger is visible to morph into the close-X; pass its real frame
+        -- (remembered from shelf mode) so the X lands on it, and keep the inset
+        -- that clears the footer band.
+        local g = require("lib/bookshelf_footer_geom").rememberedButtonRect(side)
+                  or require("lib/bookshelf_reader_buttons").tapRect(side)
+        pcall(function() StartMenu.open(nil, Screen:scaleBySize(48), g, "reader") end)
+    else
+        -- Gesture-opened with no visible button: nil burger_dimen => StartMenu
+        -- skips the close-X box entirely (nothing white collides with the reader
+        -- page / bookends bars) AND balances the bottom margin to its side margin
+        -- (the passed inset is ignored in that case). Closes via tap-outside or
+        -- Back as usual.
+        pcall(function() StartMenu.open(nil, 0, nil, "reader") end)
+    end
+end
+
 -- re-wrap this same callback when the reader is shown — AFTER our init-time
 -- wrap — routing the File-browser tab to its own home view. Re-asserting on
 -- a post-show nextTick makes Bookshelf the deterministic last writer. See the
@@ -1086,6 +1299,29 @@ function Bookshelf:onToggleBookshelf()
     return true
 end
 
+-- Gesture actions: open the start menu / full-screen micro-module view. In the
+-- reader they use the self-contained reader openers (no widget needed); in the
+-- library they open over the live widget, forcing past the Off guards since a
+-- bound gesture is an explicit request. From the raw FileManager with bookshelf
+-- closed there's no widget to open onto, so it's a no-op.
+function Bookshelf:onBookshelfOpenStartMenu()
+    if self.ui and self.ui.document then
+        self:_openReaderStartMenu()
+    elseif _live_widget and _live_widget._openStartMenu then
+        _live_widget:_openStartMenu(true)
+    end
+    return true
+end
+
+function Bookshelf:onBookshelfOpenMicroModules()
+    if self.ui and self.ui.document then
+        self:_openReaderMicroModules()
+    elseif _live_widget and _live_widget._openMicroModulesFullscreen then
+        _live_widget:_openMicroModulesFullscreen(true)
+    end
+    return true
+end
+
 -- Explicit show/hide — used by the Set Bookshelf action with on/off args.
 -- Hide is a no-op when nothing's showing, mirroring how Set Bookends behaves.
 function Bookshelf:onSetBookshelf(visible)
@@ -1152,6 +1388,13 @@ function Bookshelf:onShow()
     if G_reader_settings:readSetting("start_with") ~= "bookshelf" then return end
     if self.ui and self.ui.document then return end
     if _live_widget and UIManager:isWidgetShown(_live_widget) then return end
+    if _skip_next_onshow_takeover then
+        -- A book opened from the raw FileManager just closed (set in
+        -- onCloseDocument). Honour #110: stay in the FileManager rather than
+        -- hijacking it back to the shelf. One-shot.
+        _skip_next_onshow_takeover = false
+        return
+    end
     -- CoverBrowser disabled: every code path that touches BIM crashes.
     -- Bail silently here (init showed the notification once); just let
     -- FM stay visible. (#49.)
@@ -1283,10 +1526,36 @@ function Bookshelf:onCloseDocument()
     -- normal file-browser path — so they stay in the FileManager on close,
     -- even with Start with = Bookshelf. Cold boot still lands on Bookshelf via
     -- the session-once init takeover, not this handler.
-    if not self:_isShowing() then
+    local showing   = self:_isShowing()
+    local switching = self.ui and self.ui.tearing_down
+    if switching then
+        -- Reader→Reader switch (History/Collections/Book shortcuts/prev-next),
+        -- not a return home. The old reader is closing here and a new one is
+        -- about to load; KOReader shows a visible "Opening file…" message with a
+        -- forced repaint in the gap, which would paint the parked shelf
+        -- full-screen for ~1s (issue #172). Flag the widget to skip that paint.
+        -- Cleared on the new reader's onReaderReady (and by show()/_raiseInPlace
+        -- as a backstop); a timed clear covers a switch that opens no reader.
+        -- Only meaningful when the shelf is actually parked underneath.
+        if showing and _live_widget then
+            _live_widget._suppress_transition_paint = true
+            UIManager:scheduleIn(5, function()
+                if _live_widget then _live_widget._suppress_transition_paint = false end
+            end)
+        end
         return
     end
-    if self.ui and self.ui.tearing_down then return end
+    if not showing then
+        -- The book was opened from the RAW FileManager (the shelf was not parked
+        -- underneath) and is now closing back to the home view. KOReader will
+        -- showFileManager for this close; without this, the resulting Show event
+        -- makes onShow hijack the FileManager straight back into Bookshelf. Honour
+        -- the #110 intent — stay in the FileManager — by telling the next onShow
+        -- to stand down. Cleared on consumption, with a timed backstop.
+        _skip_next_onshow_takeover = true
+        UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
+        return
+    end
     -- _safeShow already scheduled its own show() after the close+showFM
     -- work; skipping ours here avoids a duplicate show()+softRefresh
     -- which would queue an extra EPDC commit (visible as a second
@@ -1303,6 +1572,15 @@ function Bookshelf:onCloseDocument()
     UIManager:nextTick(function()
         self:show()
     end)
+end
+
+-- New ReaderUI has finished loading after a Reader→Reader switch — the new
+-- reader now covers the parked shelf, so lift the issue #172 paint suppression
+-- set in onCloseDocument. Fires on the new reader's plugin instance; the shelf
+-- widget is the shared singleton, so clearing it here unblocks the eventual
+-- return-to-shelf paint when this book is closed.
+function Bookshelf:onReaderReady()
+    if _live_widget then _live_widget._suppress_transition_paint = false end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1641,8 +1919,9 @@ end
 --
 -- Without this handler, bookshelf's per-chip result caches stay stale --
 -- the user has to swipe-down or restart to see the change (issue #40).
--- The prop_updated arg is sometimes nil (broadcast-everything cases) and
--- sometimes a single field name; we treat every change as potentially
+-- The prop_updated arg is sometimes nil (broadcast-everything cases),
+-- sometimes a single field name, and on some KOReader versions / async paths
+-- a table of changed props; we treat every change as potentially
 -- membership-affecting since chips can sort or filter on any field.
 --
 -- Coalescing: a single user action can fire BookMetadataChanged twice
@@ -1666,8 +1945,12 @@ function Bookshelf:onBookMetadataChanged(prop_updated)
         Repo.invalidateProgressCache()
     end
     if Repo.invalidateBookCache then
-        Repo.invalidateBookCache("BookMetadataChanged"
-            .. (prop_updated and (":" .. tostring(prop_updated)) or ""))
+        -- prop_updated is usually nil or a single field-name string, but some
+        -- KOReader versions / async close paths (e.g. exiting a book via a
+        -- gesture shortcut) pass a TABLE of changed props; only fold a string
+        -- into the reason label, never concatenate a table (issue #164).
+        local tag = (type(prop_updated) == "string") and (":" .. prop_updated) or ""
+        Repo.invalidateBookCache("BookMetadataChanged" .. tag)
     end
     if not _live_widget then return end
     if self:_isShowing() then

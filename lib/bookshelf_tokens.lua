@@ -11,6 +11,23 @@ local _ = require("lib/bookshelf_i18n").gettext
 
 local Tokens = {}
 
+-- Display labels for the token-picker category headers. Kept as literal
+-- _() strings (instead of _(t.category) at the picker) so xgettext can
+-- extract them -- mirrors bookends' tokens_catalogue, which keys category
+-- separately from its label. A _(variable) call never reaches the .pot,
+-- so the headers shipped untranslated (issues #129 / #143).
+Tokens.CATEGORY_LABELS = {
+    Authors  = _("Authors"),
+    Book     = _("Book"),
+    Device   = _("Device"),
+    Logic    = _("Logic"),
+    Progress = _("Progress"),
+    Time     = _("Time"),
+}
+function Tokens.categoryLabel(cat)
+    return Tokens.CATEGORY_LABELS[cat] or cat
+end
+
 -- Token registry: name → function(book, state) → string
 Tokens.expanders = {}
 
@@ -33,8 +50,9 @@ Tokens.DEFAULT_CLOCK_LINE =
 -- plugin enabled; %page_num/%page_count are nil for EPUB on home screen.
 -- description = _("...") so the strings are extracted by xgettext and
 -- translated at load (issue #129). category stays a raw key: it's used for
--- filtering, and the picker translates it at the header via _(t.category)
--- (the six category literals are extracted from the picker's chip labels).
+-- filtering and grouping. The picker maps it to a display label via
+-- Tokens.categoryLabel(), whose CATEGORY_LABELS table holds the literal
+-- _() strings so xgettext can extract them (issues #129 / #143).
 Tokens.CATALOGUE = {
     { category = "Book",     token = "%title",            description = _("Title") },
     { category = "Authors",  token = "%author",           description = _("First author") },
@@ -53,6 +71,8 @@ Tokens.CATALOGUE = {
     { category = "Book",     token = "%filename",         description = _("File name") },
     { category = "Book",     token = "%format",           description = _("Format (EPUB/PDF/…)") },
     { category = "Book",     token = "%description",      description = _("Book blurb (HTML stripped)") },
+    { category = "Book",     token = "%quote",            description = _("A random highlight from this book") },
+    { category = "Book",     token = "%quote_source",     description = _("The book and author for %quote") },
     { category = "Book",     token = "%lang",             description = _("Language") },
     { category = "Progress", token = "%book_pct",         description = _("Percent read") },
     { category = "Progress", token = "%book_pct_left",    description = _("Percent left") },
@@ -75,6 +95,7 @@ Tokens.CATALOGUE = {
     { category = "Device",   token = "%batt",             description = _("Battery percentage") },
     { category = "Device",   token = "%batt_icon",        description = _("Battery icon (Nerd Font)") },
     { category = "Device",   token = "%wifi_icon",        description = _("Wi-Fi icon") },
+    { category = "Device",   token = "[if:connected]%wifi_icon[/if]", description = _("Wi-Fi icon only when online") },
     { category = "Device",   token = "%nightmode",        description = _("Night mode icon (moon/sun)") },
     { category = "Device",   token = "%light",            description = _("Frontlight intensity (raw)") },
     { category = "Device",   token = "%light_pct",        description = _("Frontlight intensity (0–100%)") },
@@ -87,6 +108,8 @@ Tokens.CATALOGUE = {
     { category = "Logic",    token = "[if:not foo]…[/if]",description = _("Show … when foo is empty") },
     { category = "Logic",    token = "[if:foo>50]…[/if]", description = _("Numeric comparison") },
     { category = "Logic",    token = "[if:foo]…[else]…[/if]", description = _("If/else") },
+    { category = "Logic",    token = "[if:lang=ja][font=NAME]…[/font][else]…[/if]", description = _("Per-language font: e.g. a Japanese face for ja books, another otherwise") },
+    { category = "Logic",    token = "[if:full_width]…[/if]", description = _("Show … only in the full-width status line (micro-module + full-screen views), not the cover-view status") },
     { category = "Logic",    token = "%spacer",           description = _("Elastic gap: pushes content left/right to the region edges") },
 }
 
@@ -335,6 +358,33 @@ end
 Tokens.cleanDescription = cleanDescription      -- exported for tests / ad-hoc use
 Tokens.expanders.description = function(book)
     return book and cleanDescription(book.description) or ""
+end
+
+-- %quote / %quote_source: a RANDOM highlight from the CURRENTLY SELECTED book
+-- (issue #174), so a hero / book-detail region can show one of your own
+-- highlights in place of the description. Re-rolls each time the book is
+-- selected (the widget bumps the per-book nonce); stable across repaints within
+-- one selection. Empty when the book has no highlights or no file.
+Tokens.expanders.quote = function(book)
+    if not (book and book.filepath) then return "" end
+    local ok, Quotes = pcall(require, "lib/bookshelf_quotes")
+    if not ok then return "" end
+    local q = Quotes.forBook(book.filepath)
+    -- Curly-quoted so it reads as a quotation wherever it's dropped in (users
+    -- editing a hero template can't easily type the smart quotes themselves).
+    return (q and q.text) and ("\xE2\x80\x9C" .. q.text .. "\xE2\x80\x9D") or ""
+end
+Tokens.expanders.quote_source = function(book)
+    if not (book and book.filepath) then return "" end
+    local ok, Quotes = pcall(require, "lib/bookshelf_quotes")
+    if not ok then return "" end
+    local q = Quotes.forBook(book.filepath)
+    if not q then return "" end
+    local attribution = q.title or ""
+    if q.author and q.author ~= "" then
+        attribution = attribution ~= "" and (attribution .. ", " .. q.author) or q.author
+    end
+    return attribution
 end
 
 -- HTML escape for text we inject into the reviews-modal markup (book title,
@@ -594,7 +644,7 @@ Tokens.expanders.weekday_short = function(_b, s) return fmt("%a", s) end
 local function minutesToHM(m)
     if not m or m <= 0 then return "" end
     local h = math.floor(m / 60); local mm = m % 60
-    return string.format("%dh %02dm", h, mm)
+    return string.format(_("%dh %02dm"), h, mm)
 end
 
 Tokens.expanders.book_time_left   = function(b) return minutesToHM(b and b.book_time_left_minutes) end
@@ -607,8 +657,8 @@ Tokens.expanders.speed            = function(b) return b and b.speed_pph and tos
 Tokens.expanders.avg_page_time    = function(b)
     if not b or not b.avg_page_time_seconds then return "" end
     local s = b.avg_page_time_seconds
-    if s < 60 then return string.format("%ds", s) end
-    return string.format("%dm %02ds", math.floor(s / 60), s % 60)
+    if s < 60 then return string.format(_("%ds"), s) end
+    return string.format(_("%dm %02ds"), math.floor(s / 60), s % 60)
 end
 Tokens.expanders.book_pages_read    = function(b) return b and b.book_pages_read and tostring(b.book_pages_read) or "" end
 Tokens.expanders.days_reading_book  = function(b) return b and b.days_reading_book and tostring(b.days_reading_book) or "" end
@@ -643,6 +693,21 @@ Tokens.expanders.wifi_icon = function(_b, s)
                                   or  "\xee\xb2\xa9"   -- U+ECA9 wifi-off
 end
 Tokens.expanders.wifi = Tokens.expanders.wifi_icon
+-- Connection state for CONDITIONS (not a display glyph): "yes" only when Wi-Fi is
+-- on AND linked, else empty. So `[if:connected]%wifi_icon[/if]` (or, matching
+-- bookends, `[if:connected=yes]%wifi[/if]`) shows the Wi-Fi icon only when
+-- actually online (issue #181). %wifi/%wifi_icon stay the glyph.
+Tokens.expanders.connected = function(_b, s)
+    return (s and s.connected == "yes") and "yes" or ""
+end
+-- "yes" when the status template is being rendered in a FULL-WIDTH context (the
+-- micro-module hero view and the full-screen micro-module overlay), empty in
+-- the narrow cover-view right column. Lets power users surface extra content
+-- only where there's room, e.g. `%time_12h[if:full_width]  ·  %date[/if]`
+-- (issue #178). Set on the state by HeroCard.buildStatusRow.
+Tokens.expanders.full_width = function(_b, s)
+    return (s and s.full_width) and "yes" or ""
+end
 -- Night mode glyph: moon when night mode is on, sun otherwise. Mirrors
 -- bookends (bookends_tokens.lua:2110-2117) — driven by KOReader's
 -- persistent "night_mode" setting, not a per-frame state read.

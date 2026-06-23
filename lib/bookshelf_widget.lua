@@ -4,6 +4,7 @@
 --
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
+local Breaker = require("lib/bookshelf_module_breaker")
 local Focus           = require("lib/bookshelf_focus")
 local TextSegments    = require("lib/bookshelf_text_segments")
 local FrameContainer  = require("ui/widget/container/framecontainer")
@@ -67,6 +68,18 @@ local HERO_HEIGHT_FRAC = {
     regular = 0.30,
     large   = 0.42,
 }
+-- Columns + Rows layout model: the user sets the shelf grid directly
+-- (bookshelf_columns / bookshelf_rows) and the hero auto-sizes from the
+-- leftover vertical space. HERO_MIN_FRAC is the floor the hero never shrinks
+-- below, and the same floor Rows is clamped against so the grid + a usable
+-- hero always fit. When the two settings are unset the legacy cover-size /
+-- hero-size derivation is used instead (preserving existing layouts until the
+-- user opens the editor).
+local HERO_MIN_FRAC = 0.20
+-- Sensible bounds for the explicit knobs (portrait); landscape may raise the
+-- column floor so covers don't get too tall.
+local COLUMNS_MIN, COLUMNS_MAX = 2, 6
+local ROWS_MIN = 1
 -- Landscape/widescreen: a fixed column count makes covers too tall, so there
 -- the cover-size setting instead drives cover HEIGHT as a fraction of screen
 -- height; columns fall out of that (shorter cover -> narrower -> more fit).
@@ -206,6 +219,32 @@ function BookshelfWidget:init()
     -- restart (no settings write — fresh widget instance reseeds false).
     self._expanded = false
 
+    -- Hero content mode: "current" (the currently-reading / preview book
+    -- card) or "micro" (the micro-module grid). Seeded from the
+    -- hero_area_mode setting ("Hero area starts with…"); toggled live by the
+    -- chip bar. Like _expanded, this is session state — only the *starting*
+    -- mode persists, so a fresh widget instance reseeds from the setting.
+    -- The hero only starts in micro mode when micro-modules are placed "in the
+    -- hero area" (placement == "hero"); "fullscreen" (footer-button overlay) and
+    -- "off" both keep the book hero, and the modules chip is omitted below, so
+    -- in-hero micro mode is unreachable in those placements.
+    self._hero_mode = (BookshelfSettings.microInHero()
+        and BookshelfSettings.read("hero_area_mode") == "micro_modules")
+        and "micro" or "current"
+
+    -- Home-screen crash recovery (issue #163): if the hero micro grid's paint
+    -- crashed last launch, its light-touch sentinel marker survived on disk.
+    -- Come up with the cover hero this session so the user isn't locked out of
+    -- the home screen, and clear the marker so the next launch retries the grid.
+    if self._hero_mode == "micro" then
+        local mp = Breaker.heroMarkerPath()
+        local ok_c, crashed = pcall(Breaker.fileCrashed, mp)
+        if ok_c and crashed then
+            self._hero_mode = "current"
+            pcall(Breaker.endFile, mp)
+        end
+    end
+
     local Selection = require("lib/bookshelf_selection")
     self._selection = Selection.new()
 
@@ -293,6 +332,16 @@ function BookshelfWidget:init()
                 },
                 scale = { 0, SCREENSHOT_MIN - 1 },
             },
+        },
+        -- Pinch / spread to zoom the cover grid: spread (fingers apart) =
+        -- bigger covers = FEWER columns; pinch = smaller covers = MORE
+        -- columns. Adjusts the bookshelf_columns setting (the cover-size
+        -- knob); rows reflow to fit.
+        ShelfSpread = {
+            GestureRange:new{ ges = "spread", range = self.dimen },
+        },
+        ShelfPinch = {
+            GestureRange:new{ ges = "pinch", range = self.dimen },
         },
     }
 
@@ -885,7 +934,11 @@ function BookshelfWidget:_rebuild()
     -- the book the hero is showing right now". In expanded mode there's no
     -- visible hero, so the chip is always deselected — tapping it acts as
     -- "restore hero on the lastfile" (clears _expanded AND _preview_book).
-    local current_in_hero = (not self._expanded)
+    -- In micro mode the hero shows the module grid, not the lastfile, so the
+    -- "currently reading" chip is deselected (the "modules" chip owns the
+    -- active triangle instead — only one can point at the hero at a time).
+    local current_in_hero = (self._hero_mode ~= "micro")
+        and (not self._expanded)
         and ((not self._preview_book)
              or (_lastfile_fp and self._preview_book.filepath == _lastfile_fp))
     active_chips[#active_chips + 1] = {
@@ -949,6 +1002,28 @@ function BookshelfWidget:_rebuild()
         nerd_glyph = "\xEF\x80\x82",
         action     = true,
     }
+    -- "Micro modules" hero toggle at the right end, after search. Like the
+    -- "currently reading" chip it's an action chip that renders an upward
+    -- triangle when active, pointing at the hero slot it controls; the two
+    -- are mutually exclusive (current_in_hero is gated off in micro mode), so
+    -- exactly one points at the hero at any time. Nerd-font glyph U+EC6F
+    -- (view-grid) → UTF-8 EE B1 AF.
+    -- Only present when the hero micro-module surface is on; the full-screen
+    -- button and start-menu surfaces have their own access points, not a chip.
+    if BookshelfSettings.microInHero() then
+        active_chips[#active_chips + 1] = {
+            key        = "modules",
+            nerd_glyph = "\xEE\xB1\xAF",
+            action     = true,
+            -- Action chip, but long-pressable: routes to on_hold("modules")
+            -- (the micro-module options menu) rather than the tab editor.
+            holdable   = true,
+            -- Deselected while expanded (the grid is hidden behind the strip),
+            -- mirroring the "currently reading" chip's expanded-mode behaviour;
+            -- tapping it then restores the grid.
+            selected   = (self._hero_mode == "micro") and (not self._expanded),
+        }
+    end
     -- Cache the ordered chip keys + hidden state so the edge-swipe
     -- handlers can cycle between tabs without re-deriving them. The
     -- list reflects the ordering TabModel.getActive() returned (the
@@ -1078,10 +1153,13 @@ function BookshelfWidget:_rebuild()
         -- squash/stretch band so covers fill the row. The hero absorbs any
         -- leftover, so it's always >= its target (never starved).
         local available  = self.height - chip_contrib - label_h - total_pad
-        -- Inline hero-size read: _readHeroSize is a local defined lower in the
-        -- file, invisible here (a nil global). Mirror its "large else regular".
-        local hsize = (BookshelfSettings.read("hero_size") == "large") and "large" or "regular"
-        local hero_target = math.floor(available * (HERO_HEIGHT_FRAC[hsize] or 0.30))
+        -- Columns/Rows model: the hero auto-sizes from the leftover space, so
+        -- hero_target is just the MINIMUM floor (HERO_MIN_FRAC). n_shelves
+        -- (_baseShelves) is already clamped to _maxShelfRows so the rows at
+        -- natural cover height plus this floor always fit; the hero then
+        -- takes whatever vertical slack remains above the floor — fewer rows
+        -- = a bigger hero, more rows = a smaller one.
+        local hero_target = math.floor(available * HERO_MIN_FRAC)
         local lo = math.floor(slot_h_natural * SHELF_PACK_FLOOR)
         -- Cap shelf height at natural 2:3 (no vertical stretch). Spare
         -- vertical slack flows to the hero instead of inflating the shelf
@@ -1141,7 +1219,20 @@ function BookshelfWidget:_rebuild()
     -- the fast-path in _previewBook below.
     local hero
     if self._expanded then
+        -- Expanded (swipe-up) collapses the hero to the thin status strip and
+        -- frees a shelf row — in BOTH modes. In micro mode this is the
+        -- "hide the micro modules" affordance; swipe-down (or tapping the
+        -- modules chip) restores the grid.
         hero = self:_buildExpandedStrip(content_w, hero_h, PAD)
+    elseif self._hero_mode == "micro" then
+        -- Micro-module grid (with the full-width status line pinned above it,
+        -- same as the expanded strip) fills the content_w × hero_h slot the
+        -- book hero would.
+        hero = self:_buildMicroHero(content_w, hero_h, PAD)
+        -- No HeroCard is mounted under the grid; clear the stale reference so
+        -- the in-place hero / right-column swap paths (status ticks, rating,
+        -- description) no-op on a grid instead of touching a detached card.
+        self._hero_card = nil
     else
         hero = self:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_h, PAD)
     end
@@ -1187,7 +1278,7 @@ function BookshelfWidget:_rebuild()
     local chip_pill_glyph = in_search_mode and "\xEF\x80\x82" or nil
     local chip_pill_label
     if in_search_mode then
-        chip_pill_label = "Search results"
+        chip_pill_label = _("Search results")
     else
         local _t = TabModel.getById(self.chip)
         chip_pill_label = (_t and _t.label) or self.chip
@@ -1226,7 +1317,7 @@ function BookshelfWidget:_rebuild()
     end
     -- ChipBar prefixes a chevron-left glyph automatically; we just
     -- supply the bare label.
-    local back_label = in_search_mode and "Back" or nil
+    local back_label = in_search_mode and _("Back") or nil
     local chips = not hide_chip_bar and ChipBar:new{
         chips             = active_chips,
         active            = self.chip,
@@ -1248,6 +1339,35 @@ function BookshelfWidget:_rebuild()
                 self:_openSearchDialog()
                 return
             end
+            -- "Micro modules" chip: switch the hero to the module grid.
+            -- Mutually exclusive with the book hero — clears _expanded so
+            -- the grid claims the full (non-strip) hero slot. No-op when
+            -- already in micro mode (mirrors the "current" chip's no-op
+            -- when already selected). Full rebuild: the chip's own selected
+            -- state and the "current" chip's both flip.
+            if key == "modules" then
+                -- No-op only when the grid is already visible; when collapsed
+                -- (expanded strip showing) this restores it, like swipe-down.
+                if self._hero_mode == "micro" and not self._expanded then return end
+                local was_expanded = self._expanded
+                self:_clearDpadFocus()
+                self._hero_mode = "micro"
+                self._hero_page = 1 -- always enter the grid on the first page
+                self._expanded  = false
+                require("lib/bookshelf_start_menu_modules").bumpGeneration()
+                if was_expanded then
+                    -- Leaving expanded mode also changes the shelf row count,
+                    -- so the whole layout shifts — full refresh.
+                    self:_rebuild()
+                    UIManager:setDirty(self, "ui")
+                else
+                    -- Book hero <-> grid: same hero height, shelves unchanged,
+                    -- so scope the refresh to the hero + chip band instead of
+                    -- flashing the whole screen.
+                    self:_rebuildRefreshHeroAndChips()
+                end
+                return
+            end
             -- "Currently reading" chip clears the preview so the hero
             -- falls back to Repo.getCurrent() (= lastfile). Same effect
             -- as the swipe-up gesture, but discoverable via the visible
@@ -1263,11 +1383,30 @@ function BookshelfWidget:_rebuild()
                 -- The drill-down path is preserved: the user is asking
                 -- to pop their open book back into the hero slot, not
                 -- to leave the stack/folder they're browsing.
+                local was_expanded = self._expanded
+                local prior_fp = self._preview_book and self._preview_book.filepath
+                local lastfile_fp = Repo.currentFilepath and Repo.currentFilepath()
                 self:_clearDpadFocus()
+                self._hero_mode    = "current"
                 self._preview_book = nil
                 self._expanded     = false
-                self:_rebuild()
-                UIManager:setDirty(self, "ui")
+                if was_expanded then
+                    -- Leaving expanded mode shifts the shelf row count — full
+                    -- refresh.
+                    self:_rebuild()
+                    UIManager:setDirty(self, "ui")
+                else
+                    -- Only the hero + chips change; scope the refresh to that
+                    -- band rather than flashing the whole screen.
+                    self:_rebuildRefreshHeroAndChips()
+                    -- If a non-lastfile book was previewed and is showing a
+                    -- highlight ring on a visible shelf cover, clear it with a
+                    -- scoped per-cover repaint (otherwise the ring lingers,
+                    -- which is what previously forced a full refresh here).
+                    if prior_fp and prior_fp ~= lastfile_fp then
+                        self:_repaintSelectionHighlight(prior_fp, nil)
+                    end
+                end
                 return
             end
             -- Switch chips → reset drill path and page; preserve
@@ -1285,8 +1424,7 @@ function BookshelfWidget:_rebuild()
             -- coalesced flush; a sync save here added a ~140ms file write
             -- to every chip tap.
             BookshelfSettings.saveDeferred("active_chip", key)
-            self:_rebuild()
-            UIManager:setDirty(self, "ui")
+            self:_rebuildRefreshBelowHero()
         end,
         on_breadcrumb = function(depth)
             -- depth -1 = back pill (search mode only): exit search
@@ -1312,6 +1450,12 @@ function BookshelfWidget:_rebuild()
             self:_drillBackTo(depth)
         end,
         on_hold = function(key)
+            -- The modules chip isn't an editable tab; its long-press opens the
+            -- micro-module options menu instead of the tab editor.
+            if key == "modules" then
+                self:_showModulesOptions()
+                return
+            end
             local Editor = require("lib/bookshelf_chip_editor")
             Editor:editTab(key, {
                 on_change = function()
@@ -2679,6 +2823,12 @@ function BookshelfWidget:_buildDeviceState()
                        and PowerD:isCharging() or false,
         wifi     = (ok_nm and NetMgr and NetMgr.isWifiOn and NetMgr:isWifiOn())
                        and "on" or "off",
+        -- Actual link state (radio on AND connected), for the %connected
+        -- condition: [if:connected]%wifi_icon[/if] shows the icon only when
+        -- online. Mirrors bookends' `connected` state (issue #181).
+        connected = (ok_nm and NetMgr and NetMgr.isWifiOn and NetMgr:isWifiOn()
+                       and NetMgr.isConnected and NetMgr:isConnected())
+                       and "yes" or "no",
         light    = light,
         light_pct= light_pct,
         warmth   = warmth,
@@ -2930,6 +3080,90 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
         (_perf_t4 - _perf_t0) * 1000))
     self._hero_card = card
     return card
+end
+
+-- _buildMicroHero(content_w, hero_h, PAD) — the micro-module grid with the
+-- hero's status line (time / battery / wifi) pinned full-width above it, no
+-- hairline, the same treatment the expanded strip uses. Keeps the status line
+-- visible in micro mode. Shared by _rebuild and _swapMicroHeroInPlace so both
+-- build the same structure. Falls back to a bare grid when the status region
+-- is disabled / empty (buildStatusRow returns nil). The grid is sized to the
+-- height left under the status line so the whole thing still fits hero_h.
+-- D-pad build opts for the in-hero micro grid: reserve the focus ring on any
+-- d-pad device (so moving focus in/out of the hero never resizes cells), and
+-- draw it on the cursor cell only while the hero zone holds focus.
+function BookshelfWidget:_microHeroOpts()
+    local dpad = Device:hasDPad()
+    return {
+        focusable  = dpad or nil,
+        focused_id = (dpad and self._focus_zone == "hero")
+                     and self._hero_cell_cursor or nil,
+    }
+end
+
+-- True when the hero zone is a navigable micro-module grid (d-pad device,
+-- micro placement, grid showing). The book hero and expanded strip keep their
+-- existing single-unit focus behaviour.
+function BookshelfWidget:_heroIsMicroGrid()
+    return Device:hasDPad() and self._hero_mode == "micro" and not self._expanded
+end
+
+-- Enter the hero zone onto its micro grid. Focus always arrives from below (the
+-- chips or book grid), so seed the cursor on the bottom row, nearest column.
+function BookshelfWidget:_enterHeroMicro(col_hint)
+    self._focus_zone = "hero"
+    local rows = self._hero_grid_rows
+    local last = rows and rows[#rows]
+    if last and #last > 0 then
+        self._hero_cell_cursor = last[math.min(col_hint or 1, #last)]
+    else
+        self._hero_cell_cursor = nil
+    end
+    self:_swapMicroHeroInPlace()
+end
+
+-- Move the hero-grid cursor. Returns true if it moved within the grid, false at
+-- the edge (the caller then runs the normal zone transition / stays put).
+function BookshelfWidget:_heroMicroNav(dir)
+    local HeroModules = require("lib/bookshelf_hero_modules")
+    local nid = HeroModules.navMove(self._hero_grid_rows, self._hero_cell_cursor, dir)
+    if nid and nid ~= self._hero_cell_cursor then
+        self._hero_cell_cursor = nid
+        self:_swapMicroHeroInPlace()
+        return true
+    end
+    return false
+end
+
+function BookshelfWidget:_buildMicroHero(content_w, hero_h, PAD)
+    local HeroModules = require("lib/bookshelf_hero_modules")
+    local mopts = self:_microHeroOpts()
+    -- Same current-book resolution as _buildExpandedStrip; the status row only
+    -- needs the book for its progress/title tokens (device tokens come from
+    -- _buildDeviceState).
+    local current = (self._preview_book and self._preview_book.filepath
+                     and Repo.buildBook(self._preview_book.filepath))
+                     or self._preview_book
+                     or self:_currentHeroBook()
+    -- Keep the full-width status hairline in micro mode (issue #176/#180
+    -- follow-up): same separator + Y as the book hero's right-column status,
+    -- just spanning the full width like the status text already does.
+    local status_row = HeroCard.buildStatusRow(current, self:_buildDeviceState(),
+                                               content_w, true)
+    if not status_row then
+        return HeroModules.build(self, content_w, hero_h, PAD, mopts)
+    end
+    local VerticalSpan = require("ui/widget/verticalspan")
+    -- Tight gap under the status line (half the hero PAD); a full PAD read as
+    -- slightly too much space above the grid.
+    local gap     = math.max(1, math.floor((PAD or 0) / 2))
+    local grid_h  = math.max(1, hero_h - status_row:getSize().h - gap)
+    return VerticalGroup:new{
+        align = "left",
+        status_row,
+        VerticalSpan:new{ width = gap },
+        HeroModules.build(self, content_w, grid_h, PAD, mopts),
+    }
 end
 
 -- _buildExpandedStrip(content_w, strip_h, PAD) — the thin replacement for
@@ -3236,7 +3470,7 @@ function BookshelfWidget:_buildPaginationFooter(content_w, label_h, total_pages)
         enabled       = can_step_back, show_parent = self,
     }
     local page_text = Button:new{
-        text = string.format("Page %d of %d", self.page, total_pages),
+        text = string.format(_("Page %d of %d"), self.page, total_pages),
         -- Adopt the Bookshelf UI font (a FontList-resolvable face), like the
         -- rest of the chrome; falls back to cfont in follow mode. Button
         -- resolves text_font_face via Font:getFace, and the UI-font setting
@@ -3490,6 +3724,57 @@ function BookshelfWidget:_buildStartMenuIcon(focused, frame_width)
     return btn
 end
 
+-- _buildMicroModuleIcon(focused, frame_width) — footer grid button (Micro-
+-- modules placement == "fullscreen"); opens the full-screen micro-module grid.
+-- Custom-painted 2x2 OUTLINE grid (the chip's view-grid glyph is the filled
+-- variant) at the same visual stroke weight as the hamburger's bars.
+function BookshelfWidget:_buildMicroModuleIcon(focused, frame_width)
+    local art_size = Screen:scaleBySize(32)
+    frame_width    = frame_width or art_size
+    -- Match the hamburger EXACTLY so the two footer corners balance: same art box
+    -- (art_size square), same ink width (bar_w = art_size) and ink height
+    -- (span = 62% of art, vertically centred), same stroke (FOOTER_STROKE_W). A
+    -- 2x2 box grid = outer rectangle + a centre cross, all at the bar weight.
+    local t = BookshelfWidget.FOOTER_STROKE_W
+    -- Match the hamburger's ink box EXACTLY: width = art_size (= bar_w), height =
+    -- its recomputed bar span (computed identically here, so the two icons are
+    -- the same height). FOUR SEPARATE outlined boxes in a 2x2 fill that box, with
+    -- a gap between them (a joined rect-with-cross read as one shape).
+    local span = math.floor(art_size * 0.62)
+    local bgap = math.max(1, math.floor((span - 3 * t) / 2))
+    span = 3 * t + 2 * bgap
+    -- Stretch 125% vertically: four separate boxes read shorter than the solid
+    -- bars at equal span, so the grid needs the extra height to balance.
+    local W, H = art_size, math.floor(span * 1.25)
+    local gap  = math.max(2, 2 * t)
+    local cw   = math.floor((W - gap) / 2)
+    local ch   = math.floor((H - gap) / 2)
+    local Widget = require("ui/widget/widget")
+    local GridWidget = Widget:extend{}
+    function GridWidget:getSize() return Geom:new{ w = art_size, h = art_size } end
+    function GridWidget:paintTo(bb, x, y)
+        local oy = y + math.floor((art_size - H) / 2)  -- centre the ink like the bars
+        local function box(rx, ry)
+            bb:paintRect(rx, ry, cw, t, Blitbuffer.COLOR_BLACK)          -- top
+            bb:paintRect(rx, ry + ch - t, cw, t, Blitbuffer.COLOR_BLACK) -- bottom
+            bb:paintRect(rx, ry, t, ch, Blitbuffer.COLOR_BLACK)          -- left
+            bb:paintRect(rx + cw - t, ry, t, ch, Blitbuffer.COLOR_BLACK) -- right
+        end
+        for r = 0, 1 do
+            for c = 0, 1 do
+                box(x + c * (cw + gap), oy + r * (ch + gap))
+            end
+        end
+    end
+    local bw_ref = self
+    local btn = self:_wrapAsFooterButton(GridWidget:new{}, frame_width, focused, function()
+        bw_ref:_openMicroModulesFullscreen()
+        return true
+    end)
+    self._micromod_dimen = btn.dimen
+    return btn
+end
+
 -- _buildExitIcon(focused) — Renders the close icon as the mdi-close nerd-
 -- font glyph (U+E855) via KOReader's bundled `symbols` font face. Earlier
 -- iterations rasterised the X pixel-by-pixel because paintLine isn't in
@@ -3608,6 +3893,25 @@ function BookshelfWidget:_buildFooterRow(content_w, total_pages, footer_h)
                 dimen = Geom:new{ w = self.width, h = footer_h },
                 burger,
             }
+        end
+        -- Footer micro-module button (full-screen surface on): a grid icon in
+        -- the corner OPPOSITE the start menu so they don't collide; tap opens the
+        -- full-screen grid. start_menu "off" -> default the grid to the right.
+        if BookshelfSettings.microFullscreenButton() then
+            local grid_side = (menu_pos == "left") and "right"
+                or ((menu_pos == "right") and "left" or "right")
+            local nav_strip_w  = math.floor(content_w * 0.75)
+            local side_strip_w = math.floor((self.width - nav_strip_w) / 2)
+            local mm_focused   = (self._focus_zone == "footer")
+                and (self._footer_cursor_btn == "micromod")
+            local mm_icon      = self:_buildMicroModuleIcon(mm_focused, side_strip_w)
+            local MMContainer  = grid_side == "right" and RightContainer or LeftContainer
+            row[#row + 1] = MMContainer:new{
+                dimen = Geom:new{ w = self.width, h = footer_h },
+                mm_icon,
+            }
+        else
+            self._micromod_dimen = nil
         end
     end
     self._footer_h_last = footer_h
@@ -3928,7 +4232,20 @@ function BookshelfWidget:_swapShelvesInPlace()
     logger.dbg(string.format("[bookshelf perf] _swapShelves: TOTAL=%.0fms page=%d/%d items=%d chip=%s",
         (_gettime() - _perf_t0) * 1000, self.page, self._total_pages or 0,
         self._total_items or 0, self.chip))
-    UIManager:setDirty(self, "ui")
+    -- Scope the refresh to the shelf area (top of row 1 down to the screen
+    -- bottom, covering the rows + pagination footer). The swap only changed
+    -- the shelves and footer; the hero and chip strip above are untouched, so
+    -- a whole-widget "ui" refresh needlessly repaints the hero cover -- which
+    -- flashes visibly on slower e-ink panels on book-return / page-turn
+    -- (issue #124). Fall back to a full refresh if the old rows carry no
+    -- painted dimen to anchor the region.
+    local shelf_top = old_rows[1] and old_rows[1].dimen and old_rows[1].dimen.y
+    if shelf_top then
+        UIManager:setDirty(self, "ui", Geom:new{
+            x = 0, y = shelf_top, w = self.width, h = self.height - shelf_top })
+    else
+        UIManager:setDirty(self, "ui")
+    end
     -- Pagination via _swapShelvesInPlace bypasses _rebuild's persist hook;
     -- repeat the save here so a forward/back swipe is enough to land back
     -- on the right page after a book read or KOReader restart.
@@ -4173,10 +4490,21 @@ function BookshelfWidget:softRefresh()
         UIManager:setDirty(self, "ui")
         return
     end
-    -- Two-shelf gate: _swapShelvesInPlace's own fast-path bailout. Falling
-    -- back to _rebuild here is cheaper than triggering it from the deferred
-    -- callback after we've already painted a stale tree.
-    if not has_live_tree or self:_nShelves() ~= 2 then
+    -- Row-count gate: the in-place swap helpers (_swapShelvesInPlace and the
+    -- hero right-column swap below) reuse the live tree's stashed shelf-row
+    -- indices, so they're valid only while the current _nShelves() still
+    -- matches the count the tree was built with. A mismatch means the layout
+    -- changed (rotation, expand/collapse, cover-size) and the indices are
+    -- stale -- fall back to a full _rebuild.
+    --
+    -- This was previously gated on "== 2", an outdated proxy for "collapsed,
+    -- hero visible" from before the cover-size / hero-size settings existed.
+    -- Those settings now let a hero-visible layout have 1 or 3 rows, which
+    -- were needlessly forced down the heavy whole-screen rebuild + broad
+    -- refresh on every book return (issue #124). Comparing against the
+    -- stashed count instead lets any unchanged row count take the scoped,
+    -- flash-free path, mirroring _swapShelvesInPlace's own guard.
+    if not has_live_tree or (self._shelf_dims.n_shelves or 2) ~= self:_nShelves() then
         self:_rebuild()
         if self._startStatusTimer then self:_startStatusTimer() end
         UIManager:setDirty(self, "ui")
@@ -4258,6 +4586,42 @@ function BookshelfWidget:_needsReaderReturnShelfRefresh()
     return true
 end
 
+-- Rebuild ONLY the micro-module grid and swap it into _hero_parent[1],
+-- scoping the refresh to the hero region. Used after a module tap/edit so the
+-- reload re-renders the grid (the tapped module reflects its new state, the
+-- others return cached content) WITHOUT rebuilding or refreshing the shelf
+-- below — a full _rebuild + full setDirty flashed the whole shelf on every
+-- tap. Returns true if it swapped; false (so the caller can fall back to a
+-- full rebuild) when not in the grid state or the live tree isn't there.
+function BookshelfWidget:_swapMicroHeroInPlace()
+    if self._hero_mode ~= "micro" or self._expanded then return false end
+    if not self._hero_parent or not self._hero_dims then return false end
+    local d = self._hero_dims
+    local old_hero = self._hero_parent[1]
+    -- The grid is a plain VerticalGroup, which doesn't stash a .dimen on paint
+    -- (unlike the book hero's HeroCard/InputContainer), so derive the hero's
+    -- screen rect from the geometry: full width, from the top down through the
+    -- top margin + hero height. Scopes the refresh to the hero band so the
+    -- chips and shelves below don't flash.
+    local scope = Geom:new{
+        x = 0, y = 0,
+        w = self.width,
+        h = (d.PAD or 0) + (d.hero_h or 0),
+    }
+    self._hero_parent[1] = self:_buildMicroHero(d.content_w, d.hero_h, d.PAD)
+    self._hero_card = nil
+    if self._hero_parent.resetLayout then self._hero_parent:resetLayout() end
+    if old_hero and old_hero.free then
+        UIManager:nextTick(function() pcall(function() old_hero:free() end) end)
+    end
+    if scope then
+        UIManager:setDirty(self, function() return "ui", scope end)
+    else
+        UIManager:setDirty(self, "ui")
+    end
+    return true
+end
+
 -- Rebuild the hero from current state and swap it into _hero_parent[1].
 -- Shared between _previewBook (synchronous swap on user tap) and the async
 -- cover-load completion path. No-op if there's no live tree to swap into.
@@ -4269,6 +4633,15 @@ end
 -- BIM-poll repaint, which is what the user sees as "the hero card reappears
 -- behind the listing" after swiping up while covers are still loading.
 function BookshelfWidget:_swapHeroInPlace()
+    -- While the module grid is showing (micro + not expanded) there's no book
+    -- hero to swap; re-render the GRID instead so a d-pad focus-ring change
+    -- (entering/leaving the hero zone, moving the cell cursor) shows. Mode
+    -- switches still go through a full _rebuild. When expanded the slot holds
+    -- the same status strip as book mode, so let it through.
+    if self._hero_mode == "micro" and not self._expanded then
+        self:_swapMicroHeroInPlace()
+        return
+    end
     if not self._hero_parent or not self._hero_dims then return end
     local d = self._hero_dims
     local new_hero
@@ -4313,6 +4686,10 @@ end
 -- column. nil = whole right column (line-editor live preview, where any
 -- region might have changed).
 function BookshelfWidget:_swapHeroRightColumnInPlace(regions, region_hint)
+    -- No book-hero right column under the module grid (micro + not expanded),
+    -- so status ticks / line-editor previews no-op there. When expanded the
+    -- strip is the same widget as book mode, so let it through.
+    if self._hero_mode == "micro" and not self._expanded then return false end
     if not self._hero_parent then return false end
     local hero = self._hero_card or self._hero_parent[1]
     if not hero or not hero.replaceRightColumn then return false end
@@ -4353,6 +4730,56 @@ end
 -- covers — perceptible on every shelf-cover tap.
 function BookshelfWidget:_previewBook(book, tap_t)
     if not book or not book.filepath then return end
+    -- Tapping a shelf cover while the hero is showing the micro-module grid
+    -- means "put this book in the hero" — leave micro mode for the book hero.
+    -- The hero (grid -> book) and chip strip (the modules triangle clears)
+    -- change, plus the tapped cover gains its highlight ring. Scope the
+    -- refresh to the hero + chips band and a per-cover repaint, rather than
+    -- flashing the whole shelf. (The fast in-place hero swap further down
+    -- assumes a book hero is already mounted, so it can't cross this
+    -- boundary; _rebuildRefreshHeroAndChips rebuilds the tree first.)
+    if self._hero_mode == "micro" then
+        -- Capture the tapped cover's PAINTED rect from the current tree before
+        -- rebuilding: covers don't move between micro and book hero, so this
+        -- rect still locates the cover afterwards, and the rebuilt tree isn't
+        -- painted yet (its spine dimens are nil). Iterate the shelves the same
+        -- way _repaintSelectionHighlight does so the finder depth matches.
+        local cover_dimen
+        if self._inner_vgroup and self._shelf_dims then
+            local d = self._shelf_dims
+            for r = 1, (d.n_shelves or 2) do
+                local hg = self._inner_vgroup[(d.shelf_top_idx or 1) + 2 * (r - 1)]
+                if hg then
+                    local _p, _i, spine = _descendFindSpine(hg, book.filepath, 0)
+                    if spine and spine.dimen then
+                        cover_dimen = spine.dimen:copy()
+                        break
+                    end
+                end
+            end
+        end
+        self:_clearDpadFocus()
+        self._hero_mode    = "current"
+        self._expanded     = false
+        self._preview_book = Repo.buildBook(book.filepath) or book
+        -- #174: re-roll the per-book %quote token so each selection shows a
+        -- different random highlight from the newly-selected book.
+        pcall(function() require("lib/bookshelf_quotes").rerollBook() end)
+        -- Hero (grid -> book) + chip strip change; scope to that band.
+        self:_rebuildRefreshHeroAndChips()
+        -- The rebuilt tree paints the tapped cover with its selection ring;
+        -- refresh just that cover's rect (padded for the ring, which paints
+        -- outside the card) so the border shows without flashing the shelf.
+        if cover_dimen then
+            local t = Screen:scaleBySize(4)
+            cover_dimen.x = cover_dimen.x - t
+            cover_dimen.y = cover_dimen.y - t
+            cover_dimen.w = cover_dimen.w + 2 * t
+            cover_dimen.h = cover_dimen.h + 2 * t
+            UIManager:setDirty(self, function() return "ui", cover_dimen end)
+        end
+        return
+    end
     local _perf_t0 = _gettime()
     local _perf_gap_ms = tap_t and ((_perf_t0 - tap_t) * 1000) or -1
     -- Tap-twice-to-open: a tap on the already-selected spine confirms
@@ -4386,6 +4813,8 @@ function BookshelfWidget:_previewBook(book, tap_t)
     -- bar and token lines, so upgrade to the full Book record here. Single-
     -- book DocSettings read on each preview tap is fine.
     self._preview_book = Repo.buildBook(book.filepath) or book
+    -- #174: re-roll the per-book %quote token on each selection.
+    pcall(function() require("lib/bookshelf_quotes").rerollBook() end)
     -- Stash the freshly-built record so the _swapHeroInPlace ->
     -- _buildHero call below doesn't pay DocSettings:open() a second time
     -- for the same filepath. _buildHero consumes destructively. Skipped
@@ -4588,8 +5017,16 @@ end
 function BookshelfWidget:_startStatusTimer()
     if self._status_timer_func then return end -- already armed
     self._status_timer_func = function()
-        -- Fire only if active templates actually need a time-driven repaint.
-        self:_gatedRepaint(TIMER_TOKENS)
+        if self._hero_mode == "micro" and not self._expanded then
+            -- Micro grid is the hero: advance its clock cells in place
+            -- (scoped, no re-roll of the other modules). No-op if the grid
+            -- has no clock.
+            require("lib/bookshelf_hero_modules").tickClocks(self)
+        else
+            -- Book hero: repaint the status strip iff a template uses a
+            -- time-driven token.
+            self:_gatedRepaint(TIMER_TOKENS)
+        end
         -- Re-arm at the next minute boundary.
         if self._status_timer_func then
             local now_sec = os.date("*t").sec
@@ -4783,8 +5220,35 @@ function BookshelfWidget:onSetRotationMode(mode)
         Screen:setRotationMode(mode)
         self:_rebuild()
         UIManager:setDirty(self, "full")
+        -- Stamp the new geometry so a SetRotationMode+onScreenResize pair (some
+        -- platforms fire both) doesn't rebuild twice.
+        self._last_geom_w, self._last_geom_h = Screen:getWidth(), Screen:getHeight()
     end
     return true
+end
+
+-- Android (Boox etc.) and the desktop deliver an orientation change as a window/
+-- surface RESIZE -- onScreenResize, often with NO SetRotationMode event -- so
+-- onSetRotationMode above never fires. Without this handler the homescreen stays
+-- laid out for the old geometry and, crucially, nothing issues a full refresh,
+-- so the panel goes white and only recovers when something else forces a flush
+-- (a Boox user saw white-until-sleep/wake on portrait->landscape). Rebuild for
+-- the new dimensions and do a full (flashing) refresh, mirroring the rotation
+-- path. Coalesced onto nextTick so a desktop resize-drag's event storm rebuilds
+-- once after the dimensions settle; guarded on an actual change so a same-size
+-- resize (or the post-rotation duplicate) is a no-op. NOT consumed (no `return
+-- true`): ReaderView and others also handle resize.
+function BookshelfWidget:onScreenResize()
+    if self._resize_rebuild_pending then return end
+    self._resize_rebuild_pending = true
+    UIManager:nextTick(function()
+        self._resize_rebuild_pending = false
+        local w, h = Screen:getWidth(), Screen:getHeight()
+        if self._last_geom_w == w and self._last_geom_h == h then return end
+        self._last_geom_w, self._last_geom_h = w, h
+        self:_rebuild()
+        UIManager:setDirty(self, "full")
+    end)
 end
 
 -- Swipe gesture handlers. Layering by Y-position and state, most specific
@@ -4892,6 +5356,13 @@ function BookshelfWidget:onBSFocusUp()
         return true
     end
 
+    -- Hero micro grid: step up a row; at the top row stay put (hero is the
+    -- topmost zone).
+    if self._focus_zone == "hero" and self:_heroIsMicroGrid() then
+        self:_heroMicroNav("up")
+        return true
+    end
+
     if self._focus_zone == "grid" then
         local n_cols = self:_nCols()
         if self._cursor_idx and self._cursor_idx <= n_cols then
@@ -4911,7 +5382,14 @@ function BookshelfWidget:onBSFocusUp()
                         self._chip_bar:focusCursor(self._chip_cursor_key)
                     end
                 end
-            elseif not self._expanded then
+            elseif self:_heroIsMicroGrid() then
+                -- Micro grid: enter the hero and land on its bottom row.
+                self._cursor_idx = nil
+                self:_swapShelvesInPlace()   -- clear cursor border from grid
+                self:_enterHeroMicro()
+            elseif not self._expanded and self._hero_mode ~= "micro" then
+                -- Book hero is a single focusable unit; the expanded strip and
+                -- non-d-pad micro mode have no focusable hero, so skip it.
                 self._focus_zone = "hero"
                 self._cursor_idx = nil
                 self:_swapShelvesInPlace()   -- clear cursor border from grid
@@ -4932,8 +5410,12 @@ function BookshelfWidget:onBSFocusUp()
             end
             self._chip_cursor_key    = nil
             self._crumb_cursor_depth = nil
-            self._focus_zone         = "hero"
-            self:_swapHeroInPlace()
+            if self:_heroIsMicroGrid() then
+                self:_enterHeroMicro()
+            else
+                self._focus_zone = "hero"
+                self:_swapHeroInPlace()
+            end
         end
         return true
     end
@@ -4981,6 +5463,11 @@ function BookshelfWidget:onBSFocusDown()
     end
 
     if self._focus_zone == "hero" then
+        -- Micro grid: step down a row first; only leave the hero (to chips /
+        -- grid) once the cursor is on the bottom row.
+        if self:_heroIsMicroGrid() and self:_heroMicroNav("down") then
+            return true
+        end
         self._focus_zone = nil
         self:_swapHeroInPlace()
         if not self._chip_bar_hidden then
@@ -5077,10 +5564,16 @@ end
 -- d-pad order matching the on-screen order - the menu slot sits before
 -- the chevrons when the hamburger is on the left and after them when it
 -- is on the right. "off" disables the slot via _footerBtnEnabled.
-local _FOOTER_ORDER_LEFT  = {"menu","first","prev","page","next","last"}
-local _FOOTER_ORDER_RIGHT = {"first","prev","page","next","last","menu"}
+-- "micromod" (the full-screen grid button) sits in the corner OPPOSITE the
+-- start menu, so it caps the order on the far side from "menu" (and, when the
+-- menu is "off", on the right via the LEFT table the off case falls back to).
+local _FOOTER_ORDER_LEFT  = {"menu","first","prev","page","next","last","micromod"}
+local _FOOTER_ORDER_RIGHT = {"micromod","first","prev","page","next","last","menu"}
 local function _footerBtnEnabled(k, page, total, sel_active, menu_pos)
     if k == "menu" then return not sel_active and menu_pos ~= "off" end
+    if k == "micromod" then
+        return not sel_active and BookshelfSettings.microFullscreenButton()
+    end
     if k == "first" or k == "prev" then return page > 1 end
     if k == "page"                  then return true end
     -- "next" or "last"
@@ -5107,6 +5600,13 @@ function BookshelfWidget:onBSFocusLeft()
         self._focus_zone = "grid"
         self._cursor_idx = 1
         self:_swapShelvesInPlace()
+        return true
+    end
+
+    -- Hero micro grid: move to the previous cell in the row; stay put at the
+    -- left edge (the hero is a closed 2D field — Back leaves it).
+    if self._focus_zone == "hero" and self:_heroIsMicroGrid() then
+        self:_heroMicroNav("left")
         return true
     end
 
@@ -5172,6 +5672,13 @@ function BookshelfWidget:onBSFocusRight()
         return true
     end
 
+    -- Hero micro grid: move to the next cell in the row; stay put at the right
+    -- edge.
+    if self._focus_zone == "hero" and self:_heroIsMicroGrid() then
+        self:_heroMicroNav("right")
+        return true
+    end
+
     if self._focus_zone == "grid" then
         return self:_moveCursor(1)
     end
@@ -5228,6 +5735,17 @@ end
 
 function BookshelfWidget:onBSKbPress()
     if self._focus_zone == "hero" then
+        -- Micro grid: activate the focused cell exactly as a tap would.
+        if self:_heroIsMicroGrid() then
+            local HeroModules = require("lib/bookshelf_hero_modules")
+            local rec = self._hero_cell_cursor and self._hero_cells
+                        and self._hero_cells[self._hero_cell_cursor]
+            if rec and rec.entry then
+                HeroModules._tap(self, rec.entry,
+                    function() HeroModules._reloadCellById(self, rec.entry.id) end)
+            end
+            return true
+        end
         local book = self._preview_book
             or self:_currentHeroBook()
         if book then
@@ -5349,6 +5867,9 @@ function BookshelfWidget:onBSKbPress()
         if btn == "menu" and not self._selection:isActive() then
             self:_openStartMenu()
             return true
+        elseif btn == "micromod" and not self._selection:isActive() then
+            self:_openMicroModulesFullscreen()
+            return true
         elseif btn == "first" and self.page > 1 then
             self._cursor = 1
             self:_syncPageFromCursor()
@@ -5398,6 +5919,17 @@ end
 --           the Pin / Add / Remove dialog.
 function BookshelfWidget:onBSKbHold()
     if self._focus_zone == "hero" then
+        -- Micro grid: long-press the focused cell (opens the module's edit /
+        -- pin / remove menu, same as a touch hold).
+        if self:_heroIsMicroGrid() then
+            local HeroModules = require("lib/bookshelf_hero_modules")
+            local rec = self._hero_cell_cursor and self._hero_cells
+                        and self._hero_cells[self._hero_cell_cursor]
+            if rec and rec.entry and HeroModules._hold then
+                HeroModules._hold(self, rec.entry)
+            end
+            return true
+        end
         if self._selection and self._selection:isActive() then return true end
         local book = self._preview_book
             or self:_currentHeroBook()
@@ -5453,6 +5985,67 @@ end
 -- _setActiveChip(key) — switch tabs as if the user tapped a chip.
 -- Mirrors the on_change closure in _rebuild so swipe-cycling and tap
 -- both produce identical state transitions.
+-- Rebuild, then refresh ONLY below the hero so the unchanged hero cover isn't
+-- repainted -- repainting it flashes on panels with HW dithering, on chip
+-- switch / page nav (issue #124). Both the chip-tap closure and _setActiveChip
+-- (swipe) route through here so the scoping can't drift between them. Prefers
+-- the hero's live painted dimen; falls back to the stashed hero geometry, then
+-- a full refresh.
+function BookshelfWidget:_rebuildRefreshBelowHero()
+    local prev_hero  = self._hero_parent and self._hero_parent[1]
+    local hero_dimen = prev_hero and prev_hero.dimen
+    self:_rebuild()
+    local below_y
+    if hero_dimen and hero_dimen.y and hero_dimen.h then
+        below_y = hero_dimen.y + hero_dimen.h
+    elseif self._hero_dims and self._hero_dims.hero_h then
+        below_y = (self._hero_dims.PAD or 0) + self._hero_dims.hero_h
+    end
+    -- The hero cover's drop shadow fills the bottom SHADOW_OFFSET strip of the
+    -- card, so its lower edge lands exactly on below_y. A scoped "ui" refresh
+    -- whose hard top boundary sits flush against that soft-grey gradient leaves
+    -- a faint residual flash there on weak panels with HW dithering (the #124
+    -- tail). Nudge the band down past the shadow into the neutral PAD gap above
+    -- the chip strip -- still well clear of the chips, which must stay in the
+    -- refresh. SHADOW_OFFSET mirrors the value in bookshelf_spine_widget /
+    -- bookshelf_hero_card.
+    if below_y then
+        below_y = below_y + Screen:scaleBySize(4)
+        UIManager:setDirty(self, function()
+            return "ui", Geom:new{ x = 0, y = below_y, w = self.width, h = self.height - below_y }
+        end)
+    else
+        UIManager:setDirty(self, "ui")
+    end
+end
+
+-- _rebuildRefreshHeroAndChips() — the mirror of _rebuildRefreshBelowHero, for
+-- changes that touch the hero + chip strip but not the shelves below (the
+-- hero-mode toggle: book hero <-> micro-module grid, which also flips the
+-- chip triangles). Rebuilds the tree, then scopes the "ui" refresh to the
+-- band from the top down to the bottom of the chip strip, so the shelves and
+-- footer don't flash. Falls back to a full refresh if the chip strip's
+-- painted geometry isn't available (e.g. chips hidden).
+function BookshelfWidget:_rebuildRefreshHeroAndChips()
+    local chip       = self._chip_bar
+    local chip_dimen = chip and chip.dimen
+    self:_rebuild()
+    local bottom
+    if chip_dimen and chip_dimen.y and chip_dimen.h then
+        bottom = chip_dimen.y + chip_dimen.h
+    end
+    if bottom then
+        -- Include a hair below the chip strip so its lower border refreshes
+        -- cleanly (same margin rationale as _rebuildRefreshBelowHero).
+        bottom = bottom + Screen:scaleBySize(4)
+        UIManager:setDirty(self, function()
+            return "ui", Geom:new{ x = 0, y = 0, w = self.width, h = bottom }
+        end)
+    else
+        UIManager:setDirty(self, "ui")
+    end
+end
+
 function BookshelfWidget:_setActiveChip(key)
     if not key or key == self.chip then return end
     -- Diag: wrap the chip-switch flow so the log shows the elapsed time
@@ -5487,22 +6080,7 @@ function BookshelfWidget:_setActiveChip(key)
     -- refresh to the chip strip + shelves + footer below it; the hero region
     -- is left untouched. Falls back to a full refresh if the hero hasn't
     -- painted yet (no dimen).
-    local prev_hero  = self._hero_parent and self._hero_parent[1]
-    local hero_dimen = prev_hero and prev_hero.dimen
-    self:_rebuild()
-    if hero_dimen and hero_dimen.h then
-        local below_y = hero_dimen.y + hero_dimen.h
-        UIManager:setDirty(self, function()
-            return "ui", Geom:new{
-                x = 0,
-                y = below_y,
-                w = self.width,
-                h = self.height - below_y,
-            }
-        end)
-    else
-        UIManager:setDirty(self, "ui")
-    end
+    self:_rebuildRefreshBelowHero()
     logger.dbg(string.format(
         "[bookshelf perf] chip-switch: from=%s to=%s flash=%.0fms rebuild=%.0fms TOTAL=%.0fms",
         _diag_from, key,
@@ -5570,6 +6148,17 @@ function BookshelfWidget:paintTo(bb, x, y)
     local top = stack and stack[#stack] and stack[#stack].widget
     if top and top.invisible and top.text then return end
 
+    -- Issue #172: same flash, NON-seamless path. Opening a book from inside
+    -- the reader (History / Collections / Book shortcuts / prev-next) tears the
+    -- old ReaderUI down and shows a *visible* "Opening file…" InfoMessage with a
+    -- forced repaint before the new document loads. By then the old reader is
+    -- gone and the parked shelf is the only window left, so that repaint paints
+    -- us full-screen for ~1s. The guard above only catches the seamless
+    -- (invisible) variant; this flag is set by Bookshelf:onCloseDocument when
+    -- ReaderUI is tearing down to open another book, and cleared once the new
+    -- reader is ready (or whenever the shelf is intentionally shown again).
+    if self._suppress_transition_paint then return end
+
     local sw = Screen:getWidth()
     local sh = Screen:getHeight()
     if sw ~= self.width or sh ~= self.height then
@@ -5608,12 +6197,36 @@ function BookshelfWidget:paintTo(bb, x, y)
         self._diag_first_paint_done = true
         local _diag_paint_t0 = _gettime()
         InputContainer.paintTo(self, bb, x, y)
+        self:_clearHeroMarker()
+        do
+            local FG = require("lib/bookshelf_footer_geom")
+            if self._burger_dimen and self._burger_dimen.x then FG.rememberButtonRect(self._burger_dimen) end
+            if self._micromod_dimen and self._micromod_dimen.x then FG.rememberGridRect(self._micromod_dimen) end
+        end
         logger.dbg(string.format(
             "[bookshelf perf] paintTo: FIRST first_paint=%.0fms chip=%s",
             (_gettime() - _diag_paint_t0) * 1000, self.chip))
         return
     end
     InputContainer.paintTo(self, bb, x, y)
+    self:_clearHeroMarker()
+    -- Remember the footer buttons' real painted rects so the in-reader launcher
+    -- matches them exactly (single Lua state; see bookshelf_footer_geom).
+    do
+        local FG = require("lib/bookshelf_footer_geom")
+        if self._burger_dimen and self._burger_dimen.x then FG.rememberButtonRect(self._burger_dimen) end
+        if self._micromod_dimen and self._micromod_dimen.x then FG.rememberGridRect(self._micromod_dimen) end
+    end
+end
+
+-- Clear the home-screen hero crash marker once the shelf has actually painted.
+-- If a hero module segfaults the paint pass, InputContainer.paintTo above never
+-- returns, the sentinel survives, and the next launch falls back to the cover
+-- hero (issue #163). Only meaningful in micro mode, which is what arms it.
+function BookshelfWidget:_clearHeroMarker()
+    if self._hero_mode == "micro" then
+        pcall(Breaker.endFile, Breaker.heroMarkerPath())
+    end
 end
 
 -- _isLandscape() — true when the device is rotated 90° or 270°.
@@ -5695,13 +6308,39 @@ function BookshelfWidget:_maxRows()
     return math.max(1, math.floor(available / row_h))
 end
 
--- _baseShelves() — non-expanded shelf count. Rows fill the height left after a
--- "regular" hero, counted at ~natural cover height (no shrink-to-cram, so
--- covers fill the row width with no side gaps). Chrome mirrors _maxRows minus
--- the status strip. The hero size then shifts the count: "large" always shows
--- ONE fewer row than "regular" (so the hero setting is visible at any size),
--- with the freed row's height going to the taller hero.
+-- _maxShelfRows() — the most shelf rows that fit at natural cover height
+-- while still leaving the hero its minimum (HERO_MIN_FRAC) slice. Rows is
+-- clamped to this so the grid + a usable hero never overflow the screen.
+function BookshelfWidget:_maxShelfRows()
+    local PAD, content_w, chip_h, footer_h = self:_layoutPrimitives()
+    local n_cols = self:_nCols()
+    if n_cols < 1 then return 1 end
+    local slot_w = math.floor((content_w - PAD * (n_cols - 1)) / n_cols)
+    if slot_w < 1 then return 1 end
+    local slot_h = math.floor(slot_w * 1.5)
+    local hero_chip_pad = Size.padding.large
+    local usable = self.height - PAD - hero_chip_pad - chip_h - PAD - footer_h
+    local row_unit = math.floor(slot_h * SHELF_PACK_FLOOR) + PAD
+    if row_unit < 1 then return 1 end
+    local min_hero = math.floor(usable * HERO_MIN_FRAC)
+    return math.max(1, math.floor((usable - min_hero) / row_unit))
+end
+
+-- _baseShelves() — non-expanded shelf-row count.
+--   * New model: the explicit bookshelf_rows setting, clamped to _maxShelfRows
+--     (so the grid + minimum hero always fit). The hero then auto-sizes from
+--     the leftover vertical space (see the geometry in _rebuild).
+--   * Legacy fallback (bookshelf_rows unset): the old hero-size derivation —
+--     rows fill the height left after a "regular" hero, "large" hero shows one
+--     fewer — so existing layouts are preserved until the user opens the
+--     Columns/Rows editor and writes an explicit value.
 function BookshelfWidget:_baseShelves()
+    local max_fit = self:_maxShelfRows()
+    local rows = BookshelfSettings.read("bookshelf_rows")
+    if type(rows) == "number" then
+        return math.max(ROWS_MIN, math.min(math.floor(rows), max_fit))
+    end
+    -- Legacy derivation.
     local PAD, content_w, chip_h, footer_h = self:_layoutPrimitives()
     local n_cols = self:_nCols()
     if n_cols < 1 then return 1 end
@@ -5711,14 +6350,13 @@ function BookshelfWidget:_baseShelves()
     local hero_chip_pad = Size.padding.large
     local usable = self.height - PAD - hero_chip_pad - chip_h - PAD - footer_h
     local hero_target  = math.floor(usable * (HERO_HEIGHT_FRAC.regular or 0.30))
-    local shelf_budget = usable - hero_target
     local row_unit = math.floor(slot_h * SHELF_PACK_FLOOR) + PAD
     if row_unit < 1 then return 1 end
-    local n_regular = math.max(1, math.floor(shelf_budget / row_unit))
+    local n_regular = math.max(1, math.floor((usable - hero_target) / row_unit))
     if _readHeroSize() == "large" then
-        return math.max(1, n_regular - 1)
+        n_regular = math.max(1, n_regular - 1)
     end
-    return n_regular
+    return math.min(n_regular, max_fit)
 end
 
 -- _nShelves() — shelf row count for the current mode.
@@ -5744,14 +6382,23 @@ end
 --     narrower, so more fit). CEIL the count so covers never exceed the target
 --     height and still fill the width.
 function BookshelfWidget:_nCols()
-    if self:_isLandscape() then
-        local PAD, content_w = self:_layoutPrimitives()
-        local cover_h = math.max(1, math.floor(self.height * (SHELF_HEIGHT_FRAC[_readCoverSize()] or 0.35)))
-        local cover_w = math.max(1, math.floor(cover_h / 1.5))
-        local n = math.ceil((content_w + PAD) / (cover_w + PAD))
-        return math.max(2, math.min(10, n))
+    -- Explicit Columns setting (new model); falls back to the legacy
+    -- cover-size→columns mapping until the user sets it in the editor.
+    local cols = BookshelfSettings.read("bookshelf_columns")
+    if type(cols) ~= "number" then
+        cols = COVER_SIZE_COLS[_readCoverSize()] or 4
     end
-    return math.max(2, math.min(8, COVER_SIZE_COLS[_readCoverSize()] or 4))
+    cols = math.max(COLUMNS_MIN, math.min(COLUMNS_MAX, math.floor(cols)))
+    if self:_isLandscape() then
+        -- A fixed column count makes covers too tall on the short landscape
+        -- screen, so raise the count until a cover is at most ~half the screen
+        -- height (cover_h <= H/2  ⇔  cols >= 3*content_w/H). The user's column
+        -- choice acts as a floor; landscape only ever adds more.
+        local PAD, content_w = self:_layoutPrimitives()
+        local min_cols = math.ceil(3 * content_w / math.max(1, self.height))
+        return math.max(2, math.min(10, math.max(cols, min_cols)))
+    end
+    return cols
 end
 
 -- _pageSize() — page-advance step. Matches _viewSize so paging forward
@@ -6585,11 +7232,61 @@ function BookshelfWidget:_logSwipeLatency(dir, ges)
     end
 end
 
+-- Long-press on the modules chip: options for the micro-module grid as a whole.
+-- "Reset" reseeds the hero list to defaults; "Disable" turns micro-modules off
+-- (revertible from Settings) and restores the book hero.
+function BookshelfWidget:_showModulesOptions()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local HeroModel    = require("lib/bookshelf_hero_modules_model")
+    local dialog
+    local function close(fn)
+        return function() UIManager:close(dialog); if fn then fn() end end
+    end
+    dialog = ButtonDialog:new{
+        title        = _("Micro-modules"),
+        title_align  = "center",
+        width_factor = 0.75,
+        buttons = {
+            { { text = _("Reset modules to default"), callback = close(function()
+                HeroModel.save(HeroModel.DEFAULTS())
+                self._hero_page = 1
+                self:_rebuildRefreshHeroAndChips()
+            end) } },
+            -- This is the hero chip's menu, so "disable" turns off only the hero
+            -- surface (the start-menu and full-screen surfaces are independent
+            -- now, toggled in Settings). Persist all three explicitly so we stop
+            -- depending on the legacy placement key, mirroring the settings menu.
+            { { text = _("Remove micro-modules from hero (re-enable in settings)"),
+                callback = close(function()
+                    BookshelfSettings.save("micro_in_start_menu", BookshelfSettings.microInStartMenu())
+                    BookshelfSettings.save("micro_in_hero", false)
+                    BookshelfSettings.save("micro_fullscreen_button", BookshelfSettings.microFullscreenButton())
+                    BookshelfSettings.delete("micro_modules_placement")  -- fully migrated
+                    BookshelfSettings.delete("micro_modules_disabled")   -- legacy
+                    BookshelfSettings.flush()
+                    self._hero_mode = "current"
+                    self._hero_page = 1
+                    self:_rebuild()
+                    UIManager:setDirty(self, "ui")
+                end) } },
+        },
+    }
+    UIManager:show(dialog)
+end
+
 function BookshelfWidget:onSwipeNextPage(_, ges)
-    -- Hero-area swipe: cycle preview to next book. Stays inside the
-    -- chip; pages flip automatically when the next book lives on a
-    -- different page than the current preview.
+    -- Hero-area swipe. In micro-module mode the hero shows no book, so page the
+    -- module grid instead (if it's paginated); a single page consumes the swipe
+    -- rather than falling through to shelf paging. In book-detail mode it cycles
+    -- the preview to the next book as before (pages flip automatically when the
+    -- next book lives on a different shelf page).
     if self:_isHeroSwipe(ges) then
+        if self._hero_mode == "micro" then
+            if (self._hero_pages or 1) > 1 then
+                require("lib/bookshelf_hero_modules")._gotoPage(self, 1)
+            end
+            return true
+        end
         self:_previewNeighbourBook(1)
         return true
     end
@@ -6599,6 +7296,12 @@ end
 
 function BookshelfWidget:onSwipePrevPage(_, ges)
     if self:_isHeroSwipe(ges) then
+        if self._hero_mode == "micro" then
+            if (self._hero_pages or 1) > 1 then
+                require("lib/bookshelf_hero_modules")._gotoPage(self, -1)
+            end
+            return true
+        end
         self:_previewNeighbourBook(-1)
         return true
     end
@@ -6626,6 +7329,8 @@ function BookshelfWidget:onBookshelfPrevChip()
 end
 
 function BookshelfWidget:onBookshelfToggleHero()
+    -- Collapse/restore the hero in both modes (in micro mode this hides /
+    -- shows the module grid).
     self:_clearDpadFocus()
     self._expanded = not self._expanded
     self:_rebuild()
@@ -6711,6 +7416,7 @@ function BookshelfWidget:_clearDpadFocus()
     self._crumb_cursor_depth = nil
     self._footer_cursor_btn  = nil
     self._sel_overlay_slot   = nil
+    self._hero_cell_cursor   = nil
     if self._chip_bar and self._chip_bar.focusCursor then
         self._chip_bar:focusCursor(nil)
     end
@@ -6721,7 +7427,42 @@ end
 
 -- North-swipe anywhere on screen: collapse hero to compact strip, expand
 -- the grid from 2 to 3 rows. No-op when already expanded.
+-- Pinch / spread zoom: nudge the column count (the cover-size knob).
+-- delta -1 = fewer columns (bigger covers, "spread"); +1 = more columns
+-- (smaller covers, "pinch"). Reads the stored setting so the step is off the
+-- user's chosen value, not the landscape-adjusted effective count. Clamped to
+-- [COLUMNS_MIN, COLUMNS_MAX]; a no-op at the limit still consumes the gesture.
+function BookshelfWidget:_nudgeColumns(delta)
+    local cur = BookshelfSettings.read("bookshelf_columns")
+    if type(cur) ~= "number" then cur = self:_nCols() end
+    cur = math.max(COLUMNS_MIN, math.min(COLUMNS_MAX, math.floor(cur)))
+    local new = math.max(COLUMNS_MIN, math.min(COLUMNS_MAX, cur + delta))
+    if new == cur then return true end
+    -- DEFERRED write, not save(): a synchronous full bookshelf.lua flush here
+    -- (~hundreds of ms on Kindle flash) blocked the pinch before the regrid
+    -- repainted, so each zoom step felt laggy. saveDeferred still updates the
+    -- in-memory value, so the _rebuild below reads the new column count and the
+    -- zoom is instant; only the disk persistence is coalesced onto the shared
+    -- nav-flush channel (Store.flush writes the whole file, so columns rides
+    -- along). Durability still lands at the debounce and at every
+    -- close / suspend / onFlushSettings boundary.
+    BookshelfSettings.saveDeferred("bookshelf_columns", new)
+    self._nav_dirty = true
+    self:_scheduleNavFlush()
+    self:_clearDpadFocus()
+    self:_rebuild()
+    UIManager:setDirty(self, "ui")
+    return true
+end
+
+-- Spread (fingers apart) = zoom in = bigger covers = fewer columns.
+function BookshelfWidget:onShelfSpread() return self:_nudgeColumns(-1) end
+-- Pinch (fingers together) = zoom out = smaller covers = more columns.
+function BookshelfWidget:onShelfPinch() return self:_nudgeColumns(1) end
+
 function BookshelfWidget:onSwipeShelvesUp(_, ges)
+    -- Collapses the hero to the thin strip in both modes; in micro mode this
+    -- hides the module grid (swipe-down / modules-chip restores it).
     if self._expanded then return false end
     local _diag_t0 = _gettime()
     self._expanded = true
@@ -7180,6 +7921,10 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
                                  -- "+N" pill so the visible row count
                                  -- never grows past this cap.
 
+        -- #177: cap a single pill's label so a very long tag truncates
+        -- (one line, ellipsis) inside text_w instead of spilling off-screen.
+        local pill_label_max = math.max(1, text_w - 2 * pill_pad_h - 2 * Size.border.thin)
+
         -- Build all pill widgets first so we know their widths up
         -- front (the packing pass needs them to greedily wrap).
         local function _buildPill(label_text, on_tap_cb)
@@ -7187,6 +7932,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
                 text = TextSegments.upper(label_text or ""),
                 face = pill_face,
                 bold = pill_bold,
+                max_width = pill_label_max,
             }
             -- Explicit white bg so the tap-feedback inversion has
             -- something to flip to black. Matches the hero pill builder.
@@ -7601,12 +8347,18 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     local pill_pad_h = Size.padding.default
     local pill_pad_v = Size.padding.small
     local pill_gap   = Size.padding.default
+    -- #177: a single tag longer than the row would otherwise render at full
+    -- natural width and spill off the screen edge (the packer only rejects a
+    -- pill that isn't first in its row). Cap the label so one pill never exceeds
+    -- available_w; TextWidget truncates with an ellipsis on one line (no wrap).
+    local pill_label_max = math.max(1, available_w - 2 * pill_pad_h - 2 * Size.border.thin)
 
     local function _buildPill(label_text, on_tap_cb)
         local label_w = TextWidget_:new{
             text = TextSegments.upper(label_text or ""),
             face = pill_face,
             bold = pill_bold,
+            max_width = pill_label_max,
         }
         -- Explicit white bg so the tap-feedback inversion has something to
         -- invert to black (without this, the frame's transparent fill
@@ -8020,7 +8772,7 @@ function BookshelfWidget:_refreshHardcoverEnrichmentView(reason, filepath)
                          or reason == "hardcover-use-description")
     if toggle_only and filepath
             and self._inner_vgroup and self._shelf_dims
-            and self:_nShelves() == 2 then
+            and (self._shelf_dims.n_shelves or 2) == self:_nShelves() then
         local spine_done = self:_refreshSpineInPlace(filepath)
         local preview_fp = self._preview_book and self._preview_book.filepath
         local hero_done = false
@@ -8292,6 +9044,58 @@ function BookshelfWidget:_openHardcoverMenu(book)
     UIManager:show(dialog)
 end
 
+-- Button rows contributed by other plugins through KOReader's standard
+-- long-press file-dialog hook (FileManager:addFileDialogButtons), so they appear
+-- in bookshelf's book menu exactly as they would in the stock file browser
+-- (issue #102). Returns a list of ButtonDialog rows, or nil when none apply.
+--
+-- Each row builder is called as it would be by FileManager:showFileDialog --
+-- row_func(file, is_file=true, book_props) -- and pcall-guarded so a broken or
+-- FM-context-assuming plugin button can never break bookshelf's menu. book_props
+-- is built best-effort in KOReader's shape (via coverbrowser when present) so
+-- metadata-dependent buttons render; metadata-independent ones (e.g. Incognito)
+-- ignore it.
+function BookshelfWidget:_fileDialogPluginRows(file)
+    if not file then return nil end
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if not ok_fm or not FileManager then return nil end
+    local fm = FileManager.instance
+    -- Instance first (plugins may register per-instance); fall back to the class
+    -- field (incognito registers on the class, also reachable via the instance).
+    local added = (fm and fm.file_dialog_added_buttons)
+        or FileManager.file_dialog_added_buttons
+    if type(added) ~= "table" or #added == 0 then return nil end
+
+    -- Reverse the id->position index so we can skip whole registrations by id.
+    -- coverbrowser is bookshelf's BIM provider; its long-press buttons (Ignore
+    -- cover / Ignore metadata / Refresh cached book information) are redundant
+    -- here -- bookshelf already integrates that metadata and has its own
+    -- "Refresh metadata". Everything else still passes through generically.
+    local id_at = {}
+    if type(added.index) == "table" then
+        for id, pos in pairs(added.index) do id_at[pos] = id end
+    end
+
+    local book_props
+    pcall(function()
+        if fm and fm.coverbrowser and fm.coverbrowser.getBookInfo then
+            book_props = fm.coverbrowser:getBookInfo(file)
+        end
+    end)
+
+    local rows = {}
+    for _i = 1, #added do
+        local id = id_at[_i]
+        if not (type(id) == "string" and id:find("^coverbrowser")) then
+            local ok, row = pcall(added[_i], file, true, book_props)
+            if ok and type(row) == "table" and #row > 0 then
+                rows[#rows + 1] = row
+            end
+        end
+    end
+    return (#rows > 0) and rows or nil
+end
+
 -- (from on_series_hold on a SeriesStack). Series groups have a .books field;
 -- we route to a series-specific dialog in that case.
 function BookshelfWidget:_openBookMenu(item)
@@ -8434,7 +9238,7 @@ function BookshelfWidget:_openBookMenu(item)
     --   5. Select / Cancel / Apply
 
     local show_info_button = {
-        text = "Show info",
+        text = _("Show info"),
         callback = closing(function()
             -- filemanagerbookinfo:show does lfs.attributes(file).size with
             -- no nil guard -- passing a missing filepath panics LuaJIT
@@ -9185,6 +9989,16 @@ function BookshelfWidget:_openBookMenu(item)
     buttons[#buttons + 1] = { reset_btn, remove_history_button, fav_button }
     buttons[#buttons + 1] = { delete_btn, refresh_button }
     buttons[#buttons + 1] = { select_btn, cancel_btn, apply_btn }
+
+    -- Buttons contributed by other plugins via KOReader's standard long-press
+    -- hook (FileManager:addFileDialogButtons) -- e.g. Incognito's "Open
+    -- Incognito" (issue #102). Appended below a separator so bookshelf's own
+    -- actions stay primary. Generic: any plugin using the hook shows up here.
+    local plugin_rows = self:_fileDialogPluginRows(book.filepath)
+    if plugin_rows then
+        buttons[#buttons + 1] = {} -- separator
+        for _i = 1, #plugin_rows do buttons[#buttons + 1] = plugin_rows[_i] end
+    end
 
     -- Inset the header by the shelf's inter-column book gap, and ONLY that:
     -- override ButtonDialog's default title_padding (Size.padding.large) so
@@ -10132,17 +10946,33 @@ end
 
 -- ─── Dismiss / passthrough ───────────────────────────────────────────────────
 
-function BookshelfWidget:_openStartMenu()
-    -- Defensive: with the start menu off there is no footer button and
-    -- no focusable "menu" slot, so nothing should reach this - but a
-    -- stale dispatcher action or queued gesture must not open it anyway.
-    if self:_startMenuPosition() == "off" then return end
+-- force: open even when the start menu is set to Off. Set only by the explicit
+-- "open start menu" gesture action; the footer button / focus slot leave it nil
+-- so the Off guard still protects against a stale dispatcher action or queued
+-- gesture.
+function BookshelfWidget:_openStartMenu(force)
+    if not force and self:_startMenuPosition() == "off" then return end
     local ok, StartMenu = pcall(require, "lib/bookshelf_start_menu")
     if not ok or not StartMenu then
         logger.warn("[bookshelf] start menu unavailable:", tostring(StartMenu))
         return
     end
-    StartMenu.open(self, self._footer_h_last or Screen:scaleBySize(40), self._burger_dimen)
+    StartMenu.open(self, self._footer_h_last or Screen:scaleBySize(40),
+        self._burger_dimen, "library")
+end
+
+-- Open the full-screen micro-module grid (Micro-modules placement ==
+-- "fullscreen"), launched by the footer grid button. force: open even when
+-- placement isn't "fullscreen" -- set only by the explicit gesture action; the
+-- footer button leaves it nil so the placement guard still applies there.
+function BookshelfWidget:_openMicroModulesFullscreen(force)
+    if not force and not BookshelfSettings.microFullscreenButton() then return end
+    local ok, Mod = pcall(require, "lib/bookshelf_micro_fullscreen")
+    if not ok or not Mod then
+        logger.warn("[bookshelf] micro-module fullscreen unavailable:", tostring(Mod))
+        return
+    end
+    Mod.open(self, self._micromod_dimen, self._footer_h_last or Screen:scaleBySize(40))
 end
 
 function BookshelfWidget:onClose()

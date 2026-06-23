@@ -58,10 +58,29 @@ function M.bundledFaceId(name, variant)
 end
 
 -- The currently chosen UI font face (a resolvable font_face), or nil for follow.
+-- A stored face that the running KOReader can't actually load is treated as
+-- follow: callers pass this name straight to KOReader Buttons / TextWidgets,
+-- whose own Font:getFace would return nil and crash (issue #168 — RobotoCondensed
+-- was the seeded default but KOReader v2026.03 dropped it from its bundled fonts,
+-- and a bare-filename face resolves against KOReader's install ./fonts, not the
+-- user dir, so the bundled copy doesn't help). The load check is cached per
+-- setting value (keyed on `v`, so setUIFontFace invalidates it) to stay off the
+-- per-render hot path.
+local _ui_face_checked, _ui_face_ok
 function M.getUIFontFace()
     local v = Settings.read(M.SETTING_KEY, nil)
     if v == nil or v == M.FOLLOW or v == "" then return nil end
-    return v
+    if _ui_face_checked ~= v then
+        _ui_face_checked = v
+        -- A size is MANDATORY here. Font:getFace with no size falls back to
+        -- self.sizemap[face], which is nil for an arbitrary UI face name, so
+        -- font.lua then does Screen:scaleBySize(nil) and crashes ("arithmetic
+        -- on px (nil)", framebuffer.lua) -- which took down every fresh install
+        -- whose seeded UI font can't load (issue #175, a regression from the
+        -- issue #168 probe). The size value itself is irrelevant to a load check.
+        _ui_face_ok = Font:getFace(v, 16) ~= nil
+    end
+    return _ui_face_ok and v or nil
 end
 function M.isFollow() return M.getUIFontFace() == nil end
 
@@ -206,6 +225,16 @@ function M.maybeSeedFreshInstall()
     if not Settings.wasPresent() then            -- no prior settings file => fresh install
         Settings.save(M.SETTING_KEY, M.bundledFaceId("Roboto Condensed"))
         Settings.save("author_format", "first_last")
+        -- Flexible chip widths by default: chips size to their label instead of
+        -- equal-share, so the bar (now carrying the micro-modules chip) doesn't
+        -- crowd and truncate names (issue #176). New installs only -- existing
+        -- users keep whatever they have (chip_flex_widths unset = equal-share).
+        Settings.save("chip_flex_widths", true)
+        -- Micro-modules default to the full-screen footer button rather than the
+        -- in-hero chip: it declutters the chip bar (#176) and reads better. New
+        -- installs only -- existing users keep their placement (unset -> "hero"
+        -- via Store.microPlacement, the prior behaviour).
+        Settings.save("micro_modules_placement", "fullscreen")
         local ok, Regions = pcall(require, "lib/bookshelf_hero_regions")
         if ok and Regions and Regions.applyFreshInstallDefaults then
             Regions.applyFreshInstallDefaults()
@@ -213,6 +242,62 @@ function M.maybeSeedFreshInstall()
     end
     Settings.save(M.SEEDED_KEY, true)
     Settings.flush()
+end
+
+-- Resolve a font display name (e.g. "BIZ UDPMincho") to a file path that
+-- Font:getFace can load. The hero's [font=NAME] tag (issue #144) carries a
+-- display name, but the renderer needs a file. Returns the input unchanged if
+-- it already looks like a path, or nil if no installed font matches. Memoised
+-- (including misses) since the FontList fallback iterates every installed font.
+-- Ported from bookends' resolveFontNameToFile.
+local _font_name_cache = {}
+function M.resolveFontNameToFile(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local hit = _font_name_cache[name]
+    if hit ~= nil then return hit or nil end
+    local result
+    if name:find("/") or name:match("%.[tT][tT][fFcC]$") or name:match("%.[oO][tT][fFcC]$") then
+        result = name  -- already a file path
+    else
+        -- Preferred: ask CRE (matches stock KOReader's font resolution, picks
+        -- the regular variant).
+        local ok_cre, cre = pcall(function()
+            return require("document/credocument"):engineInit()
+        end)
+        if ok_cre and cre and cre.getFontFaceFilenameAndFaceIndex then
+            local ok_call, file = pcall(cre.getFontFaceFilenameAndFaceIndex, name)
+            if ok_call and type(file) == "string" and file ~= "" then result = file end
+        end
+        if not result then
+            -- Fallback: rank-based FontList iteration (most-regular variant wins).
+            local ok_fl, FontList = pcall(require, "fontlist")
+            if ok_fl and FontList then
+                local best_file, best_rank = nil, math.huge
+                for file, info in pairs(FontList.fontinfo or {}) do
+                    if info and info[1] and info[1].name == name then
+                        local fi = info[1]
+                        local rank = 0
+                        if fi.bold then rank = rank + 2 end
+                        if fi.italic then rank = rank + 2 end
+                        local lbase = (file:match("([^/]+)$") or ""):lower()
+                        if lbase:find("regular") then
+                            rank = rank - 1
+                        elseif lbase:find("bold") or lbase:find("italic") or lbase:find("oblique") then
+                            rank = rank + 2
+                        elseif lbase:find("light") or lbase:find("thin") or lbase:find("heavy")
+                            or lbase:find("black") or lbase:find("medium") or lbase:find("semibold")
+                            or lbase:find("extrabold") or lbase:find("book") then
+                            rank = rank + 1
+                        end
+                        if rank < best_rank then best_file, best_rank = file, rank end
+                    end
+                end
+                result = best_file
+            end
+        end
+    end
+    _font_name_cache[name] = result or false
+    return result
 end
 
 return M

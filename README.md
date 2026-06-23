@@ -31,6 +31,8 @@ A friendly home screen for KOReader. Browse your library by series, author, genr
 3. Restart KOReader.
 4. Open KOReader's menu and set **Start with -> Bookshelf**. Without this, KOReader opens its standard file browser on launch; you can still open Bookshelf manually from the menu.
 
+   > The **Start with** setting only appears in the menu of KOReader's **File Manager** screen, not while a book is open. If you can't find it, close the book first (or launch KOReader without one open), then open the menu from the file browser.
+
 > **You also need CoverBrowser enabled** (Settings -> More plugins -> CoverBrowser). It supplies the covers and metadata Bookshelf uses. If it's disabled, Bookshelf shows a one-time notice and steps aside to KOReader's standard file browser.
 
 Once it's running, the top menu has a **Bookshelf** section with everything else: chips, the book detail view, collections, updates, and settings.
@@ -59,7 +61,9 @@ The same menu (**menu -> Bookshelf chips…**) also has **Chip bar font size** f
 
 ### Searching
 
-Tap the search icon at the right of the chip bar. Search looks across folders, authors, series, genres, collections, and book titles in one go, and groups the results by category. Tapping a result drills into it; back-swipe to return to whichever shelf you were on.
+Tap the search icon at the right of the chip bar. Search looks across authors, series, genres, collections, and book titles in one go, and groups the results by category. Tapping a result drills into it; back-swipe to return to whichever shelf you were on.
+
+Folder names aren't searched by default: in most libraries the folders mirror the author/series/genre stacks, so matching a folder just duplicates the metadata result of the same name. If you navigate by folder, turn on **Advanced settings -> Include folder names in search results**.
 
 ### The hero card (top of the shelf area)
 
@@ -77,6 +81,31 @@ The hero card has eight sections you can show, hide, or restyle:
 - **Progress** -- bottom-anchored line with an inline progress bar.
 
 To edit them, open **menu -> Edit book detail view** (see [Customising the hero card](#customising-the-hero-card) below).
+
+### Micro-modules on the home screen
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/AndyHazz/bookshelf.koplugin/master/assets/hero-grid.png" width="32%" alt="Home screen showing a grid of micro-modules" />
+</p>
+
+The home screen can show a grid of **micro-modules** -- small live panels like a clock, a quote from your highlights, your reading goal, the weather, or a launcher button. They're the same kinds of panels you can add to the [start menu](#micro-modules).
+
+Micro-modules can appear in three independent places, each its own on/off checkbox under **Bookshelf settings -> Micro modules**:
+
+- **In hero area** -- a **grid chip** at the right of the chip bar swaps the book preview at the top of the shelf for the grid (tap the chip to toggle between the two).
+- **Full-screen button** -- a grid button sits in the footer opposite the start menu; tapping it opens the modules full-screen as a dashboard, with the status line across the top. Close it with the **X**, a tap on empty space, or Back. The usual KOReader gestures (top-edge menu, edge swipes for brightness, corner actions) still work over it.
+- **In start menu** -- module cards appear in the [start menu](#micro-modules) launcher alongside your other items.
+
+You can run any combination. The **hero** and **full-screen** views keep **separate module lists**, so you can show different modules in each -- the full-screen list starts as a copy of your hero modules and then the two diverge as you edit them. Turning all three off disables micro-modules entirely (a quick way to rule them out when troubleshooting).
+
+In either grid:
+
+- **Long-press a module** to move it, make it wider or narrower (`-` / `+`), add another from the picker (**+**), or remove it. In the hero grid you can also send a module to one of four **pages**; the full-screen view shows everything at once, so it has no pages.
+- **Swipe left/right** on the hero grid, or tap the in-grid arrows, to flip between pages.
+- **Long-press the grid chip** to reset the hero grid to its defaults, or to remove micro-modules from the hero area.
+- On **physical-button (D-pad) devices**, move the cursor across the grid with the arrow keys, open a module with the centre key, and long-press to edit it.
+
+The grid packs square modules (clocks, launcher icons) tightly and lets text modules fill the rest of the row. Set the number of **columns and rows** under **menu -> Settings -> Edit shelf size**. Hero micro-modules have their own entry under **menu -> Text size** so you can scale the grid independently of the book hero.
 
 ### The shelf grid (the books)
 
@@ -114,20 +143,30 @@ Each item can be:
 - A **folder** -- group items together; it flies out to the side when you tap it.
 - A **micro-module** -- a small live panel (see below).
 
-**Building and editing it.** Long-press any item for **rename**, **change icon**, **move up / down**, **move into / out of a folder**, **delete**, and **add new menu item**. Adding walks you through the categories above; the icon picker is a built-in glyph grid (no extra plugins needed). Folders open downward from the row you tapped, overlapping the menu so they read as connected.
+**Building and editing it.** Long-press any item for **rename**, **change icon**, **move up / down**, **move into / out of a folder**, **show in** (home screen, reader, or both), **delete**, and **add new menu item**. Adding walks you through the categories above; the icon picker is a built-in glyph grid (no extra plugins needed). Folders open downward from the row you tapped, overlapping the menu so they read as connected.
 
 **Position.** Under **Bookshelf settings -> Start menu** you can put the button on the **left**, the **right**, or turn it **off**. It works with touch and with physical-button (D-pad) devices.
 
+**While reading.** Turn on **Bookshelf settings -> Show launcher button while reading** to keep a small launcher button in the reader's bottom corner. Tapping it opens the same start menu over your book, so you can jump to a shelf, a collection, or another plugin and tap straight back in. If you use full-screen [micro-modules](#micro-modules-on-the-home-screen), the grid button appears in the reader too. By default each menu item shows both on the home screen and while reading; use **show in** (above) to limit one to the reader or the home screen -- handy for keeping the reading menu short.
+
+**By gesture (no button needed).** Prefer not to show a button? KOReader's **Gesture manager** (wrench -> Taps and gestures -> Gesture manager) lists two assignable actions, **Bookshelf: open start menu** and **Bookshelf: open micro-modules**. Bind either to any gesture -- a corner tap, a swipe, a multiswipe -- and it opens that view in the reader (or the library) whether or not the launcher buttons are shown. Because a bound gesture is a deliberate request, it works even if the start menu or micro-modules are set to **Off**.
+
 ### Micro-modules
 
-Micro-modules are small live panels you can drop into the menu through **Add new menu item -> Bookshelf micro-module…**. Four ship with Bookshelf:
+Micro-modules are small live panels. Add them to the start menu through **Add new menu item -> Bookshelf micro-module…**, or to the [home-screen grid](#micro-modules-on-the-home-screen). The ones that ship with Bookshelf:
 
-- **Clock** -- a large digital clock (12- or 24-hour).
-- **Reading stats** -- time and pages read today and this week (needs the `statistics` plugin).
+- **Clock** -- digital (12- or 24-hour) or analogue.
 - **Quote of the day** -- a highlight drawn from your own books, refreshed daily or on every open. Tapping it can roll a new quote, open that book's bookmark list, or open the book at the highlight.
-- **Random book** -- rolls an unread book from the current shelf (or your whole library) into the hero card; tap the dice for another. Has its own settings for source and which reading statuses to include.
+- **Reading goal** -- progress towards a daily reading target.
+- **Reading stats** -- time and pages read today and this week (needs the `statistics` plugin).
+- **Reading streak** -- your current and best reading streak, in days and weeks (needs the `statistics` plugin).
+- **Random book** -- rolls an unread book from the current shelf (or your whole library) into the hero card; tap the dice for another.
+- **Shelf count** -- how many books are on the current shelf.
+- **Countdown** -- "N days until <your label>" for a date you pick; counts up ("N days since…") once the date has passed. Add it more than once for several dates, each with its own label.
+- **Weather**, **On this day**, **Trivia**, **Daily fun** (jokes, facts and riddles) -- live content from the internet.
+- **Action** -- a launcher card that runs a plugin, a KOReader action, or a Bookshelf action, with your own icon and an optional label.
 
-Each module can carry its own settings (reached via **Module settings…** when you long-press it). Modules are a small self-contained format: if you write a little Lua you can add your own by dropping a file into the plugin's `micromodules/` folder, and a bad one is skipped rather than breaking the menu. See `micromodules/README.md` for the contract.
+Each module can carry its own settings (reached via **Module settings…** when you long-press it). Modules that need the internet show their data source in the picker rather than fetching while you browse. Modules are a small self-contained format: if you write a little Lua you can add your own by dropping a file into the plugin's `micromodules/` folder, or into `koreader/settings/bookshelf/micromodules/` to have it survive plugin updates. A bad one is skipped rather than breaking the menu. See `micromodules/README.md` for the contract.
 
 ---
 
@@ -148,6 +187,8 @@ Below the header you'll find:
 | **Remove from history** | Drop the book from Recent without changing anything else on disk. |
 | **Reset book data…** | A wider purge with checkboxes for progress, bookmarks, highlights, notes, custom cover, and custom metadata. |
 | **Delete** | Permanently remove the file from disk (with a confirmation). |
+
+If another plugin adds its own entries to KOReader's file long-press menu (for example "Open Incognito", or an AI assistant's "About this book"), those appear at the bottom of the book menu too, so you can use them straight from Bookshelf.
 
 Long-pressing a series, author, genre, collection, format, rating, or folder stack instead opens a single **Pin to chip bar** prompt -- the fastest way to turn a stack you've drilled into into a permanent shelf.
 
@@ -202,7 +243,7 @@ Bookshelf does not rewrite EPUB files. Descriptions, ratings and the other cache
 
 ## Layout
 
-Open **menu -> Settings -> Edit layout…** for a live overlay that resizes the grid without leaving the home screen. Two controls:
+Open **menu -> Settings -> Edit shelf size…** for a live overlay that resizes the grid without leaving the home screen. Two controls:
 
 - **Bookshelf size** -- how much room the shelves get relative to the hero card.
 - **Book size** -- how large the covers render, which also sets how many fit per row.
@@ -485,6 +526,8 @@ Tokens are placeholders prefixed with `%`. Conditional logic uses `[if:cond]…[
 | `%format` | *EPUB* |
 | `%lang` | *en* |
 | `%description` | Book blurb (HTML stripped, entities decoded) |
+| `%quote` | A random highlight from this book, in quotation marks (a fresh one each time you select the book; empty if the book has no highlights). Handy in the Description section in place of the blurb. |
+| `%quote_source` | The book and author for `%quote` |
 
 #### Position and progress
 
@@ -538,9 +581,11 @@ Statistics tokens auto-hide when the plugin is absent or the book has no recorde
 [if:lang!=en]Lang: %lang\n[/if]%description
 [if:batt<20]LOW BATTERY %batt[/if]
 [if:not series]Standalone[/if]
+[if:connected]%wifi_icon[/if]
+%time_12h[if:full_width]   ·   %date[/if]
 ```
 
-Comparisons: `=` `!=` `<` `>` `<=` `>=`. Boolean: `and`, `or`, `not`. Numeric tokens compare numerically; string tokens compare by string equality.
+Comparisons: `=` `!=` `<` `>` `<=` `>=`. Boolean: `and`, `or`, `not`. Numeric tokens compare numerically; string tokens compare by string equality. The `connected` condition is true only while actually online, so `[if:connected]%wifi_icon[/if]` shows the Wi-Fi glyph just when connected. The `full_width` condition is true only in the wide status line of the micro-module and full-screen views (not the narrow cover-view status), so you can surface extra content -- a date, say -- only where there's room for it.
 
 </details>
 

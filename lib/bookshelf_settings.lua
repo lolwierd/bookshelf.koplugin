@@ -20,6 +20,22 @@ local BFont        = require("lib/bookshelf_fonts")
 
 local Settings = {}
 
+-- Re-setup the in-reader launcher buttons after a setting that affects them
+-- (start-menu position, micro placement, the launcher toggle) so they update
+-- live instead of only on the next book open. The bookshelf plugin instance is
+-- a registered module on ReaderUI; no-op outside the reader.
+local function refreshReaderLauncher()
+    local rd = package.loaded["apps/reader/readerui"]
+    rd = rd and rd.instance
+    if not rd then return end
+    for _i, m in ipairs(rd) do
+        if type(m) == "table" and type(m._setupReaderButtons) == "function" then
+            pcall(function() m:_setupReaderButtons() end)
+            return
+        end
+    end
+end
+
 -- ─── Toggle helpers ───────────────────────────────────────────────────────────
 
 local function isTrue(key)
@@ -265,7 +281,7 @@ function Settings:_pickTokenFallback(dialog)
         if t.category ~= current_cat then
             current_cat = t.category
             items[#items + 1] = {
-                text           = "── " .. _(t.category) .. " ──",
+                text           = "── " .. Tokens.categoryLabel(t.category) .. " ──",
                 bold           = true,
                 select_enabled = false,
             }
@@ -1332,93 +1348,273 @@ end
 -- in the main bookshelf menu. Keeps the top level uncluttered while still
 -- giving each surface its own sub-screen.
 function Settings:_settingsSubItems()
-    local items = {
-        {
-            text     = _("Edit layout") .. "…",
-            help_text = _("Open a small overlay that lets you cycle through"
-                .. " bookshelf cover size and hero size with the bookshelf"
-                .. " visible behind it. Changes preview in realtime; Accept"
-                .. " keeps them, Cancel reverts."),
-            keep_menu_open = true,
-            callback = function(touchmenu_instance)
-                self:_openLayoutEditor(touchmenu_instance)
-            end,
-        },
-        {
-            text                = _("Cover display"),
-            sub_item_table_func = function()
-                return self:_coverDisplaySubItems()
-            end,
-        },
-        {
-            text                = _("Text size"),
-            sub_item_table_func = function()
-                return self:_textSizeSubItems()
-            end,
-        },
-        {
-            text                = _("Colors"),
-            sub_item_table_func = function()
-                return self:_colorsSubItems()
-            end,
-        },
-        {
-            text                = _("Expanded shelf"),
-            sub_item_table_func = function()
-                return self:_expandedShelfSubItems()
-            end,
-        },
-        -- Start-menu position: three-state radio. "left" (default; an
-        -- absent key reads as left), "right" mirrors the whole stack
-        -- (footer button, popup anchor, leftward flyout), "off" removes
-        -- the button and its d-pad slot entirely.
-        (function()
-            local function readPos()
-                local v = BookshelfSettings.read("start_menu_position", "left")
-                if v == "right" or v == "off" then return v end
-                return "left"
+    local items = {}
+
+    -- ── layout band: shelf grid + hero area ──
+    items[#items + 1] = {
+        text     = _("Edit shelf size") .. "…",
+        help_text = _("Open a small overlay that lets you set the number of"
+            .. " columns and rows of books on the shelf, with the bookshelf"
+            .. " visible behind it. Cover size follows the column count and"
+            .. " the hero area fills the space left over. Changes preview in"
+            .. " realtime; Accept keeps them, Cancel reverts."),
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            self:_openLayoutEditor(touchmenu_instance)
+        end,
+    }
+    items[#items + 1] = {
+        text                = _("Expanded shelf"),
+        sub_item_table_func = function()
+            return self:_expandedShelfSubItems()
+        end,
+    }
+    -- Micro-module placement: three INDEPENDENT surfaces (start menu / hero /
+    -- full-screen button), each a checkbox, so any combination can run at once.
+    -- Promoted here from Advanced so it sits directly above "Hero area starts
+    -- with" -- the row the hero checkbox governs -- which shows/hides live.
+    -- Turning all three off is the kill switch (microAnyEnabled() false).
+    items[#items + 1] = {
+        text_func = function()
+            if not BookshelfSettings.microAnyEnabled() then
+                return _("Micro modules") .. ": " .. _("Off")
             end
-            local labels = {
-                left  = _("Left"),
-                right = _("Right"),
-                off   = _("Off"),
-            }
-            local function optionRow(pos, label)
+            return _("Micro modules")
+        end,
+        help_text = _("Where micro-modules appear. Each surface is independent:"
+            .. " In start menu shows module cards in the start-menu launcher; In"
+            .. " hero area gives a chip that swaps the hero card for the grid;"
+            .. " Full-screen button adds a footer button opening a full-screen"
+            .. " grid. The hero and full-screen surfaces keep their own module"
+            .. " lists. Turn all three off to disable micro-modules entirely."),
+        sub_item_table_func = function()
+            -- Flip one surface. Snapshot the current (possibly still
+            -- legacy-derived) state of all three and persist them explicitly, so
+            -- after the first toggle we no longer depend on the old
+            -- micro_modules_placement key.
+            local function toggle(which, touchmenu_instance)
+                local sm   = BookshelfSettings.microInStartMenu()
+                local hero = BookshelfSettings.microInHero()
+                local fs   = BookshelfSettings.microFullscreenButton()
+                if     which == "start_menu" then sm   = not sm
+                elseif which == "hero"       then hero = not hero
+                elseif which == "fullscreen" then fs   = not fs end
+                BookshelfSettings.save("micro_in_start_menu", sm)
+                BookshelfSettings.save("micro_in_hero", hero)
+                BookshelfSettings.save("micro_fullscreen_button", fs)
+                BookshelfSettings.delete("micro_modules_placement")  -- fully migrated
+                BookshelfSettings.delete("micro_modules_disabled")   -- legacy
+                refreshReaderLauncher()
+                BookshelfSettings.flush()
+                if self._bw then
+                    if hero and BookshelfSettings.read("hero_area_mode") == "micro_modules" then
+                        self._bw._hero_mode = "micro"
+                        self._bw._expanded = false
+                    elseif (not hero) and self._bw._hero_mode == "micro" then
+                        -- Hero surface off: the chip that switches back is gone,
+                        -- so drop to the book hero.
+                        self._bw._hero_mode = "current"
+                    end
+                    if self._bw._rebuild then
+                        self._bw:_rebuild()
+                        UIManager:setDirty(self._bw, "ui")
+                    end
+                end
+                if touchmenu_instance and touchmenu_instance.updateItems then
+                    touchmenu_instance:updateItems()
+                end
+            end
+            local function row(which, label, accessor)
                 return {
                     text           = label,
-                    checked_func   = function() return readPos() == pos end,
+                    checked_func   = accessor,
+                    keep_menu_open = true,
+                    callback       = function(tmi) toggle(which, tmi) end,
+                }
+            end
+            return {
+                row("start_menu", _("In start menu"),     BookshelfSettings.microInStartMenu),
+                row("hero",       _("In hero area"),       BookshelfSettings.microInHero),
+                row("fullscreen", _("Full-screen button"), BookshelfSettings.microFullscreenButton),
+            }
+        end,
+    }
+    -- Hero-area-starts-with only matters when micro-modules are in the hero
+    -- area; hidden otherwise. Two-state radio: "currently_reading" (default)
+    -- shows the book hero; "micro_modules" shows the micro-module grid. Seeds
+    -- _hero_mode on each fresh widget; the chip-bar toggle owns the live
+    -- switch, and changing it here applies live too.
+    if BookshelfSettings.microInHero() then
+        items[#items + 1] = (function()
+            local function readMode()
+                local v = BookshelfSettings.read("hero_area_mode")
+                if v == "micro_modules" then return v end
+                return "currently_reading"
+            end
+            local labels = {
+                currently_reading = _("Currently reading"),
+                micro_modules     = _("Micro modules"),
+            }
+            local function setMode(mode, touchmenu_instance)
+                BookshelfSettings.save("hero_area_mode", mode)
+                if self._bw then
+                    self._bw._hero_mode =
+                        (mode == "micro_modules") and "micro" or "current"
+                    if mode == "micro_modules" then
+                        -- Leave the expanded strip state if we're entering
+                        -- micro mode, mirroring the chip handler.
+                        self._bw._expanded = false
+                    end
+                    if self._bw._rebuild then
+                        self._bw:_rebuild()
+                        UIManager:setDirty(self._bw, "ui")
+                    end
+                end
+                if touchmenu_instance and touchmenu_instance.updateItems then
+                    touchmenu_instance:updateItems()
+                end
+            end
+            local function optionRow(mode, label)
+                return {
+                    text           = label,
+                    checked_func   = function() return readMode() == mode end,
                     radio          = true,
                     keep_menu_open = true,
                     callback       = function(touchmenu_instance)
-                        BookshelfSettings.save("start_menu_position", pos)
-                        if self._bw and self._bw._rebuild then
-                            self._bw:_rebuild()
-                            UIManager:setDirty(self._bw, "ui")
-                        end
-                        if touchmenu_instance and touchmenu_instance.updateItems then
-                            touchmenu_instance:updateItems()
-                        end
+                        setMode(mode, touchmenu_instance)
                     end,
                 }
             end
             return {
                 text_func = function()
-                    return _("Start menu") .. ": " .. labels[readPos()]
+                    return _("Hero area starts with") .. ": " .. labels[readMode()]
                 end,
-                help_text = _("Where the start-menu button sits in the"
-                    .. " footer. Right moves the button and its menu to"
-                    .. " the bottom-right corner; Off hides the button"
-                    .. " entirely."),
+                help_text = _("What the hero area at the top of the bookshelf"
+                    .. " shows when it opens: the book you're currently"
+                    .. " reading, or a grid of micro-modules (clock, quote,"
+                    .. " random book, reading goals…). You can also switch"
+                    .. " between them with the chips above the shelves."),
                 sub_item_table_func = function()
                     return {
-                        optionRow("left",  labels.left),
-                        optionRow("right", labels.right),
-                        optionRow("off",   labels.off),
+                        optionRow("currently_reading", labels.currently_reading),
+                        optionRow("micro_modules",     labels.micro_modules),
                     }
                 end,
             }
-        end)(),
+        end)()
+    end
+    -- End the layout band on whatever is last (Hero area if shown, else
+    -- Micro-modules).
+    items[#items].separator = true
+
+    -- ── appearance band ──
+    items[#items + 1] = {
+        text                = _("Cover display"),
+        sub_item_table_func = function()
+            return self:_coverDisplaySubItems()
+        end,
     }
+    items[#items + 1] = {
+        text                = _("Text size"),
+        sub_item_table_func = function()
+            return self:_textSizeSubItems()
+        end,
+    }
+    items[#items + 1] = {
+        text                = _("Colors"),
+        sub_item_table_func = function()
+            return self:_colorsSubItems()
+        end,
+    }
+    -- Bookshelf UI font: promoted here from Advanced to sit with the other
+    -- appearance settings.
+    items[#items + 1] = {
+        text_func = function()
+            local Fonts = require("lib/bookshelf_fonts")
+            local f = Fonts.getUIFontFace()
+            local label = _("Follow KOReader")
+            if f then label = f:gsub("^.*/", ""):gsub("%.%w+$", "") end  -- basename, no extension
+            return T(_("Bookshelf UI font: %1"), label)
+        end,
+        help_text = _("The font Bookshelf uses for its own UI text (chips, "
+            .. "labels, metadata). Pick any installed font (same picker as the "
+            .. "hero card); '(Default)' follows your KOReader UI font. The hero "
+            .. "title and author have their own fonts in the hero card editor."),
+        keep_menu_open = true,
+        callback = function(touchmenu_instance) self:_pickBookshelfUIFont(touchmenu_instance) end,
+    }
+    items[#items].separator = true  -- end appearance band
+
+    -- ── start menu & reader band ──
+    -- Start-menu position: three-state radio. "left" (default; an absent key
+    -- reads as left), "right" mirrors the whole stack (footer button, popup
+    -- anchor, leftward flyout), "off" removes the button and its d-pad slot.
+    items[#items + 1] = (function()
+        local function readPos()
+            local v = BookshelfSettings.read("start_menu_position", "left")
+            if v == "right" or v == "off" then return v end
+            return "left"
+        end
+        local labels = {
+            left  = _("Left"),
+            right = _("Right"),
+            off   = _("Off"),
+        }
+        local function optionRow(pos, label)
+            return {
+                text           = label,
+                checked_func   = function() return readPos() == pos end,
+                radio          = true,
+                keep_menu_open = true,
+                callback       = function(touchmenu_instance)
+                    BookshelfSettings.save("start_menu_position", pos)
+                    refreshReaderLauncher()
+                    if self._bw and self._bw._rebuild then
+                        self._bw:_rebuild()
+                        UIManager:setDirty(self._bw, "ui")
+                    end
+                    if touchmenu_instance and touchmenu_instance.updateItems then
+                        touchmenu_instance:updateItems()
+                    end
+                end,
+            }
+        end
+        return {
+            text_func = function()
+                return _("Start menu") .. ": " .. labels[readPos()]
+            end,
+            help_text = _("Where the start-menu button sits in the"
+                .. " footer. Right moves the button and its menu to"
+                .. " the bottom-right corner; Off hides the button"
+                .. " entirely."),
+            sub_item_table_func = function()
+                return {
+                    optionRow("left",  labels.left),
+                    optionRow("right", labels.right),
+                    optionRow("off",   labels.off),
+                }
+            end,
+        }
+    end)()
+    -- In-reader launcher (opt-in, off by default): a small persistent button
+    -- in the reader's bottom corner that opens the start menu. Registered at
+    -- reader init, so it takes effect the next time a book is opened.
+    items[#items + 1] = {
+        text = _("Show launcher button while reading"),
+        help_text = _("Adds a small Bookshelf button to the bottom corner of"
+            .. " the reader that opens the start menu. Takes effect the next"
+            .. " time you open a book."),
+        checked_func = function()
+            return BookshelfSettings.read("reader_launcher_button", false) == true
+        end,
+        callback = function()
+            local on = BookshelfSettings.read("reader_launcher_button", false) == true
+            BookshelfSettings.save("reader_launcher_button", not on)
+            refreshReaderLauncher()
+        end,
+    }
+    items[#items].separator = true  -- end start menu & reader band
+
     -- "Hardcover enrichment" was promoted to the top-level Bookshelf menu
     -- (below Manage collections) -- see main.lua addToMainMenu. It no longer
     -- lives under Settings.
@@ -2117,6 +2313,7 @@ end
 function Settings:_advancedSubItems()
     local plugin = self._plugin
     return {
+        -- ── library & metadata ──
         {
             text     = _("Scan all library metadata"),
             callback = function(touchmenu_instance)
@@ -2124,12 +2321,6 @@ function Settings:_advancedSubItems()
                     UIManager:close(touchmenu_instance)
                 end
                 UIManager:nextTick(function() plugin:scanAllMetadata() end)
-            end,
-        },
-        {
-            text                = _("Performance tweaks"),
-            sub_item_table_func = function()
-                return self:_performanceSubItems()
             end,
         },
         {
@@ -2208,6 +2399,50 @@ function Settings:_advancedSubItems()
             end,
         },
         {
+            text = _("Include folder names in search results"),
+            help_text = _("When searching, also match the names of folders in"
+                .. " your library and list them as folder results. Off by"
+                .. " default: most libraries file books into author, series or"
+                .. " genre folders, so a matching folder just duplicates the"
+                .. " author / series / genre result of the same name. Turn on"
+                .. " if you navigate by folder and want folders in search."),
+            checked_func   = function()
+                return BookshelfSettings.read("search_include_folders") == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local enabled = BookshelfSettings.read("search_include_folders") == true
+                BookshelfSettings.save("search_include_folders", not enabled)
+                BookshelfSettings.flush()
+            end,
+        },
+        {
+            text = _("Sort Chinese text by pinyin"),
+            help_text = _("Sorts Chinese characters by their Mandarin "
+                .. "pinyin reading, so Chinese titles and authors file "
+                .. "alphabetically alongside Latin names. When off, "
+                .. "Chinese text sorts in Unicode order (roughly by "
+                .. "radical and stroke count), after Latin names. "
+                .. "Japanese kanji are also affected, so leave this off "
+                .. "for Japanese-language libraries."),
+            checked_func   = function()
+                return BookshelfSettings.read("cjk_pinyin_sort") == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local enabled = BookshelfSettings.read("cjk_pinyin_sort") == true
+                BookshelfSettings.save("cjk_pinyin_sort", not enabled)
+                -- No explicit cache invalidation needed: the save bumps the
+                -- settings generation, and the sort engine re-reads the flag
+                -- (and epoch-invalidates its per-record keys) on the next
+                -- sort. The rebuild below triggers that sort.
+                if self._bw and self._bw._rebuild then
+                    self._bw:_rebuild()
+                    UIManager:setDirty(self._bw, "ui")
+                end
+            end,
+        },
+        {
             text_func = function()
                 local ImageSource = require("lib/bookshelf_image_source")
                 local p = ImageSource.getImageLibraryPath()
@@ -2224,6 +2459,33 @@ function Settings:_advancedSubItems()
             callback = function(touchmenu_instance)
                 self:_pickImageLibraryPath(touchmenu_instance)
             end,
+        },
+        {
+            text = _("BETA: Read calibre metadata.calibre"),
+            help_text = _("For users with a Calibre-managed library. "
+                .. "Reads the metadata.calibre JSON file at home_dir to "
+                .. "cover title / authors / series / tags / language for "
+                .. "every book in the library — no per-book extraction "
+                .. "needed. BIM-cached metadata still wins per field; "
+                .. "Calibre data only fills gaps."),
+            checked_func   = function()
+                return BookshelfSettings.read("calibre_metadata") == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local enabled = BookshelfSettings.read("calibre_metadata") == true
+                BookshelfSettings.save("calibre_metadata", not enabled)
+                local ok, Repo = pcall(require, "lib/bookshelf_book_repository")
+                if ok and Repo and Repo.invalidateWalkCache then
+                    Repo.invalidateWalkCache()
+                end
+                if self._bw and self._bw._rebuild then
+                    self._bw:_rebuild()
+                    UIManager:setDirty(self._bw, "ui")
+                end
+            end,
+            -- End the library & metadata band.
+            separator = true,
         },
         {
             text = _("Double tap to open books"),
@@ -2267,21 +2529,16 @@ function Settings:_advancedSubItems()
                 local enabled = BookshelfSettings.nilOrTrue("show_close_msg")
                 BookshelfSettings.save("show_close_msg", not enabled)
             end,
+            -- End the reading behaviour band.
+            separator = true,
         },
         {
-            text_func = function()
-                local Fonts = require("lib/bookshelf_fonts")
-                local f = Fonts.getUIFontFace()
-                local label = _("Follow KOReader")
-                if f then label = f:gsub("^.*/", ""):gsub("%.%w+$", "") end  -- basename, no extension
-                return T(_("Bookshelf UI font: %1"), label)
+            text                = _("Performance tweaks"),
+            sub_item_table_func = function()
+                return self:_performanceSubItems()
             end,
-            help_text = _("The font Bookshelf uses for its own UI text (chips, "
-                .. "labels, metadata). Pick any installed font (same picker as the "
-                .. "hero card); '(Default)' follows your KOReader UI font. The hero "
-                .. "title and author have their own fonts in the hero card editor."),
-            keep_menu_open = true,
-            callback = function(touchmenu_instance) self:_pickBookshelfUIFont(touchmenu_instance) end,
+            -- End the performance band (before the resets).
+            separator = true,
         },
         {
             text     = _("Reset chip bar to defaults"),
@@ -2355,57 +2612,6 @@ function Settings:_advancedSubItems()
                         end
                     end,
                 })
-            end,
-        },
-        {
-            text = _("Sort Chinese text by pinyin"),
-            help_text = _("Sorts Chinese characters by their Mandarin "
-                .. "pinyin reading, so Chinese titles and authors file "
-                .. "alphabetically alongside Latin names. When off, "
-                .. "Chinese text sorts in Unicode order (roughly by "
-                .. "radical and stroke count), after Latin names. "
-                .. "Japanese kanji are also affected, so leave this off "
-                .. "for Japanese-language libraries."),
-            checked_func   = function()
-                return BookshelfSettings.read("cjk_pinyin_sort") == true
-            end,
-            keep_menu_open = true,
-            callback = function()
-                local enabled = BookshelfSettings.read("cjk_pinyin_sort") == true
-                BookshelfSettings.save("cjk_pinyin_sort", not enabled)
-                -- No explicit cache invalidation needed: the save bumps the
-                -- settings generation, and the sort engine re-reads the flag
-                -- (and epoch-invalidates its per-record keys) on the next
-                -- sort. The rebuild below triggers that sort.
-                if self._bw and self._bw._rebuild then
-                    self._bw:_rebuild()
-                    UIManager:setDirty(self._bw, "ui")
-                end
-            end,
-        },
-        {
-            text = _("BETA: Read calibre metadata.calibre"),
-            help_text = _("For users with a Calibre-managed library. "
-                .. "Reads the metadata.calibre JSON file at home_dir to "
-                .. "cover title / authors / series / tags / language for "
-                .. "every book in the library — no per-book extraction "
-                .. "needed. BIM-cached metadata still wins per field; "
-                .. "Calibre data only fills gaps."),
-            checked_func   = function()
-                return BookshelfSettings.read("calibre_metadata") == true
-            end,
-            keep_menu_open = true,
-            callback = function()
-                local enabled = BookshelfSettings.read("calibre_metadata") == true
-                BookshelfSettings.save("calibre_metadata", not enabled)
-                local ok, Repo = pcall(require, "lib/bookshelf_book_repository")
-                if ok and Repo and Repo.invalidateWalkCache then
-                    Repo.invalidateWalkCache()
-                end
-                if self._bw and self._bw._rebuild then
-                    self._bw:_rebuild()
-                    UIManager:setDirty(self._bw, "ui")
-                end
             end,
         },
     }
@@ -2513,71 +2719,61 @@ end
 function Settings:_openLayoutEditor(touchmenu_instance)
     local ButtonDialog = require("ui/widget/buttondialog")
 
-    local function readHero()
-        local v = BookshelfSettings.read("hero_size")
-        if v == "large" then return "large" end
-        return "regular"  -- absorbs legacy "small"/"medium"/missing
-    end
-    local function readBookshelf()
-        local v = BookshelfSettings.read("bookshelf_size") or "medium"
-        if v == "small" or v == "large" then return v end
-        return "medium"
-    end
-
-    local original_hero       = readHero()
-    local original_bookshelf  = readBookshelf()
+    local bw = self._bw
+    -- Snapshot the stored values (may be nil = legacy/unset) so Cancel can
+    -- restore the exact prior state, including "never set".
+    local original_columns = BookshelfSettings.read("bookshelf_columns")
+    local original_rows    = BookshelfSettings.read("bookshelf_rows")
 
     local restoreMenu = self._plugin:hideMenu(touchmenu_instance)
 
-    local hero_order      = { "regular", "large" }
-    local bookshelf_order = { "small", "medium", "large" }
-    local hero_label      = { regular = _("Regular"), large = _("Large") }
-    local bookshelf_label = { small = _("Small"), medium = _("Medium"), large = _("Large") }
-
-    local function cycle(order, current)
-        for i, v in ipairs(order) do
-            if v == current then return order[(i % #order) + 1] end
-        end
-        return order[1]
+    -- Effective current grid, reading through the widget so an unset (legacy)
+    -- value still shows the real column/row count being rendered.
+    local function curCols()
+        return (bw and bw._nCols and bw:_nCols()) or 4
     end
+    local function curRows()
+        return (bw and bw._baseShelves and bw:_baseShelves()) or 2
+    end
+    local function maxRows()
+        return (bw and bw._maxShelfRows and bw:_maxShelfRows()) or 6
+    end
+    local COLS_MIN, COLS_MAX = 2, 6
 
     local function rebuild()
-        if self._bw and self._bw._rebuild then
-            self._bw:_rebuild()
-            UIManager:setDirty(self._bw, "ui")
+        if bw and bw._rebuild then
+            bw:_rebuild()
+            UIManager:setDirty(bw, "ui")
         end
-    end
-
-    -- When max_rows < 3, Regular and Large hero collapse to the same row
-    -- count (both clamp to 1 via max(1, n_max - eaten)). The cycle button
-    -- locks in that case so the user isn't toggling a setting that has
-    -- no visible effect.
-    local function heroLocked()
-        return self._bw and self._bw._maxRows and self._bw:_maxRows() < 3
-    end
-    local function heroDisplay()
-        if heroLocked() then return "regular" end
-        return readHero()
     end
 
     local dialog
-    local function cycleHero()
-        BookshelfSettings.save("hero_size", cycle(hero_order, readHero()))
+    local function nudgeCols(delta)
+        local v = math.max(COLS_MIN, math.min(COLS_MAX, curCols() + delta))
+        BookshelfSettings.save("bookshelf_columns", v)
         rebuild()
         Focus.reinit(dialog)
     end
-    local function cycleBookshelf()
-        BookshelfSettings.save("bookshelf_size", cycle(bookshelf_order, readBookshelf()))
+    local function nudgeRows(delta)
+        local v = math.max(1, math.min(maxRows(), curRows() + delta))
+        BookshelfSettings.save("bookshelf_rows", v)
         rebuild()
         Focus.reinit(dialog)
+    end
+    local function restore(key, val)
+        if val == nil then
+            BookshelfSettings.delete(key)
+        else
+            BookshelfSettings.save(key, val)
+        end
     end
     local function close()
         UIManager:close(dialog)
         restoreMenu()
     end
     local function cancel()
-        BookshelfSettings.save("hero_size",      original_hero)
-        BookshelfSettings.save("bookshelf_size", original_bookshelf)
+        restore("bookshelf_columns", original_columns)
+        restore("bookshelf_rows", original_rows)
         rebuild()
         close()
     end
@@ -2588,22 +2784,21 @@ function Settings:_openLayoutEditor(touchmenu_instance)
 
     dialog = ButtonDialog:new{
         dismissable = false,  -- explicit Cancel/Accept; tap-outside disabled
-        title = _("Edit layout"),
-        width_factor = 0.5,
+        title = _("Edit shelf size"),
+        width_factor = 0.6,
 
         buttons = {
             {
-                { text_func    = function()
-                      return _("Book: ") .. hero_label[heroDisplay()]
-                  end,
-                  enabled_func = function() return not heroLocked() end,
-                  callback     = cycleHero },
+                { text = "−", callback = function() nudgeCols(-1) end },
+                { text_func = function() return _("Columns: ") .. curCols() end,
+                  enabled = false },
+                { text = "+", callback = function() nudgeCols(1) end },
             },
             {
-                { text_func = function()
-                      return _("Bookshelf: ") .. bookshelf_label[readBookshelf()]
-                  end,
-                  callback = cycleBookshelf },
+                { text = "−", callback = function() nudgeRows(-1) end },
+                { text_func = function() return _("Rows: ") .. curRows() end,
+                  enabled = false },
+                { text = "+", callback = function() nudgeRows(1) end },
             },
             {
                 { text = _("Cancel"), callback = cancel },
@@ -2660,6 +2855,72 @@ function Settings:_pickFontScale(touchmenu_instance)
     dialog = ButtonDialog:new{
         dismissable = false,  -- nudge-dialog lockdown; see _pickCoverBadgeFontScale
         title = _("Book detail font scale"),
+        buttons = {
+            {
+                { text = "-10",  callback = function() nudge(-10) end },
+                { text = "-5",   callback = function() nudge(-5)  end },
+                { text_func = function() return tostring(getValue()) .. "%" end,
+                  enabled = false },
+                { text = "+5",   callback = function() nudge(5)   end },
+                { text = "+10",  callback = function() nudge(10)  end },
+            },
+            {
+                { text = _("Cancel"), callback = function() revert(); close() end },
+                { text = _("Default"),
+                  callback = function() setValue(100); rebuild(); Focus.reinit(dialog) end },
+                { text = _("Apply"), is_enter_default = true, callback = close },
+            },
+        },
+        tap_close_callback = revert,
+    }
+    if dialog.movable then dialog.movable.ges_events = {} end
+    UIManager:show(dialog)
+end
+
+-- Hero micro-modules size knob (issue #180). Same nudge-dialog shape as
+-- _pickFontScale, but a SEPARATE key so the micro-module grid scales
+-- independently of the currently-reading card / status line. It's a multiplier
+-- on each module's cell auto-fit (100 = unchanged), so lower renders the modules
+-- smaller with more whitespace. Live preview = the bookshelf rebuild behind.
+function Settings:_pickHeroModuleFontScale(touchmenu_instance)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local key = "hero_module_font_scale"
+    local original = BookshelfSettings.read(key, 100)
+    local restoreMenu = self._plugin:hideMenu(touchmenu_instance)
+
+    local function getValue() return BookshelfSettings.read(key, 100) end
+    local function setValue(v)
+        v = math.max(50, math.min(200, v))
+        BookshelfSettings.save(key, v)
+    end
+    local function rebuild()
+        if Settings._bw and Settings._bw._rebuild then
+            Settings._bw:_rebuild()
+            UIManager:setDirty(Settings._bw, "ui")
+        end
+        if touchmenu_instance and touchmenu_instance.updateItems then
+            touchmenu_instance:updateItems()
+        end
+    end
+
+    local dialog
+    local function nudge(delta)
+        setValue(getValue() + delta)
+        rebuild()
+        Focus.reinit(dialog)
+    end
+    local function close()
+        UIManager:close(dialog)
+        restoreMenu()
+    end
+    local function revert()
+        setValue(original)
+        rebuild()
+    end
+
+    dialog = ButtonDialog:new{
+        dismissable = false,
+        title = _("Hero micro-modules font scale"),
         buttons = {
             {
                 { text = "-10",  callback = function() nudge(-10) end },
@@ -2926,8 +3187,15 @@ function Settings:_textSizeSubItems()
             end,
         }
     end
+    -- Prefix the two hero rows with their chip glyphs so they read as a pair and
+    -- map onto the on-screen chips: open-book (U+E7BD) = currently-reading hero,
+    -- view-grid (U+EC6F) = micro-module hero. Glyphs render via KOReader's
+    -- symbols-font fallback, same as the chips.
+    local HERO_BOOK = "\xEE\x9E\xBD  "
+    local HERO_GRID = "\xEE\xB1\xAF  "
     return {
-        row(_("Hero card"),             "font_scale",                100, "_pickFontScale"),
+        row(HERO_BOOK .. _("Hero card"),         "font_scale",             100, "_pickFontScale"),
+        row(HERO_GRID .. _("Hero micro-modules"),"hero_module_font_scale", 100, "_pickHeroModuleFontScale"),
         row(_("Chip bar"),              "chip_font_scale",           100, "_pickChipFontScale"),
         row(_("Stack & folder labels"), "stack_label_font_scale",    100, "_pickStackLabelFontScale"),
         row(_("Expanded shelf labels"), "expanded_shelf_font_scale", 100, "_pickExpandedShelfFontScale"),

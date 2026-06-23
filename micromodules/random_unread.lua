@@ -30,6 +30,7 @@ frees it after each paint), and module render output is rebuilt per paint —
 a shared cover bb across rebuilds reads freed memory.
 ]]
 local _ = require("lib/bookshelf_i18n").gettext
+local SafeText = require("lib/bookshelf_text_safe")
 
 -- Group-card sources have no flat book list to draw from; for those chips
 -- the pick falls back to the whole library ("library" = flattened walk).
@@ -228,12 +229,15 @@ end
 return {
     key   = "random_unread", -- stable id stored in user menus; never change it
     title = _("Random book"),
-    render = function(width, scale_pct)
+    summary = _("From your library. Works offline."),
+    render = function(ctx)
+        local width, scale_pct = ctx.width, ctx.scale
         local Blitbuffer    = require("ffi/blitbuffer")
         local Fonts         = require("lib/bookshelf_fonts")
         local TextWidget    = require("ui/widget/textwidget")
         local VerticalGroup = require("ui/widget/verticalgroup")
-        local CARD_BG = require("lib/bookshelf_start_menu_modules").CARD_BG
+        local SM = require("lib/bookshelf_start_menu_modules")
+        local CARD_BG = SM.CARD_BG
         local mw = math.max(50, width)
         local function sc(n) return math.max(1, math.floor(n * (scale_pct or 100) / 100 + 0.5)) end
         local statuses = readStatuses()
@@ -243,25 +247,19 @@ return {
                 text = unreadOnly(statuses) and _("Nothing unread here")
                     or _("Nothing to pick from here"),
                 face = Fonts:getFace("cfont", sc(15)),
-                fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+                fgcolor = SM.COLOR_MUTED,
                 max_width = mw,
             }
         end
         local TextBoxWidget  = require("ui/widget/textboxwidget")
-        local HorizontalGroup = require("ui/widget/horizontalgroup")
-        local HorizontalSpan  = require("ui/widget/horizontalspan")
+        local VerticalSpan   = require("ui/widget/verticalspan")
         local Screen = require("device").screen
-        -- The die hugs the card's bottom-right corner: the text block takes
-        -- a FIXED width (mw minus die and gap — the title TextBoxWidget
-        -- always occupies the full text_w, so the die's x never moves as
-        -- the title wraps over 1-3 lines) and the bottom alignment pins the
-        -- die to the block's baseline edge. Its face tumbles on every
-        -- re-roll.
-        -- The glyph's font box carries descender space below the ink, so a
-        -- bottom-aligned TextWidget shows extra padding under the die. PUA
-        -- icon glyphs render above the baseline, so forcing the widget's
-        -- height to its own baseline trims the box to the ink bottom and
-        -- the die sits with even bottom/right padding in the card.
+        -- The die sits BELOW the title/author (its own row in the vertical
+        -- flow), left-aligned with the text. Its face tumbles on every re-roll.
+        -- The glyph's font box carries descender space below the ink; PUA icon
+        -- glyphs render above the baseline, so forcing the widget's height to
+        -- its own baseline trims the box to the ink bottom and the die sits
+        -- tight under the text rather than with a tall blank gap.
         local die_face = Fonts:getFace("cfont", sc(38))
         local die_text = DICE[(_pick_cache and _pick_cache.die) or 1]
         local probe = TextWidget:new{ text = die_text, face = die_face }
@@ -271,12 +269,12 @@ return {
         local die = TextWidget:new{
             text = die_text,
             face = die_face,
-            fgcolor = Blitbuffer.COLOR_BLACK,
+            fgcolor = SM.COLOR_PRIMARY,
             forced_height   = die_ink_h,
             forced_baseline = die_ink_h,
         }
         local gap = Screen:scaleBySize(sc(8))
-        local text_w = math.max(50, mw - die:getSize().w - gap)
+        local text_w = mw  -- die is below now, so the text spans the full width
         local face_title, bold_title = Fonts:getFace("cfont", sc(15), {bold=true})
         local group = VerticalGroup:new{
             align = "left",
@@ -286,15 +284,15 @@ return {
                 text = unreadOnly(statuses) and _("Try something new:")
                     or _("Why not this one:"),
                 face = Fonts:getFace("cfont", sc(13), {italic=true}),
-                fgcolor = Blitbuffer.COLOR_BLACK,
+                fgcolor = SM.COLOR_MUTED,
                 max_width = text_w,
             },
             TextBoxWidget:new{
-                text  = b.title or b.filename or "?",
+                text  = SafeText.safe(b.title or b.filename or "?"),
                 face  = face_title,
                 bold  = bold_title,
                 width = text_w,
-                fgcolor = Blitbuffer.COLOR_BLACK,
+                fgcolor = SM.COLOR_PRIMARY,
                 -- TextBoxWidget paints an opaque background (unlike
                 -- TextWidget); match the module card's grey or the title
                 -- sits on a white bar.
@@ -303,18 +301,16 @@ return {
         }
         if b.author and b.author ~= "" then
             group[#group + 1] = TextWidget:new{
-                text = b.author,
+                text = SafeText.safe(b.author),
                 face = Fonts:getFace("cfont", sc(14)),
-                fgcolor = Blitbuffer.COLOR_BLACK,
+                fgcolor = SM.COLOR_PRIMARY,
                 max_width = text_w,
             }
         end
-        return HorizontalGroup:new{
-            align = "bottom",
-            group,
-            HorizontalSpan:new{ width = gap },
-            die,
-        }
+        -- Die on its own row beneath the title/author.
+        group[#group + 1] = VerticalSpan:new{ width = gap }
+        group[#group + 1] = die
+        return group
     end,
     show_settings = showSettings,
     -- keep_open: the menu stays up while the hero changes underneath it,

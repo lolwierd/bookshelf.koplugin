@@ -156,9 +156,16 @@ end
 -- whole point of segmenting is to keep glyphs out of the bold path,
 -- so non-bold lines have nothing to gain. The returned widget always
 -- has a getSize() so callers' width math works.
-local function _buildSegmentedInline(text, face, bold)
-    if not bold or not text:find("[\x80-\xFF]") then
-        return TextWidget:new{ text = text, face = face, bold = bold or false }
+local function _buildSegmentedInline(text, face, bold, max_width, truncate_left)
+    -- max_width set => truncate to one line with an ellipsis (issue #170). The
+    -- segmented icon/bold path can't be partially truncated, so a clamped side
+    -- always uses the plain TextWidget path (loses the per-segment bold split on
+    -- that side only, which is an overflow edge case). truncate_left puts the
+    -- ellipsis at the START (used for the right-aligned, after-spacer side so its
+    -- right-anchored tail -- battery/wifi/etc -- stays and the cut sits by the spacer).
+    if max_width or not bold or not text:find("[\x80-\xFF]") then
+        return TextWidget:new{ text = text, face = face, bold = bold or false,
+            max_width = max_width, truncate_left = truncate_left or false }
     end
     local segments = TextSegments.labelSegments(text)
     if #segments <= 1 then
@@ -297,10 +304,29 @@ end
 -- segmented path loses line wrapping; reserved for short single-line
 -- content like the status clock line, which is the common case for
 -- icon-bearing region templates.)
-local function buildText(text, region, width)
+local function buildText(text, region, width, max_height)
+    -- [font=NAME] whole-region override (issue #144): when the text is wrapped
+    -- in a single [font=NAME]...[/font] spanning the whole content, render this
+    -- region in that font -- FACE ONLY; size, bold and alignment stay from the
+    -- region. Lets a template conditionally pick a font (e.g.
+    -- [if:lang=ja][font=...]%title[/font][else]...[/if]) on top of the line
+    -- editor's default. An unresolvable name falls back to the region font;
+    -- partial / mid-line [font] tags are stripped (inline spans unsupported).
+    local override_face
+    -- Apply the FIRST [font=NAME] found anywhere to the WHOLE region, not only
+    -- when it wraps the entire line. Mid-line spans aren't supported, so if a
+    -- font tag is present at all the whole line takes that font (text outside
+    -- the tag included). After a conditional resolves only one branch's [font]
+    -- survives, so the first match is the right one.
+    local fname = text:match("%[font=([^%]]+)%]")
+    if fname then
+        local file = BFont.resolveFontNameToFile(fname)
+        if file then override_face = fontFace(file, region.font_size) end
+    end
+    text = text:gsub("%[font=[^%]]*%]", ""):gsub("%[/font%]", "")
     local rendered = text
     if region.uppercase then rendered = TextSegments.upper(rendered) end
-    local face = regionFace(region)
+    local face = override_face or regionFace(region)
     local is_bold = region.bold or false
     if is_bold and rendered:find("[\x80-\xFF]") and not rendered:find("\n") then
         local segments = TextSegments.labelSegments(rendered)
@@ -339,6 +365,12 @@ local function buildText(text, region, width)
         -- 0.3 default. Only the title region sets this today; other
         -- regions fall through to the default leading.
         line_height = region.line_height,
+        -- Optional height cap (the title in a short hero): truncate with an
+        -- ellipsis rather than wrapping unbounded. height_adjust keeps short
+        -- text tight (shrinks to natural height, no reserved gap below).
+        height                        = max_height,
+        height_adjust                 = max_height and true or nil,
+        height_overflow_show_ellipsis = max_height and true or nil,
     }
 end
 
@@ -363,11 +395,17 @@ function HeroCard.buildStatusRow(book, state, width, with_hairline)
     local regions = Regions.read()
     if not regions.status or regions.status.disabled then return nil end
     if not book then return nil end
-    local status_text = Tokens.expand(regions.status.template, book, state)
+    -- This is the FULL-WIDTH status line (micro-module hero + full-screen
+    -- overlay), so [if:full_width]…[/if] in the template activates here but not
+    -- in the narrow cover-view status (_buildRightColumn, which passes the raw
+    -- state). A metatable proxy adds the flag without mutating the shared,
+    -- cached device_state.
+    local st = setmetatable({ full_width = true }, { __index = state })
+    local status_text = Tokens.expand(regions.status.template, book, st)
     status_text = status_text:gsub("%[/?[biu]%]", "")
     if Tokens.isEmpty(status_text) then return nil end
     local vg = VerticalGroup:new{ align = "left" }
-    vg[#vg + 1] = buildLine(status_text, regions.status, width, book)
+    vg[#vg + 1] = buildLine(status_text, regions.status, width, book, nil, true)
     if with_hairline then
         vg[#vg + 1] = LineWidget:new{
             dimen      = Geom:new{ w = width, h = Size.line.medium },
@@ -386,7 +424,7 @@ end
 -- trailing segment are stripped so they don't render as literal text.
 -- Assigned (not `local function`) so the forward declaration above
 -- resolves; HeroCard.buildStatusRow references this by name.
-buildLine = function(expanded, region, width, book)
+buildLine = function(expanded, region, width, book, max_height, single_line)
     -- Locate the first elastic token (%bar or %spacer), whichever appears
     -- earliest. Same one-shot semantics either way.
     local bar_pos    = expanded:find(BAR_TOKEN_PATTERN)
@@ -398,7 +436,28 @@ buildLine = function(expanded, region, width, book)
         first_pos, first_pattern, kind = spacer_pos, SPACER_TOKEN_PATTERN, "spacer"
     end
     if not first_pattern then
-        return buildText(expanded, region, width)
+        -- single_line (the status strip): no elastic token, but the line must
+        -- stay one line -- truncate instead of wrapping (issue #170). The
+        -- truncated TextWidget is sized to its own (clamped) text width, so it
+        -- ignores region.alignment on its own; wrap it in the matching alignment
+        -- container sized to the full width so left/center/right work again
+        -- (issue #182 regression). The ellipsis sits on the end the alignment
+        -- does NOT anchor to: right-aligned keeps its right (ellipsis at start),
+        -- otherwise keep the left (ellipsis at end).
+        if single_line then
+            local display   = region.uppercase and TextSegments.upper(expanded) or expanded
+            local alignment = region.alignment or "left"
+            local seg = _buildSegmentedInline(display, regionFace(region),
+                region.bold or false, width, alignment == "right")
+            local dimen = Geom:new{ w = width, h = seg:getSize().h }
+            if alignment == "center" then
+                return CenterContainer:new{ dimen = dimen, seg }
+            elseif alignment == "right" then
+                return RightContainer:new{ dimen = dimen, seg }
+            end
+            return LeftContainer:new{ dimen = dimen, seg }
+        end
+        return buildText(expanded, region, width, max_height)
     end
 
     -- Split on the FIRST occurrence of the winning token. Defensively
@@ -420,19 +479,15 @@ buildLine = function(expanded, region, width, book)
 
     local face = regionFace(region)
 
-    local used_w = 0
-    local b_widget = nil
-    if before ~= "" then
-        local display = region.uppercase and TextSegments.upper(before) or before
-        b_widget = _buildSegmentedInline(display, face, region.bold or false)
-        used_w = used_w + b_widget:getSize().w
+    -- Build a text side, optionally clamped to max_w (truncates, one line).
+    local function mkseg(text, max_w, trunc_left)
+        local display = region.uppercase and TextSegments.upper(text) or text
+        return _buildSegmentedInline(display, face, region.bold or false, max_w, trunc_left)
     end
-    local a_widget = nil
-    if after ~= "" then
-        local display = region.uppercase and TextSegments.upper(after) or after
-        a_widget = _buildSegmentedInline(display, face, region.bold or false)
-        used_w = used_w + a_widget:getSize().w
-    end
+    local b_widget = before ~= "" and mkseg(before) or nil
+    local a_widget = after  ~= "" and mkseg(after)  or nil
+    local b_w = b_widget and b_widget:getSize().w or 0
+    local a_w = a_widget and a_widget:getSize().w or 0
 
     -- Boundary gap: padding.small only kicks in for %bar (the bar has a
     -- visible body that benefits from breathing room from adjacent text)
@@ -444,13 +499,36 @@ buildLine = function(expanded, region, width, book)
     local apply_gap  = (kind == "bar")
     local before_gap = (apply_gap and b_widget and not before:match("%s$")) and Size.padding.small or 0
     local after_gap  = (apply_gap and a_widget and not after:match("^%s"))  and Size.padding.small or 0
-    local elastic_w  = math.max(0, width - used_w - before_gap - after_gap)
 
-    if elastic_w < 1 then
-        -- No room for the elastic widget. Render text only, joined.
+    -- #170: a %spacer line must stay on ONE line within `width`. When the two
+    -- sides together overflow, the centred HorizontalGroup renders at its
+    -- natural (over-)width and spills LEFT over the cover. Truncate to fit,
+    -- the RIGHT side first (keep the left text whole); only if the left alone
+    -- still doesn't fit is the left truncated too (and the right dropped).
+    if kind == "spacer" and (b_w + a_w) > width then
+        -- Reserve a little separation so a truncated line reads
+        -- "4:27 PM   …right", not "4:27 PM…right" -- the leftover becomes the
+        -- elastic span (gap) between the two sides.
+        local trunc_gap = Size.padding.large
+        if a_widget and (b_w + trunc_gap) < width then
+            -- truncate_left: the after-spacer side is right-aligned, so keep its
+            -- right-anchored tail and put the ellipsis by the spacer (issue #170).
+            a_widget = mkseg(after, math.max(0, width - b_w - trunc_gap), true)
+            a_w = a_widget:getSize().w
+        else
+            a_widget, a_w = nil, 0
+            if b_widget then b_widget = mkseg(before, width); b_w = b_widget:getSize().w end
+        end
+    end
+
+    local used_w    = b_w + a_w
+    local elastic_w = math.max(0, width - used_w - before_gap - after_gap)
+
+    if kind == "bar" and elastic_w < 1 then
+        -- No room for the bar. Render text only, joined.
         local joined = before
         if after ~= "" then joined = joined ~= "" and (joined .. " " .. after) or after end
-        return buildText(joined ~= "" and joined or "", region, width)
+        return buildText(joined ~= "" and joined or "", region, width, max_height)
     end
 
     local elastic_widget
@@ -542,7 +620,7 @@ function HeroCard:_buildRightColumn(book, regions, state, dimen)
         local status_text = Tokens.expand(regions.status.template, book, state)
         status_text = status_text:gsub("%[/?[biu]%]", "")
         if not Tokens.isEmpty(status_text) then
-            local status_widget = buildLine(status_text, regions.status, right_w, book)
+            local status_widget = buildLine(status_text, regions.status, right_w, book, nil, true)
             local hairline_widget = LineWidget:new{
                 dimen      = Geom:new{ w = right_w, h = Size.line.medium },
                 background = Blitbuffer.gray(0.4),
@@ -680,10 +758,38 @@ function HeroCard:_buildRightColumn(book, regions, state, dimen)
         local title_text = Tokens.expand(regions.title.template, book, state)
         title_text = title_text:gsub("%[/?[biu]%]", "")
         if not Tokens.isEmpty(title_text) then
-            local face = regionFace(regions.title)
-            title_text = balanceLines(title_text, face, right_w,
-                                      regions.title.bold or false)
-            right_top[#right_top + 1] = buildLine(title_text, regions.title, right_w, book)
+            local title_face = regionFace(regions.title)
+            -- Skip widow-balancing when a [font=...] tag is present: balanceLines
+            -- measures with the region face (not the tag's) and could split the
+            -- tag across lines, breaking buildText's whole-region [font] match.
+            -- The title just greedy-wraps in that case (issue #144).
+            if not title_text:find("%[font=") then
+                title_text = balanceLines(title_text, title_face, right_w,
+                                          regions.title.bold or false)
+            end
+            -- Cap the title so the top block (status/rating already placed +
+            -- title + the author/metadata lines still to come) fits the hero.
+            -- A long title then truncates with an ellipsis instead of wrapping
+            -- unbounded and pushing author/metadata out of a short hero. Tall
+            -- heros leave a large cap so normal titles never truncate;
+            -- height_adjust keeps short titles tight. Always >= 1 title line.
+            local title_lh = (title_face.size or 16) * (1 + (regions.title.line_height or 0.3))
+            local top_used = 0  -- status + rating placed above the title so far
+            for i = 1, #right_top do
+                local g = right_top[i]:getSize()
+                top_used = top_used + (g and g.h or 0)
+            end
+            local function regionLineH(r)
+                if not r or r.disabled then return 0 end
+                local f = regionFace(r)
+                return (f.size or 14) * 1.35
+            end
+            local reserve = regionLineH(regions.author)
+                + regionLineH(regions.metadata) + Size.padding.default * 2
+            local max_title_h = math.max(math.floor(title_lh),
+                cover_h - top_used - reserve)
+            right_top[#right_top + 1] =
+                buildLine(title_text, regions.title, right_w, book, max_title_h)
         end
     end
 
@@ -713,6 +819,7 @@ function HeroCard:_buildRightColumn(book, regions, state, dimen)
     -- column, which would tear down the pill widget too if we reused
     -- one. Gap below so the pills don't run straight into the progress
     -- text.
+    local tags_n = 0  -- right_bottom elements the tags block contributes (for progressive-hide)
     if regions.tags and not regions.tags.disabled and self.tags_builder then
         local ok, widget = pcall(self.tags_builder, book)
         if ok and widget then
@@ -738,6 +845,7 @@ function HeroCard:_buildRightColumn(book, regions, state, dimen)
                 right_bottom[#right_bottom + 1] = VerticalSpan:new{
                     width = Size.padding.default + Screen:scaleBySize(4),
                 }
+                tags_n = 2  -- the AlignContainer + the gap span above
             end
         end
     end
@@ -761,6 +869,45 @@ function HeroCard:_buildRightColumn(book, regions, state, dimen)
         end
         if not Tokens.isEmpty(progress_text) then
             right_bottom[#right_bottom + 1] = buildLine(progress_text, regions.progress, right_w, book)
+        end
+    end
+
+    -- Progressive hide: when the hero is too short to fit the top block
+    -- (status/rating/title/author/metadata) AND the bottom block, trim the
+    -- bottom block — tags first (least essential), then the progress line —
+    -- until they fit cover_h. This is the same idea the description already
+    -- uses (it self-limits to leftover slack); extending it to tags/progress
+    -- keeps title/author readable when a small hero (e.g. after a pinch-zoom
+    -- to many columns + rows) would otherwise cram the regions on top of each
+    -- other. Title/author/metadata are kept; the description, added next,
+    -- budgets itself against whatever bottom block survives.
+    do
+        local breath = Size.padding.default
+        -- Sum child heights directly rather than calling the GROUP's getSize():
+        -- the group caches per-child paint offsets on getSize(), and the
+        -- description is appended to right_top AFTER this, so a premature group
+        -- getSize() here would leave the offset table one short at paint time
+        -- (nil-index crash). Per-child getSize() is safe — those children don't
+        -- change.
+        local function sumChildren(group)
+            local h = 0
+            for i = 1, #group do
+                local g = group[i].getSize and group[i]:getSize()
+                h = h + (g and g.h or 0)
+            end
+            return h
+        end
+        local function overflows()
+            return (sumChildren(right_top) + sumChildren(right_bottom) + breath) > cover_h
+        end
+        if overflows() and tags_n > 0 then
+            for _i = 1, tags_n do table.remove(right_bottom, 1) end
+            if right_bottom.resetLayout then right_bottom:resetLayout() end
+            tags_n = 0
+        end
+        if overflows() then
+            while #right_bottom > 0 do table.remove(right_bottom) end
+            if right_bottom.resetLayout then right_bottom:resetLayout() end
         end
     end
 

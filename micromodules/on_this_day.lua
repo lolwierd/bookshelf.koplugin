@@ -5,6 +5,7 @@ Tap cycles through different events.
 ]]
 local _ = require("lib/bookshelf_i18n").gettext
 local T = require("ffi/util").template
+local SafeText = require("lib/bookshelf_text_safe")
 
 -- ─── HTTP helper ─────────────────────────────────────────────────────────────
 local function httpGetJSON(url)
@@ -79,7 +80,9 @@ local function fetchOTD(force, callback)
                 for i = 1, math.min(10, #data.events) do
                     table.insert(events, {
                         year = data.events[i].year,
-                        text = data.events[i].text
+                        -- Wikipedia event text is untrusted; sanitise before
+                        -- caching/rendering to avoid a shaper crash (#163).
+                        text = SafeText.safe(data.events[i].text)
                     })
                 end
                 
@@ -100,6 +103,10 @@ local function fetchOTD(force, callback)
     end)
 end
 
+-- Parent-provided scoped refresh, stashed by render(); the async OTD fetch
+-- nudges just this card when it lands. nil until a host that passes it (the
+-- 5th render arg) renders us — works in the hero grid AND the start menu.
+local _async_refresh = nil
 local _implicit_fetch_pending = false
 
 local function maybeScheduleImplicitFetch()
@@ -109,8 +116,8 @@ local function maybeScheduleImplicitFetch()
     UIManager:scheduleIn(0.1, function()
         fetchOTD(false, function(result)
             _implicit_fetch_pending = false
-            if result then
-                UIManager:setDirty(nil, "ui")
+            if result and _async_refresh then
+                _async_refresh()  -- parent-scoped; works in the hero AND the menu
             end
         end)
     end)
@@ -133,9 +140,13 @@ end
 return {
     key   = "otd",
     title = _("On This Day"),
+    summary = _("From Wikipedia. Needs internet."),
+    network = { "en.wikipedia.org" },
     keep_open = true,
 
-    render = function(width, scale_pct, is_preview)
+    render = function(ctx)
+        local width, scale_pct, is_preview, _avail_h, refresh = ctx.width, ctx.scale, ctx.preview, ctx.height, ctx.refresh
+        _async_refresh = refresh
         local Blitbuffer      = require("ffi/blitbuffer")
         local Fonts           = require("lib/bookshelf_fonts")
         local TextWidget      = require("ui/widget/textwidget")
@@ -146,7 +157,8 @@ return {
 
         local mw = math.max(50, width)
         local function sc(n) return math.max(1, math.floor(n * (scale_pct or 100) / 100 + 0.5)) end
-        local BLACK, GRAY = Blitbuffer.COLOR_BLACK, Blitbuffer.COLOR_DARK_GRAY
+        local SM = require("lib/bookshelf_start_menu_modules")
+        local BLACK, GRAY = SM.COLOR_PRIMARY, SM.COLOR_MUTED
 
         if is_preview then
             local VG = require("ui/widget/verticalgroup")
@@ -165,6 +177,18 @@ return {
         end
 
         local data = Store.read(KEY_DATA)
+
+        -- Invalidate stale cache from a previous day
+        local current_day = os.date("%Y-%m-%d")
+        local cached_day = Store.read(KEY_DAY, "")
+        if data and current_day ~= cached_day then
+            data = nil
+            Store.save(KEY_DATA, nil)
+            _pages_cache = nil
+            _total_pages = 1
+            _view_index = 1
+        end
+
         if data and #data > 10 then
             local limited = {}
             for i = 1, 10 do table.insert(limited, data[i]) end

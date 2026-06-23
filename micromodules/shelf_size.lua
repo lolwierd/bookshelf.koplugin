@@ -42,7 +42,12 @@ end
 return {
     key   = "shelf_size", -- stable id stored in user menus; never change it
     title = _("Shelf size"),
-    render = function(width, scale_pct)
+    summary = _("From your library. Works offline."),
+    -- avail_h (4th arg) is accepted for signature parity with the hero grid;
+    -- the status table's wrap decision is width-driven (below) so it adapts in
+    -- both the start menu and the hero.
+    render = function(ctx)
+        local width, scale_pct, _preview, avail_h = ctx.width, ctx.scale, ctx.preview, ctx.height
         local Blitbuffer      = require("ffi/blitbuffer")
         local Fonts           = require("lib/bookshelf_fonts")
         local TextWidget      = require("ui/widget/textwidget")
@@ -50,11 +55,12 @@ return {
         local VerticalSpan    = require("ui/widget/verticalspan")
         local HorizontalGroup = require("ui/widget/horizontalgroup")
         local HorizontalSpan  = require("ui/widget/horizontalspan")
-        local CenterContainer = require("ui/widget/container/centercontainer")
+        local LeftContainer   = require("ui/widget/container/leftcontainer")
         local Geom            = require("ui/geometry")
+        local SM              = require("lib/bookshelf_start_menu_modules")
         local mw = math.max(50, width)
         local function sc(n) return math.max(1, math.floor(n * (scale_pct or 100) / 100 + 0.5)) end
-        local BLACK = Blitbuffer.COLOR_BLACK
+        local BLACK = SM.COLOR_PRIMARY
 
         local total, counts = getCounts()
 
@@ -67,7 +73,7 @@ return {
         local big_tw = TextWidget:new{ text = tostring(total), face = big_face,
             bold = big_bold, fgcolor = BLACK }
         local books_tw = TextWidget:new{ text = _("Books"), face = books_face,
-            bold = books_bold, fgcolor = BLACK }
+            bold = books_bold, fgcolor = SM.COLOR_MUTED }
         local dy = math.max(0, big_tw:getBaseline() - books_tw:getBaseline())
         local header = HorizontalGroup:new{
             align = "top",
@@ -76,30 +82,56 @@ return {
             VerticalGroup:new{ align = "left", VerticalSpan:new{ width = dy }, books_tw },
         }
 
-        -- Status table: a column per status, label heading over its count.
-        local col_w      = math.floor(mw / #STATUS_ROWS)
+        -- Status table: label heading over its count, one cell per status.
+        -- A single row of #STATUS_ROWS columns reads well in a wide cell but
+        -- cramps in a narrow / square / portrait one, so wrap to 2 columns
+        -- (2 rows) there. ONLY in the hero grid (avail_h given): the start
+        -- menu (avail_h nil) keeps the original single row, because its cards
+        -- are narrow AND the menu sizes its panel to each card's height — a
+        -- taller wrapped card there would inflate the panel past the screen
+        -- and destabilise the start-menu layout. Gating on avail_h keeps the
+        -- menu's behaviour exactly as it shipped.
         local head_face  = Fonts:getFace("cfont", sc(12))
         local count_face, count_bold = Fonts:getFace("cfont", sc(18), {bold=true})
-        local table_row  = HorizontalGroup:new{ align = "top" }
-        for _i, st in ipairs(STATUS_ROWS) do
+        local n_status   = #STATUS_ROWS
+        -- Status columns are spread evenly across the module width (one equal
+        -- slot each), with each column's label + count LEFT-aligned within its
+        -- slot. The leftmost column lines up with the big total above it, and
+        -- the row fills the width evenly (issue #185 -- centred content left the
+        -- total stranded against the spread row). A single wide row cramps in a
+        -- narrow / square cell, so wrap to 2 columns there.
+        local status_cols = (avail_h and math.floor(mw / n_status) < sc(70))
+            and 2 or n_status
+        local col_w      = math.floor(mw / status_cols)
+        local function statusCol(st)
             local col = VerticalGroup:new{
-                align = "center",
-                TextWidget:new{ text = st.label, face = head_face, fgcolor = BLACK,
+                align = "left",
+                TextWidget:new{ text = st.label, face = head_face, fgcolor = SM.COLOR_MUTED,
                     max_width = col_w },
                 VerticalSpan:new{ width = sc(2) },
                 TextWidget:new{ text = tostring(counts[st.id] or 0),
                     face = count_face, bold = count_bold, fgcolor = BLACK,
                     max_width = col_w },
             }
-            table_row[#table_row + 1] = CenterContainer:new{
+            return LeftContainer:new{
                 dimen = Geom:new{ w = col_w, h = col:getSize().h }, col }
+        end
+        local table_block = VerticalGroup:new{ align = "left" }
+        local row
+        for i, st in ipairs(STATUS_ROWS) do
+            if (i - 1) % status_cols == 0 then
+                if row then table_block[#table_block + 1] = VerticalSpan:new{ width = sc(6) } end
+                row = HorizontalGroup:new{ align = "top" }
+                table_block[#table_block + 1] = row
+            end
+            row[#row + 1] = statusCol(st)
         end
 
         return VerticalGroup:new{
             align = "left",
             header,
             VerticalSpan:new{ width = sc(6) },
-            table_row,
+            table_block,
         }
     end,
 }

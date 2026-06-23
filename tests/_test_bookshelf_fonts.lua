@@ -112,6 +112,8 @@ test("seed: fresh install sets Roboto Condensed face id + seeds hero", function(
     BFont.maybeSeedFreshInstall()
     eq(settings.bookshelf_ui_font, "RobotoCondensed-Regular.ttf", "fresh -> Roboto Condensed face id")
     eq(settings.author_format, "first_last", "fresh -> author format First Last")
+    eq(settings.chip_flex_widths, true, "fresh -> flexible chip widths (issue 176)")
+    eq(settings.micro_modules_placement, "fullscreen", "fresh -> full-screen micro-module button")
     eq(seeded_hero, true, "fresh -> hero seeded")
     eq(settings.bookshelf_fonts_seeded, true, "marker set")
 end)
@@ -123,6 +125,8 @@ test("seed: existing user (file present) left on follow", function()
     BFont.maybeSeedFreshInstall()
     eq(settings.bookshelf_ui_font, nil, "existing user -> no UI font (follow)")
     eq(settings.author_format, nil, "existing user -> author format untouched")
+    eq(settings.chip_flex_widths, nil, "existing user -> chip widths untouched")
+    eq(settings.micro_modules_placement, nil, "existing user -> placement untouched")
     eq(seeded_hero, false, "existing user -> hero NOT reseeded")
     eq(settings.bookshelf_fonts_seeded, true, "marker still set")
 end)
@@ -131,6 +135,32 @@ test("seed: runs only once", function()
     settings.bookshelf_fonts_seeded = true
     BFont.maybeSeedFreshInstall()
     eq(settings.bookshelf_ui_font, nil, "already-seeded -> no-op")
+end)
+
+test("getUIFontFace: unresolvable stored face degrades to follow (issue 168)", function()
+    -- The seeded RobotoCondensed default was dropped from KOReader v2026.03, so
+    -- its face no longer loads; getUIFontFace must NOT hand that name back (a
+    -- caller passes it straight to a KOReader Button whose Font:getFace returns
+    -- nil and crashes). It degrades to follow (nil) instead.
+    settings.bookshelf_ui_font = "RobotoCondensed-Regular.ttf"
+    missing["RobotoCondensed-Regular.ttf"] = true
+    eq(BFont.getUIFontFace(), nil, "unloadable stored face must degrade to follow")
+end)
+
+test("getUIFontFace: a loadable stored face is returned as-is", function()
+    settings.bookshelf_ui_font = "/f/Bar-Regular.ttf"
+    eq(BFont.getUIFontFace(), "/f/Bar-Regular.ttf", "loadable face returned unchanged")
+end)
+
+test("getUIFontFace: probe passes a size to getFace (issue 175)", function()
+    -- A nil size makes the real font.lua fall back to sizemap[face]=nil and
+    -- crash in Screen:scaleBySize(nil). Use a face value no other test touches
+    -- so the per-value cache doesn't short-circuit the probe.
+    settings.bookshelf_ui_font = "/f/Probe175-Regular.ttf"
+    BFont.getUIFontFace()
+    assert(last ~= nil, "probe must call Font:getFace")
+    assert(type(last.size) == "number" and last.size > 0,
+        "probe must pass a positive size; got " .. tostring(last and last.size))
 end)
 
 io.write(("bookshelf_fonts: %d passed, %d failed\n"):format(pass, fail))

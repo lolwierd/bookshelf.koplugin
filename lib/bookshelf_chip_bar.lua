@@ -968,9 +968,15 @@ end
 
 function ChipBar:focusCursor(key)
     if not self._chip_dimens then return end
+    local prev_key = self.focused_key
     self.focused_key = key
     self:_initChips()
     if not self.show_parent or not self.dimen then return end
+    -- Re-focusing the same chip changes nothing, so skip the (unscoped) full
+    -- refresh -- it needlessly repainted the whole widget, including the hero,
+    -- which flashed the cover on panels that lay dithering down with a strong
+    -- waveform (issue #124, fix found by the reporter @jospalau).
+    if prev_key == key then return end
     UIManager:setDirty(self.show_parent, "ui")
 end
 
@@ -1043,8 +1049,10 @@ function ChipBar:onHoldStrip(_, ges)
             local d = self._chip_dimens[chip.key]
             if d and x >= d.x and x < d.x + d.w then
                 -- Skip action chips (search, currently-reading) -- they have
-                -- no editable settings; long-press there is a no-op.
-                if not chip.action and self.on_hold then
+                -- no editable settings; long-press there is a no-op. An action
+                -- chip can opt back in with chip.holdable (e.g. the modules
+                -- chip, whose long-press opens the micro-module options menu).
+                if (not chip.action or chip.holdable) and self.on_hold then
                     self.on_hold(chip.key)
                 end
                 return true
