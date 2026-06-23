@@ -1054,8 +1054,6 @@ end
 -- onTapCloseMenu + onClose + showFileManager. We keep onTapCloseMenu
 -- (otherwise the menu overlay lingers above the new layer) and replace
 -- the rest based on whether Bookshelf is the live home.
--- `force` re-installs the callback even when we've already wrapped this
--- menu instance. Needed because another home-screen-replacement plugin can
 -- Persistent in-reader launcher button (opt-in via reader_launcher_button).
 -- Registers a ReaderView module that paints the hamburger into the reader frame
 -- (survives page turns, no e-ink ghosting -- the Bookends overlay mechanism),

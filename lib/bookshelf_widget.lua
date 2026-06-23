@@ -10045,12 +10045,14 @@ function BookshelfWidget:_openBookMenu(item)
                         on_tap = function()
                             -- Leave the book menu OPEN underneath: the browser
                             -- shows on top, and closing it returns to the menu.
-                            local FileManager = require("apps/filemanager/filemanager")
+                            local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+                            local parent_ui = (ok_fm and FileManager and FileManager.instance) or nil
+                            if not parent_ui then return end
                             -- files must be a SET keyed by filepath:
                             -- getBookList iterates `for file in pairs(files)`
                             -- and uses the KEY as the path (an array would
                             -- yield integer keys -> a downstream crash).
-                            BookmarkBrowser:show({ [fp] = true }, FileManager.instance)
+                            BookmarkBrowser:show({ [fp] = true }, parent_ui)
                         end,
                     }
                 end
