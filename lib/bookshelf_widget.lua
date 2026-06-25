@@ -2617,6 +2617,14 @@ function BookshelfWidget:_fetchChipItems(n)
             or tip.kind == "genre" or tip.kind == "tag"
             or tip.kind == "format" or tip.kind == "rating"
             or tip.kind == "language") then
+        -- Re-apply the within-group sort on EVERY fetch, not just at drill time.
+        -- A return-from-book rebuild restores the drill payload fresh, and the
+        -- tag restore rebuilds .books in non-deterministic pairs() order, so
+        -- without this the drilled view shows random order until you re-enter
+        -- the collection (#205). Re-sorting also lets a just-opened book pick up
+        -- its new last-opened position. Idempotent while paging (order is stable
+        -- unless a book was opened).
+        self:_applyWithinGroupSort(tip.payload)
         local books = tip.payload.books or {}
         local total = #books
         -- Cursor-based: offset is 0-based, cursor is 1-based. Clamp upstream
