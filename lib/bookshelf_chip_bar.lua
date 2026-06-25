@@ -442,16 +442,22 @@ function ChipBar:_initChips()
         flex_naturals[j] = measureNatural(self.chips[idx], self.height, _scaled)
     end
 
+    -- Page chevrons are narrower than the action buttons: a chevron glyph
+    -- needs far less width than search/current, and a slimmer cell keeps the
+    -- chip area roomier (a comfortable tap target remains, and swipe also pages).
+    local chevron_w = math.floor(self.height * 1.1)
+    self._chevron_w = chevron_w
+
     -- Pagination: avail is the room left for flex chips + any chevrons after
-    -- the fixed action slots and their separators. chevron_w == action_w
-    -- (chevrons are action-sized cells); Pages accounts for inter-chip spacing.
+    -- the fixed action slots and their separators. Pages reserves chevron_w on
+    -- pages with a neighbour and accounts for inter-chip spacing.
     local avail = self.width - action_w * action_count - separator_w * action_count
 
     self._pages = Pages.paginate{
         widths    = flex_naturals,
         spacing   = separator_w,
         avail     = avail,
-        chevron_w = action_w,
+        chevron_w = chevron_w,
     }
 
     -- Determine current page from selected_key (active chip key).
@@ -558,30 +564,34 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
         end
     end
 
-    -- Count action + chevron entries in render_chips for width allocation.
+    -- Chevron cells are narrower than the action buttons (see _initChips).
+    local chevron_w = self._chevron_w or action_w
+    -- Sum the fixed (action + chevron) widths so the visible flex chips can
+    -- claim exactly the rest. Chevrons (chip._page_dir) use chevron_w; real
+    -- action chips use action_w.
     local n_render  = #render_chips
-    local n_action_render = 0
-    local n_flex_render   = 0
+    local fixed_total = 0
     for _, chip in ipairs(render_chips) do
-        if chip.action then
-            n_action_render = n_action_render + 1
-        else
-            n_flex_render = n_flex_render + 1
+        if chip._page_dir then
+            fixed_total = fixed_total + chevron_w
+        elseif chip.action then
+            fixed_total = fixed_total + action_w
         end
     end
 
     -- Flex width available to visible flex chips in render_chips.
     local sep_total_render = separator_w * (n_render - 1)
-    local flex_render_total = self.width - sep_total_render - action_w * n_action_render
+    local flex_render_total = self.width - sep_total_render - fixed_total
 
-    -- Per-chip widths for rendered entries.
-    -- Action + chevron chips get action_w.
-    -- Visible flex chips share flex_render_total using the same
-    -- equal-share / proportional logic as before.
+    -- Per-chip widths for rendered entries. Chevrons get chevron_w, other
+    -- action chips action_w; visible flex chips share flex_render_total using
+    -- the same equal-share / proportional logic as before.
     local render_widths = {}
     local flex_render_indices = {}  -- indices into render_chips of flex entries
     for ri, chip in ipairs(render_chips) do
-        if chip.action then
+        if chip._page_dir then
+            render_widths[ri] = chevron_w
+        elseif chip.action then
             render_widths[ri] = action_w
         else
             flex_render_indices[#flex_render_indices + 1] = ri
