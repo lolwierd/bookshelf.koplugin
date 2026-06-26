@@ -50,6 +50,40 @@ local function stripModules(items)
     return out
 end
 
+-- Drop menu-action shortcuts whose captured menu item doesn't resolve in the
+-- current view's menu (reader vs file manager) -- so each auto-appears only
+-- where it works (#211). Display-only: folders are shallow-copied when their
+-- children change, never mutating the stored model. Fail-open via
+-- MenuShortcut.isAvailable (shows everything if the menu tree can't be built).
+local function filterByMenuAvailability(items)
+    local ok_ms, MS = pcall(require, "lib/bookshelf_menu_shortcut")
+    if not ok_ms or not MS or type(MS.isAvailable) ~= "function" then return items end
+    local function keep(e)
+        if type(e) == "table" and type(e.menu_path) == "table" then
+            return MS.isAvailable(e.menu_path)
+        end
+        return true
+    end
+    local out = {}
+    for _i, e in ipairs(items) do
+        if keep(e) then
+            if e.type == "folder" and e.children then
+                local kids = {}
+                for _j, c in ipairs(e.children) do
+                    if keep(c) then kids[#kids + 1] = c end
+                end
+                local copy = {}
+                for k, v in pairs(e) do copy[k] = v end
+                copy.children = kids
+                out[#out + 1] = copy
+            else
+                out[#out + 1] = e
+            end
+        end
+    end
+    return out
+end
+
 -- Paints its single child at a fixed offset within the overlay.
 local OffsetContainer = WidgetContainer:extend{ x_off = 0, y_off = 0 }
 function OffsetContainer:getSize()
@@ -174,6 +208,12 @@ function StartMenu:_loadItems()
     -- Hide entries scoped to the other context (library vs the in-reader
     -- launcher). nil scope shows in both, so default menus are unaffected.
     items = Model.filterByScope(items, self.context or "library")
+    -- Hide menu-action shortcuts whose captured menu item doesn't exist in the
+    -- CURRENT view's menu (reader vs file manager), so a shortcut auto-appears
+    -- only where it works -- no "not available" tap, no manual scoping (#211).
+    -- Display-only (like the scope filter); folder entries are shallow-copied
+    -- when their children change so the stored model is never mutated.
+    items = filterByMenuAvailability(items)
     return items
 end
 

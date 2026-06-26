@@ -215,6 +215,20 @@ function MenuShortcut.toggleState(menu_path)
     return v and true or false
 end
 
+-- Whether a menu shortcut should be shown in the CURRENT view: its captured
+-- path resolves to a callable leaf in the active UI's menu (reader vs file
+-- manager). Lets the start menu hide shortcuts that don't exist here, so each
+-- auto-appears only where it works -- no "not available" tap (#211).
+-- Fail-OPEN: a non-table path, or a menu tree that can't be built (transient
+-- MenuSorter error), returns true so shortcuts never vanish on a hiccup.
+function MenuShortcut.isAvailable(menu_path)
+    if type(menu_path) ~= "table" then return true end
+    local tree = MenuShortcut.buildMenuTree()
+    if type(tree) ~= "table" then return true end
+    local leaf = MenuShortcut.walk(tree, menu_path)
+    return type(leaf) == "table" and type(leaf.callback) == "function"
+end
+
 -- Replay a saved menu_path: re-assemble the menu, walk to the leaf, fire its
 -- callback with a minimal touchmenu shim. Fail safe: any miss -> toast, no fire.
 function MenuShortcut.replay(menu_path)
