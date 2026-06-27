@@ -233,6 +233,7 @@ local ReviewsModal = FocusManager:extend{
     -- bar (the book-detail cover + metadata header). Rebuilt on each re-layout.
     header_builder = nil,
     on_refresh = nil,   -- optional callback fired by the Refresh button
+    on_open    = nil,   -- optional; wires an "Open" footer button (opens the book)
     on_close   = nil,   -- optional callback fired once when the modal is
                         -- genuinely dismissed (NOT on Refresh, which reopens).
                         -- Used to return to the caller (e.g. the book menu)
@@ -297,18 +298,20 @@ function ReviewsModal:init()
         header_h = probe and probe:getSize().h or 0
     end
 
-    -- Refresh only makes sense when the caller supplied an on_refresh (the
-    -- reviews use it to re-fetch). Reused for plain HTML content (e.g. a book
-    -- description), where there's nothing to refresh, it's omitted and only
-    -- Close remains.
+    -- Footer row: Close | (Refresh) | zoom - | zoom + | Open. Close on the left,
+    -- Open on the right; the zoom controls sit between.
     local button_row = {}
+    button_row[#button_row + 1] = {
+        text = _("Close"),
+        callback = function() self:onClose() end,
+    }
+    -- Refresh only when a caller supplied on_refresh (unused by the book-detail
+    -- popup; reviews load cache-first). Kept for any other caller.
     if self.on_refresh then
         button_row[#button_row + 1] = {
             text = _("Refresh"),
             callback = function()
                 local cb = self.on_refresh
-                -- Refresh reopens the modal, so suppress the
-                -- return-on-close callback for this close.
                 self._suppress_close_cb = true
                 self:onClose()
                 if cb then cb() end
@@ -330,10 +333,17 @@ function ReviewsModal:init()
         font_bold = false,
         callback = function() self:_changeFontSize(DESC_FONT_STEP) end,
     }
-    button_row[#button_row + 1] = {
-        text = _("Close"),
-        callback = function() self:onClose() end,
-    }
+    -- Open the book (closes the popup first). Only when a caller wired on_open.
+    if self.on_open then
+        button_row[#button_row + 1] = {
+            text = _("Open"),
+            callback = function()
+                local cb = self.on_open
+                self:onClose()
+                if cb then cb() end
+            end,
+        }
+    end
     -- Keep the row spec; the footer ButtonTable is rebuilt FRESH each _assemble
     -- (merging its layout into the modal's nils it, so a reused one would lose
     -- its focus layout after the first tab switch).

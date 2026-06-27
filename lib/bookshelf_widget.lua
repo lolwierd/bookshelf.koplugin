@@ -9310,6 +9310,9 @@ function BookshelfWidget:_showBookDetail(book, opts)
         tabs       = tabs,
         active_tab = active_tab,
         on_close   = opts.on_close,
+        -- "Open" footer button opens the book in the reader (the popup closes
+        -- first via onClose). _openBook handles stale files + the Kobo path.
+        on_open    = function() self:_openBook(book) end,
         -- Cover + metadata header in place of a title bar. Rebuilt fresh on each
         -- layout by the modal (cover bb is one-shot); no pills here (Tags tab),
         -- no bookmark button.
