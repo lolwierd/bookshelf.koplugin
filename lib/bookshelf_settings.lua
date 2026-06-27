@@ -2687,32 +2687,30 @@ function Settings:_advancedSubItems()
         },
     }
 
-    -- Kobo virtual-library shelf (beta). Only offered on Kobo where OGKevin's
-    -- kobo.koplugin is present + active (isAvailable() is false everywhere else),
-    -- so the option never clutters non-Kobo devices. Toggling rebuilds so the
-    -- "Kobo" chip appears/disappears immediately.
-    local ok_kobo, KoboSource = pcall(require, "lib/bookshelf_kobo_source")
-    if ok_kobo and KoboSource and KoboSource.isAvailable() then
-        items[#items + 1] = {
-            text = _("BETA: Kobo library shelf"),
-            help_text = _("Adds a \"Kobo\" chip that surfaces your Kobo "
-                .. "virtual library (the books managed by the Kobo store / "
-                .. "OGKevin's kobo.koplugin) as a Bookshelf shelf. Read-only; "
-                .. "covers and opening depend on that plugin. Kobo devices only."),
-            checked_func = function()
-                return BookshelfSettings.read("kobo_shelf") == true
-            end,
-            keep_menu_open = true,
-            callback = function()
-                local enabled = BookshelfSettings.read("kobo_shelf") == true
-                BookshelfSettings.save("kobo_shelf", not enabled)
-                if self._bw and self._bw._rebuild then
-                    self._bw:_rebuild()
-                    UIManager:setDirty(self._bw, "ui")
-                end
-            end,
-        }
-    end
+    -- Kobo virtual-library shelf (beta). Always listed (like the calibre beta
+    -- toggle) so Kobo users can reliably find and enable it -- on non-Kobo
+    -- devices the option simply does nothing, because the "Kobo" chip is
+    -- separately gated on this setting AND KoboSource.isAvailable() (false
+    -- off-Kobo). Toggling rebuilds so the chip appears/disappears immediately.
+    items[#items + 1] = {
+        text = _("BETA: Kobo library shelf"),
+        help_text = _("Adds a \"Kobo\" chip that surfaces your Kobo "
+            .. "virtual library (the books managed by the Kobo store / "
+            .. "OGKevin's kobo.koplugin) as a Bookshelf shelf. Read-only; "
+            .. "covers and opening depend on that plugin. Kobo devices only."),
+        checked_func = function()
+            return BookshelfSettings.read("kobo_shelf") == true
+        end,
+        keep_menu_open = true,
+        callback = function()
+            local enabled = BookshelfSettings.read("kobo_shelf") == true
+            BookshelfSettings.save("kobo_shelf", not enabled)
+            if self._bw and self._bw._rebuild then
+                self._bw:_rebuild()
+                UIManager:setDirty(self._bw, "ui")
+            end
+        end,
+    }
     return items
 end
 
