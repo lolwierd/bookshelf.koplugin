@@ -9033,33 +9033,36 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         bw:_rebuild(); UIManager:setDirty(bw, "ui")
     end } }
 
-    -- Third-party file-dialog buttons (e.g. Incognito). Wrap each so it closes
-    -- the popup first, since those callbacks expect a file-dialog context.
+    -- Third-party file-dialog buttons (e.g. Incognito). Run their specs RAW --
+    -- exactly as the old long-press menu did -- rather than wrapping them to
+    -- close the popup first; a plugin callback that opens the reader triggers our
+    -- onShowingReader handler, which closes the popup cleanly. Pre-closing the
+    -- popup before the callback ran was a deviation from the proven path.
     local plugin_rows = bw:_fileDialogPluginRows(book.filepath)
     if plugin_rows then
         rows[#rows + 1] = {}  -- separator
         for _i = 1, #plugin_rows do
-            local prow = plugin_rows[_i]
-            for _j = 1, #prow do
-                local b = prow[_j]
-                local orig = b.callback
-                if orig then b.callback = function() closeModal(); orig() end end
-            end
-            rows[#rows + 1] = prow
+            rows[#rows + 1] = plugin_rows[_i]
         end
     end
 
-    local pad = Screen:scaleBySize(20)
-    local sb  = ScrollableContainer:getScrollbarWidth()
-    local bt  = ButtonTable:new{
-        width       = avail_w - 2 * pad - sb,
-        buttons     = rows,
-        show_parent = modal,
-    }
+    -- Edge-to-edge button grid: no horizontal padding, so the outer button
+    -- borders meet the modal frame on both sides. Build full-width first; if the
+    -- grid is taller than the tab body it will scroll, so rebuild it
+    -- scrollbar-width narrower to leave the bar its own strip (ScrollableContainer
+    -- crops the content by that width only when scrollable -- otherwise the right
+    -- column would be clipped under the bar). When it fits, no bar, full width.
+    local sb         = ScrollableContainer:getScrollbarWidth()
+    local pad_top    = Screen:scaleBySize(20)
+    local pad_bottom = Screen:scaleBySize(10)
+    local bt = ButtonTable:new{ width = avail_w, buttons = rows, show_parent = modal }
+    if bt:getSize().h + pad_top + pad_bottom > avail_h then
+        bt = ButtonTable:new{ width = avail_w - sb, buttons = rows, show_parent = modal }
+    end
     local padded = FrameContainer:new{
         bordersize = 0, margin = 0,
-        padding_left = pad, padding_right = pad + sb,
-        padding_top = Screen:scaleBySize(20), padding_bottom = Screen:scaleBySize(10),
+        padding_left = 0, padding_right = 0,
+        padding_top = pad_top, padding_bottom = pad_bottom,
         bt,
     }
     return ScrollableContainer:new{

@@ -95,22 +95,34 @@ function TabBar:init()
     self.border     = Screen:scaleBySize(2)
     self.face       = Font:getFace("cfont", Screen:scaleBySize(13))
 
-    self._labels, self._tab_x, self._tab_w = {}, {}, {}
+    -- Pack tabs into rows that fit self.width, wrapping when the next tab would
+    -- overflow (so a narrow screen / high DPI keeps every tab reachable instead
+    -- of clipping the right-hand ones off-screen). Each tab records its row.
+    self._labels, self._tab_x, self._tab_w, self._tab_row = {}, {}, {}, {}
     local x = self.left_inset
+    local row = 1
     local label_h = 0
     for i, label in ipairs(self.tabs) do
         local tw = TextWidget:new{ text = label, face = self.face }
         self._labels[i] = tw
         local sz = tw:getSize()
-        self._tab_w[i] = sz.w + 2 * self.pad_h
-        self._tab_x[i] = x
-        x = x + self._tab_w[i]
+        local w  = sz.w + 2 * self.pad_h
+        if x > self.left_inset and (x + w) > self.width then
+            row = row + 1            -- wrap
+            x = self.left_inset
+        end
+        self._tab_x[i]   = x
+        self._tab_w[i]   = w
+        self._tab_row[i] = row
+        x = x + w
         if sz.h > label_h then label_h = sz.h end
     end
+    self._n_rows = row
+    self._row_h  = label_h + 2 * self.pad_v
     self.dimen = Geom:new{
         x = 0, y = 0,
         w = self.width,
-        h = self.top_pad + label_h + 2 * self.pad_v + self.border,
+        h = self.top_pad + self._n_rows * self._row_h + self.border,
     }
     if Device:isTouchDevice() then
         self.ges_events = {
@@ -123,32 +135,40 @@ function TabBar:getSize() return self.dimen end
 
 function TabBar:paintTo(bb, x, y)
     self.dimen.x, self.dimen.y = x, y
-    local border      = self.border
-    local box_top     = y + self.top_pad     -- gap above the tabs
-    local baseline_y  = y + self.dimen.h - border
-    local box_h       = baseline_y - box_top
-    -- Full-width baseline.
-    bb:paintRect(x, baseline_y, self.dimen.w, border, Blitbuffer.COLOR_BLACK)
-    -- Active tab box: top + left + right (no bottom), square corners.
-    local ax = x + self._tab_x[self.active]
-    local aw = self._tab_w[self.active]
-    bb:paintRect(ax, box_top, aw, border, Blitbuffer.COLOR_BLACK)                  -- top
-    bb:paintRect(ax, box_top, border, box_h, Blitbuffer.COLOR_BLACK)              -- left
-    bb:paintRect(ax + aw - border, box_top, border, box_h, Blitbuffer.COLOR_BLACK) -- right
-    -- Open the bottom: erase the baseline under the active tab's interior so it
-    -- connects to the content below.
-    bb:paintRect(ax + border, baseline_y, aw - 2 * border, border, Blitbuffer.COLOR_WHITE)
-    -- Labels.
+    local border  = self.border
+    local box_top = y + self.top_pad
+    -- A baseline under each row (the last row's is the content boundary).
+    for r = 1, self._n_rows do
+        local base_y = box_top + r * self._row_h
+        bb:paintRect(x, base_y, self.dimen.w, border, Blitbuffer.COLOR_BLACK)
+    end
+    -- Active tab box (top + left + right, open bottom) on its own row.
+    local r       = self._tab_row[self.active]
+    local ax      = x + self._tab_x[self.active]
+    local aw      = self._tab_w[self.active]
+    local top     = box_top + (r - 1) * self._row_h
+    local base_y  = box_top + r * self._row_h
+    local box_h   = base_y - top
+    bb:paintRect(ax, top, aw, border, Blitbuffer.COLOR_BLACK)                       -- top
+    bb:paintRect(ax, top, border, box_h, Blitbuffer.COLOR_BLACK)                    -- left
+    bb:paintRect(ax + aw - border, top, border, box_h, Blitbuffer.COLOR_BLACK)      -- right
+    bb:paintRect(ax + border, base_y, aw - 2 * border, border, Blitbuffer.COLOR_WHITE) -- open bottom
+    -- Labels, each on its row.
     for i, tw in ipairs(self._labels) do
-        tw:paintTo(bb, x + self._tab_x[i] + self.pad_h, box_top + self.pad_v)
+        local rr = self._tab_row[i]
+        tw:paintTo(bb, x + self._tab_x[i] + self.pad_h,
+            box_top + (rr - 1) * self._row_h + self.pad_v)
     end
 end
 
 function TabBar:onTapTab(_arg, ges)
     if not (ges and ges.pos) then return false end
-    local rel = ges.pos.x - self.dimen.x
+    local rel_x = ges.pos.x - self.dimen.x
+    local rel_y = ges.pos.y - self.dimen.y - self.top_pad
+    local row   = math.floor(rel_y / self._row_h) + 1
     for i = 1, #self.tabs do
-        if rel >= self._tab_x[i] and rel < self._tab_x[i] + self._tab_w[i] then
+        if self._tab_row[i] == row
+                and rel_x >= self._tab_x[i] and rel_x < self._tab_x[i] + self._tab_w[i] then
             if i ~= self.active and self.on_select then self.on_select(i) end
             return true
         end
@@ -552,6 +572,14 @@ end
 function ReviewsModal:onMultiSwipe(_arg, _ges)
     self:onClose()
     return true
+end
+
+-- A book opening underneath us (e.g. the Edit tab's "Open Incognito" plugin
+-- button, or any action that enters the reader) broadcasts ShowingReader as the
+-- reader takes over -- close so we don't linger on top of the opening book.
+-- Mirrors the old long-press menu's onShowingReader handler.
+function ReviewsModal:onShowingReader()
+    self:onClose()
 end
 
 function ReviewsModal:onClose()
