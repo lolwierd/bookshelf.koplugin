@@ -3014,7 +3014,7 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
                 return bw:_buildPillGroup(pill_specs, pill_w, max_rows, pill_size,
                     tcfg.alignment or "left", nil,
                     -- +N opens the combined book-detail popup (pills + description).
-                    function() bw:_showBookTags(book) end)
+                    function() bw:_showBookDetail(book, { active = "tags" }) end)
             end
         end
     end
@@ -7692,8 +7692,12 @@ end
 -- a one-time-use bb -- ImageWidget frees it after first paint, which
 -- means the bb in `book` itself (potentially shared with other UI) is
 -- never touched. Same disposable-bb invariant as the hero card.
-function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, bookmark_action)
+function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, bookmark_action, opts)
     if not book or not book.filepath then return nil end
+    -- rich = the book-detail popup's header: +2pt detail fonts, a page count,
+    -- "Last read" wording, and the folder path with the filename. The long-press
+    -- menu (opts nil) keeps the compact original.
+    local rich = opts and opts.rich or false
     local Font           = require("ui/font")
     local ImageWidget    = require("ui/widget/imagewidget")
     local HorizontalGroup_   = require("ui/widget/horizontalgroup")
@@ -7880,7 +7884,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
     -- info is no longer rendered here -- it lives as a tappable pill
     -- in the nav strip below.
     local top_stack = VerticalGroup_:new{ align = "left" }
-    local mtitle_face, mtitle_bold = BFont:getFace("smalltfont", 22, { bold = true })
+    local mtitle_face, mtitle_bold = BFont:getFace("smalltfont", rich and 26 or 22, { bold = true })
     top_stack[#top_stack + 1] = TextBoxWidget_:new{
         text  = book.title or book.filename or _("(no title)"),
         face  = mtitle_face,
@@ -7890,7 +7894,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
         width = text_w - bm_reserve,
     }
     if book.author and book.author ~= "" then
-        local mauthor_face, mauthor_bold = BFont:getFace("cfont", 18)
+        local mauthor_face, mauthor_bold = BFont:getFace("cfont", rich and 22 or 18)
         top_stack[#top_stack + 1] = TextBoxWidget_:new{
             text  = book.author,
             face  = mauthor_face,
@@ -7902,7 +7906,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
     -- Metadata + filename block: cheap-to-fetch supporting detail in a
     -- compact bottom slice of the top stack. Each chunk skipped when
     -- its source is unavailable.
-    local meta_face, meta_bold = BFont:getFace("cfont", 14)
+    local meta_face, meta_bold = BFont:getFace("cfont", rich and 18 or 14)
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     local size_bytes, mtime
     if ok_lfs and lfs and lfs.attributes then
@@ -7942,10 +7946,20 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
     if book.format then meta_parts[#meta_parts + 1] = book.format end
     local size_str = _fmt_size(size_bytes)
     if size_str then meta_parts[#meta_parts + 1] = size_str end
+    -- Page count (rich header only). page_count is nil for un-rendered EPUBs.
+    if rich then
+        local pages = tonumber(book.page_count)
+        if pages and pages > 0 then
+            meta_parts[#meta_parts + 1] = _("Pages") .. " " .. tostring(pages)
+        end
+    end
     local added_str = _fmt_short_date(mtime)
     if added_str then meta_parts[#meta_parts + 1] = _("Added") .. " " .. added_str end
     local last_str  = _fmt_short_date(_last_opened(book.filepath))
-    if last_str then meta_parts[#meta_parts + 1] = _("Read") .. " " .. last_str end
+    if last_str then
+        meta_parts[#meta_parts + 1] =
+            (rich and _("Last read") or _("Read")) .. " " .. last_str
+    end
     if #meta_parts > 0 then
         top_stack[#top_stack + 1] = TextBoxWidget_:new{
             text  = table.concat(meta_parts, "  \xC2\xB7  "),  -- middle-dot
@@ -7955,12 +7969,25 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
         }
     end
 
-    -- Filename (basename only, no directory). Directory is reachable
-    -- through the Folder pill in the nav strip below, so duplicating
-    -- the full path here is noise.
-    local basename = (book.filepath or ""):match("([^/]+)$") or book.filepath or ""
+    -- Filename. The compact (long-press menu) header shows the basename only --
+    -- the directory is reachable via the Folder pill. The rich (book-detail
+    -- popup) header includes the folder path, shown relative to home_dir when
+    -- the book sits under it, else the full path.
+    local fname = (book.filepath or ""):match("([^/]+)$") or book.filepath or ""
+    if rich and book.filepath then
+        local shown = book.filepath
+        local ok_gs, gs = pcall(function() return G_reader_settings end)
+        local home = ok_gs and gs and gs:readSetting("home_dir")
+        if type(home) == "string" then
+            home = home:gsub("/+$", "")
+            if home ~= "" and shown:sub(1, #home + 1) == home .. "/" then
+                shown = shown:sub(#home + 2)  -- strip "home_dir/"
+            end
+        end
+        fname = shown
+    end
     top_stack[#top_stack + 1] = TextBoxWidget_:new{
-        text  = basename,
+        text  = fname,
         face  = meta_face,
         bold  = meta_bold,
         width = text_w,
@@ -8089,7 +8116,7 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
         -- book-detail popup (every facet, still tappable, above the description).
         -- All "+N" widgets here share one callback.
         if stopped_at then
-            local more_cb = function() self:_showBookTags(book) end
+            local more_cb = function() self:_showBookDetail(book, { active = "tags" }) end
             local more_extra = Screen:scaleBySize(8)
             local hidden = #pill_widgets - stopped_at + 1
             local more_pill, more_w = _buildPill("+" .. hidden, more_cb, more_extra)
@@ -8526,7 +8553,9 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
         -- popup routes it to the full tags sheet on top of itself), else the bare
         -- tags sheet. All "+N" widgets share one callback over the full spec
         -- list, and get extra L/R padding for a bigger tap target.
-        local more_cb = on_overflow or function() self:_showAllTags(pill_specs) end
+        -- on_overflow opens the overflow view (the book-detail popup's Tags tab);
+        -- nil leaves the "+N" non-tappable (no caller wants a bare list now).
+        local more_cb = on_overflow
         local more_extra = Screen:scaleBySize(8)
         local hidden = #pill_widgets - stopped_at + 1
         local more_pill, more_w = _buildPill("+" .. hidden, more_cb, more_extra)
@@ -8564,51 +8593,6 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     -- caller's job (the hero wraps this in a Left/Centre/Right container at
     -- the authoritative column width).
     return pill_group
-end
-
--- _showAllTags(pill_specs, also_close)
--- Open the tags sheet listing EVERY pill (author / series / collections /
--- genres / folder), each still tappable to drill into its view. Fired by the
--- "+N" overflow pill (bare-sheet fallback) and by the combined book-detail
--- popup's internal "+N". also_close (optional) is a list of extra widgets to
--- close when a pill is tapped -- the combined popup passes itself so a drilldown
--- from the stacked sheet tears the whole stack down before navigating.
-function BookshelfWidget:_showAllTags(pill_specs, also_close)
-    if not pill_specs or #pill_specs == 0 then return end
-    local TagsSheet = require("lib/bookshelf_tags_sheet")
-    local sheet
-    -- Wrap each drilldown so a tap in the sheet closes the sheet (and any
-    -- also_close widgets) first, then runs the original navigation (which
-    -- already closes the long-press dialog where one is open). Pills without an
-    -- on_tap stay inert.
-    local wrapped = {}
-    for _i, s in ipairs(pill_specs) do
-        local orig = s.on_tap
-        wrapped[#wrapped + 1] = {
-            label  = s.label,
-            on_tap = orig and function()
-                if sheet then UIManager:close(sheet) end
-                if also_close then
-                    for _j, w in ipairs(also_close) do
-                        if w then UIManager:close(w) end
-                    end
-                end
-                orig()
-            end or nil,
-        }
-    end
-    sheet = TagsSheet:new{
-        title = _("Tags"),
-        -- max_rows huge => every pill wraps onto its own row(s) and no "+N"
-        -- collapse is produced, so _buildPillGroup never recurses back here.
-        -- Larger font than the inline strips (the sheet scrolls, so there's
-        -- room) and centred rows.
-        build_content = function(avail_w)
-            return self:_buildPillGroup(wrapped, avail_w, 9999, 18, "center",
-                Screen:scaleBySize(10))
-        end,
-    }
-    UIManager:show(sheet)
 end
 
 -- _openBookMenu(item)
@@ -8712,7 +8696,7 @@ end
 -- _descriptionArgs(book) — build the ReviewsModal args (title + tabs/html_body
 -- + on_tab_close) for a book's description(s), or nil when the book has no
 -- usable description. Shared by _showFullDescription and the combined
--- book-detail popup (_showBookTags).
+-- book-detail popup (_showBookDetail).
 function BookshelfWidget:_descriptionArgs(book)
     if not book then return nil end
     local Tokens = require("lib/bookshelf_tokens")
@@ -8762,8 +8746,10 @@ function BookshelfWidget:_descriptionArgs(book)
         -- Both available: a Book / Hardcover toggle at the top. Default to
         -- whichever description the hero currently shows.
         args.tabs = {
-            { label = _("Book"),      html = file_html },   -- 1 = book's own
-            { label = _("Hardcover"), html = hc_html },     -- 2 = Hardcover
+            -- "Description" (not "Book"): it's the book file's own description,
+            -- i.e. the KOReader/EPUB field, vs Hardcover's.
+            { label = _("Description"), html = file_html },   -- 1 = book's own
+            { label = _("Hardcover"),   html = hc_html },     -- 2 = Hardcover
         }
         args.active_tab = book.hardcover_description and 2 or 1
         -- On close, adopt the description of the tab being viewed: switching to
@@ -8789,149 +8775,198 @@ function BookshelfWidget:_descriptionArgs(book)
     return args
 end
 
--- Open a scrollable viewer with the full book description. Same TextViewer the
--- updater uses for release notes. The description is sanitised/converted to HTML
--- (see _descriptionArgs); the viewer renders it with paragraph breaks preserved.
+-- Tapping the description opens the unified book-detail popup (pills always on
+-- top, description + reviews tabs below) -- the pills are shown here too, not
+-- only via the "+N" overflow.
 function BookshelfWidget:_showFullDescription(book)
-    local args = self:_descriptionArgs(book)
-    if not args then return end
-    -- No on_refresh: a description doesn't refresh, so the footer is Close only.
-    local ReviewsModal = require("lib/bookshelf_reviews_modal")
-    UIManager:show(ReviewsModal:new(args))
+    return self:_showBookDetail(book)
 end
 
--- _showBookTags(book) — the combined book-detail popup. Shows EVERY tag pill
--- (author / series / collections / genres / folder), each tappable to drill in,
--- ABOVE the book/Hardcover description. The pill strip is capped to a few rows;
--- its "+N" opens the full scrollable tags sheet on top. When the book has no
--- description it degrades to the bare tags sheet (pills only).
-function BookshelfWidget:_showBookTags(book)
+-- _showBookDetail(book, opts) — the combined book-detail popup, a tabbed window:
+-- a Tags tab (all the author / series / collections / genres / folder pills, each
+-- tappable to drill in, scrollable), the book/Hardcover Description tab(s), and a
+-- Hardcover Reviews tab when the book is linked. One tab body is mounted at a
+-- time, so the Tags scroller never fights the description scroller. Replaces the
+-- old separate description / reviews modals and the standalone tags sheet.
+-- opts.active = "tags" | "reviews" picks the starting tab (default: description);
+-- opts.on_close fires once on dismiss (e.g. to reopen the book menu).
+function BookshelfWidget:_showBookDetail(book, opts)
+    opts = opts or {}
     if not book or not book.filepath then return end
     local ReadCollection = require("readcollection")
     local in_collections = ReadCollection.getCollectionsWithFile
         and ReadCollection:getCollectionsWithFile(book.filepath) or {}
-    -- All categories (like the long-press menu); close_cb nil -- we handle
-    -- closing the popup explicitly below so the drilldown tears down the stack.
+    -- All categories (like the long-press menu); close_cb nil -- we close the
+    -- popup explicitly so the drilldown tears the stack down before navigating.
     local pill_specs = self:_buildPillSpecs(book, in_collections, nil, nil)
-    if #pill_specs == 0 then
-        return self:_showFullDescription(book)  -- nothing to pill; plain desc
-    end
 
-    local args = self:_descriptionArgs(book)
-    if not args then
-        return self:_showAllTags(pill_specs)  -- no description: pills-only sheet
-    end
-
-    local ReviewsModal = require("lib/bookshelf_reviews_modal")
     local modal  -- forward ref so a pill tap closes the popup before navigating
-    -- Capped pill strip above the description. Each pill closes the popup then
-    -- drills; the "+N" opens the full tags sheet (which also closes the popup
-    -- when one of ITS pills is tapped, via also_close).
-    args.pills_builder = function(avail_w)
-        local capped = {}
-        for _i, s in ipairs(pill_specs) do
-            local orig = s.on_tap
-            capped[#capped + 1] = {
-                label  = s.label,
-                on_tap = orig and function()
-                    if modal then UIManager:close(modal) end
-                    orig()
-                end or nil,
-            }
-        end
-        return self:_buildPillGroup(capped, avail_w, 3, 16, "center",
-            Screen:scaleBySize(8),
-            function() self:_showAllTags(pill_specs, { modal }) end)
-    end
-    modal = ReviewsModal:new(args)
-    UIManager:show(modal)
-end
 
-function BookshelfWidget:_showHardcoverReviews(book, opts)
-    opts = opts or {}
-    if not (book and book.filepath) then return end
+    local tabs = {}
+    local tags_idx, desc_idx, hc_idx, reviews_idx
+
+    -- Tags tab (appended LAST, after description + reviews): the full pill set,
+    -- scrollable, each tappable (closes the popup then drills). Built lazily as a
+    -- native widget body when the tab is shown.
+    local tags_tab
+    if #pill_specs > 0 then
+        tags_tab = {
+            id = "tags",
+            label = _("Tags"),
+            widget_builder = function(avail_w, avail_h, show_parent)
+                local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
+                local FrameContainer = require("ui/widget/container/framecontainer")
+                local wrapped = {}
+                for _i, s in ipairs(pill_specs) do
+                    local orig = s.on_tap
+                    wrapped[#wrapped + 1] = {
+                        label  = s.label,
+                        on_tap = orig and function()
+                            if modal then UIManager:close(modal) end
+                            orig()
+                        end or nil,
+                    }
+                end
+                local lpad = (show_parent and show_parent._side_pad)
+                    or Screen:scaleBySize(20)
+                local sb   = ScrollableContainer:getScrollbarWidth()
+                -- Pill size tracks the modal's font knob so the +/- buttons
+                -- resize the tags the same as the description/review tabs.
+                local base = (show_parent and show_parent.font_size) or 18
+                local pills = self:_buildPillGroup(wrapped, avail_w - lpad - sb,
+                    9999, base, "left", Screen:scaleBySize(8))
+                local padded = FrameContainer:new{
+                    bordersize = 0, margin = 0,
+                    padding_left = lpad, padding_right = sb,
+                    -- Top padding matches the description tabs' body padding so
+                    -- the first pill row sits at the same height as body text.
+                    padding_top = Screen:scaleBySize(28),
+                    padding_bottom = Screen:scaleBySize(14),
+                    pills,
+                }
+                return ScrollableContainer:new{
+                    dimen = Geom:new{ w = avail_w, h = avail_h },
+                    show_parent = show_parent,
+                    padded,
+                }
+            end,
+        }
+    end
+
+    -- 2. Description tab(s).
+    local desc_args = self:_descriptionArgs(book) or {}
+    if desc_args.tabs then
+        desc_idx = #tabs + 1
+        tabs[desc_idx] = { id = "description", label = _("Description"),
+            html = desc_args.tabs[1].html }
+        hc_idx = #tabs + 1
+        tabs[hc_idx] = { id = "hardcover", label = _("Hardcover"),
+            html = desc_args.tabs[2].html }
+    elseif desc_args.html_body then
+        desc_idx = #tabs + 1
+        tabs[desc_idx] = { id = "description", label = _("Description"),
+            html = desc_args.html_body }
+    end
+
+    -- 3. Hardcover reviews tab, only when linked. Cache-first so the common case
+    -- shows instantly; otherwise a "Loading" placeholder an async fetch fills in.
     local ok_hc, Hardcover = pcall(require, "lib/bookshelf_hardcover")
-    local InfoMessage = require("ui/widget/infomessage")
-    if not ok_hc or not Hardcover then
-        UIManager:show(InfoMessage:new{
-            text = _("Hardcover integration could not be loaded"),
-            icon = "notice-warning",
-            timeout = 3,
-        })
-        if opts.on_close then opts.on_close() end
-        return
-    end
-
-    local link = Hardcover.getLink(book.filepath)
-    local book_id = book.hardcover_book_id or (link and link.book_id)
-    if not book_id then
-        UIManager:show(InfoMessage:new{
-            text = _("No Hardcover book is linked yet."),
-            icon = "notice-warning",
-            timeout = 3,
-        })
-        if opts.on_close then opts.on_close() end
-        return
-    end
-
     local Tokens = require("lib/bookshelf_tokens")
-    local ReviewsModal = require("lib/bookshelf_reviews_modal")
-    local function showModal(result)
-        local html = Tokens.reviewsHtml{
-            title         = result.title or book.hardcover_title or book.title,
+    local link = ok_hc and Hardcover and Hardcover.getLink
+        and Hardcover.getLink(book.filepath) or nil
+    local book_id = book.hardcover_book_id or (link and link.book_id)
+    local has_reviews = (ok_hc and Hardcover and book_id) and true or false
+    local function reviewsHtml(result)
+        return Tokens.reviewsHtml{
+            -- No title: the popup header already shows the book title/author.
             rating        = result.rating,
             ratings_count = result.ratings_count,
             reviews_count = result.reviews_count,
             reviews       = result.reviews,
         }
-        UIManager:show(ReviewsModal:new{
-            -- The query filters to review_has_spoilers=false, so the heading
-            -- can promise spoiler-free.
-            title      = _("Hardcover spoiler-free reviews"),
-            html_body  = html,
-            -- Return to the caller (e.g. the book menu) when dismissed, but
-            -- only if one was supplied -- the hero "N reviews" tap passes
-            -- none, so it just closes.
-            on_close   = opts.on_close,
-            on_refresh = function()
-                self:_showHardcoverReviews(book, { force = true, on_close = opts.on_close })
-            end,
-        })
     end
-
-    -- Cache-first: if reviews are already cached and this isn't a forced
-    -- refresh, show them immediately -- no "Fetching..." flash and no network
-    -- round-trip. This is the common case (e.g. the hero tap); the previous
-    -- code always showed the progress toast, which then overlapped the
-    -- already-rendered modal.
-    if not opts.force then
+    local reviews_pending
+    if has_reviews then
+        reviews_idx = #tabs + 1
+        local html = "<p>" .. _("Loading reviews\xE2\x80\xA6") .. "</p>"
         local ok_cached, cached = Hardcover.fetchReviews(book_id, { cache_only = true })
         if ok_cached and type(cached) == "table" then
-            showModal(cached)
-            return
+            html = reviewsHtml(cached)
+        else
+            reviews_pending = true
+        end
+        tabs[reviews_idx] = { id = "reviews", label = _("Reviews"), html = html }
+    end
+
+    -- Tags last.
+    if tags_tab then
+        tags_idx = #tabs + 1
+        tabs[tags_idx] = tags_tab
+    end
+
+    if #tabs == 0 then return end  -- no pills, no description, no reviews
+
+    -- Active tab: tags / reviews on request, else the description source the hero
+    -- shows, else whatever single tab exists.
+    local active_tab
+    if opts.active == "tags" and tags_idx then
+        active_tab = tags_idx
+    elseif opts.active == "reviews" and reviews_idx then
+        active_tab = reviews_idx
+    elseif desc_idx then
+        active_tab = (hc_idx and book.hardcover_description) and hc_idx or desc_idx
+    else
+        active_tab = 1
+    end
+
+    local args = {
+        tabs       = tabs,
+        active_tab = active_tab,
+        on_close   = opts.on_close,
+        -- Cover + metadata header in place of a title bar. Rebuilt fresh on each
+        -- layout by the modal (cover bb is one-shot); no pills here (Tags tab),
+        -- no bookmark button.
+        header_builder = function(avail_w)
+            return self:_buildBookMenuHeader(book, avail_w, nil, nil, { rich = true })
+        end,
+    }
+    -- The Book/Hardcover description tabs drive the per-book "use Hardcover
+    -- description" choice (mapped back to 1 = own, 2 = Hardcover). Other tabs
+    -- (Tags, Reviews) must not.
+    if desc_args.on_tab_close and hc_idx then
+        local desc_otc = desc_args.on_tab_close
+        args.on_tab_close = function(active_idx)
+            if active_idx == desc_idx then desc_otc(1)
+            elseif active_idx == hc_idx then desc_otc(2) end
         end
     end
 
-    -- Cache miss or forced refresh: now we're genuinely fetching, so the
-    -- progress message earns its place.
-    UIManager:show(InfoMessage:new{
-        text = _("Fetching Hardcover reviews..."),
-        timeout = 1,
-    })
-    Hardcover.fetchReviewsOnline(book_id, {
-        force = opts.force == true,
-    }, function(ok, result)
-        if not ok then
-            UIManager:show(InfoMessage:new{
-                text = _("Hardcover reviews could not be fetched: ") .. tostring(result),
-                icon = "notice-warning",
-                timeout = 5,
-            })
-            if opts.on_close then opts.on_close() end
-            return
-        end
-        showModal(result)
-    end)
+    local ReviewsModal = require("lib/bookshelf_reviews_modal")
+    modal = ReviewsModal:new(args)
+    UIManager:show(modal)
+
+    -- Cache miss: fetch reviews online, then drop them into the reviews tab in
+    -- place. Guard against the user closing the popup before it returns.
+    if reviews_pending then
+        Hardcover.fetchReviewsOnline(book_id, {}, function(ok, result)
+            if modal._dismissed then return end
+            local html
+            if ok and type(result) == "table" then
+                html = reviewsHtml(result)
+            else
+                html = "<p>" .. _("Reviews couldn't be fetched.") .. "</p>"
+            end
+            if modal.setTabHtml then modal:setTabHtml(reviews_idx, html) end
+        end)
+    end
+end
+
+-- Hardcover reviews now live as a tab in the unified book-detail popup, so this
+-- just opens that popup on the Reviews tab. opts.on_close reopens the caller
+-- (e.g. the book menu) on dismiss.
+function BookshelfWidget:_showHardcoverReviews(book, opts)
+    opts = opts or {}
+    self:_showBookDetail(book, { active = "reviews", on_close = opts.on_close })
 end
 
 function BookshelfWidget:_refreshHardcoverEnrichmentView(reason, filepath)

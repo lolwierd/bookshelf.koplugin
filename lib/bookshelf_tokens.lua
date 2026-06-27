@@ -485,8 +485,12 @@ end
 function Tokens.reviewsHtml(payload)
     payload = type(payload) == "table" and payload or {}
     local out = {}
-    -- Book title: a large heading above all reviews.
-    out[#out + 1] = "<h1>" .. _escHtml(payload.title or "Hardcover reviews") .. "</h1>"
+    -- Book title: a large heading above all reviews. Omitted when no title is
+    -- given (the book-detail popup shows the title in its header already, so a
+    -- heading here would be redundant).
+    if payload.title and payload.title ~= "" then
+        out[#out + 1] = "<h1>" .. _escHtml(payload.title) .. "</h1>"
+    end
 
     -- Overall rating: the shared star glyph row (in a span so only the glyphs
     -- use the embedded symbols font), with the rating/review counts inline on

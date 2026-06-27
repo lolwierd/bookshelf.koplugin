@@ -93,7 +93,7 @@ function TabBar:init()
     self.pad_h      = Screen:scaleBySize(14)
     self.pad_v      = Screen:scaleBySize(6)
     self.border     = Screen:scaleBySize(2)
-    self.face       = Font:getFace("cfont", Screen:scaleBySize(16))
+    self.face       = Font:getFace("cfont", Screen:scaleBySize(13))
 
     self._labels, self._tab_x, self._tab_w = {}, {}, {}
     local x = self.left_inset
@@ -165,10 +165,13 @@ local ReviewsModal = InputContainer:extend{
     on_tab_close = nil, -- optional fn(active_tab_index) fired once on dismiss
     width      = nil,
     height     = nil,
-    -- Optional function(avail_w) -> widget, rendered as a tappable strip between
-    -- the title bar and the tabs/body (the combined book-detail popup passes the
-    -- tag pills here). nil = no strip.
-    pills_builder = nil,
+    -- tabs entries may be HTML ({ label, html, id }) or native ({ label, id,
+    -- widget_builder = function(avail_w, avail_h, show_parent) -> widget }).
+    -- A widget tab's body (e.g. the scrollable tag pills) is mounted only while
+    -- that tab is active, so its scroller never coexists with the HTML scroller.
+    -- Optional function(avail_w) -> widget, shown at the top in place of a title
+    -- bar (the book-detail cover + metadata header). Rebuilt on each re-layout.
+    header_builder = nil,
     on_refresh = nil,   -- optional callback fired by the Refresh button
     on_close   = nil,   -- optional callback fired once when the modal is
                         -- genuinely dismissed (NOT on Refresh, which reopens).
@@ -197,9 +200,10 @@ function ReviewsModal:init()
         self._active_tab = 1
     end
 
-    -- Horizontal content padding (px), shared by the HTML body's CSS padding and
-    -- the tab strip's left inset so the first tab lines up with the body text.
-    self._side_pad = Screen:scaleBySize(56)
+    -- Horizontal content inset, shared by the HTML body's CSS padding, the tab
+    -- strip's left inset, the tag tab's pill inset, and the header's L/R + top
+    -- padding -- so tabs, bodies and header all line up.
+    self._side_pad = Screen:scaleBySize(28)
 
     if Device:hasKeys() then
         self.key_events = { Close = { { Device.input.group.Back } } }
@@ -219,15 +223,17 @@ function ReviewsModal:init()
         }
     end
 
-    self.titlebar = TitleBar:new{
-        width            = self.width,
-        align            = "left",
-        with_bottom_line = true,
-        title            = self.title or _("Hardcover reviews"),
-        subtitle         = self.subtitle,
-        close_callback   = function() self:onClose() end,
-        show_parent      = self,
-    }
+    -- Book-detail header (cover + title/author/metadata) sits where a title bar
+    -- would, built by the caller (header_builder). No title bar: the header
+    -- already shows the title, and the footer has a Close button. The header's
+    -- cover bb is one-shot (freed after paint), so it's rebuilt fresh on every
+    -- _assemble (mirrors the long-press menu's _reinitDialog); here we build one
+    -- only to measure its height for the body budget.
+    local header_h = 0
+    if self.header_builder then
+        local probe = self:_buildHeader()
+        header_h = probe and probe:getSize().h or 0
+    end
 
     -- Refresh only makes sense when the caller supplied an on_refresh (the
     -- reviews use it to re-fetch). Reused for plain HTML content (e.g. a book
@@ -272,39 +278,17 @@ function ReviewsModal:init()
         show_parent = self,
     }
 
-    -- Optional tappable pill strip between the title bar and the tabs/body.
-    -- Built to the frame width minus a side inset, centred. Its height comes off
-    -- the description body's budget so the layout still fits.
-    self._pills_widget = nil
-    if self.pills_builder then
-        local pill_pad = Screen:scaleBySize(20)
-        local pills = self.pills_builder(self.width - 2 * pill_pad)
-        if pills then
-            local ph = pills:getSize().h
-            self._pills_widget = FrameContainer:new{
-                bordersize = 0,
-                padding    = pill_pad,
-                margin     = 0,
-                CenterContainer:new{
-                    dimen = Geom:new{ w = self.width - 2 * pill_pad, h = ph },
-                    pills,
-                },
-            }
-        end
-    end
-    local pills_h = self._pills_widget and self._pills_widget:getSize().h or 0
-
-    -- Source tab bar (File / Hardcover, …). Built only when there are 2+ tabs;
-    -- a single source needs no switcher.
+    -- Source/section tab bar. Built only when there are 2+ tabs.
     self._tab_row = self:_buildTabRow()
     local tabs_h = self._tab_row and self._tab_row:getSize().h or 0
 
-    local titlebar_h = self.titlebar:getSize().h
     local buttons_h  = buttons:getSize().h
-    local html_h     = self.height - titlebar_h - buttons_h - tabs_h - pills_h
+    local html_h     = self.height - header_h - buttons_h - tabs_h
     if html_h < Screen:scaleBySize(80) then
         html_h = Screen:scaleBySize(80)
     end
+    -- Body height, shared by the HTML scroller and any native (widget) tab.
+    self._body_h = html_h
 
     -- Embed the Nerd Font symbols face via @font-face so the star rows use the
     -- exact same glyphs (F005/F123/F006) as the ratings UI. MuPDF's HTML engine
@@ -352,33 +336,79 @@ function ReviewsModal:init()
         },
     }
 
-    self._vgroup = VerticalGroup:new{
-        align = "left",
-        self.titlebar,
-    }
-    if self._pills_widget then
-        self._vgroup[#self._vgroup + 1] = self._pills_widget
-    end
-    -- Remember where the tab row sits so _switchTab can swap it in place.
-    if self._tab_row then
-        self._vgroup[#self._vgroup + 1] = self._tab_row
-        self._tabrow_pos = #self._vgroup
-    end
-    self._vgroup[#self._vgroup + 1] = self.scroll_html
-    self._vgroup[#self._vgroup + 1] = button_separator
-    self._vgroup[#self._vgroup + 1] = buttons
+    -- Stash the chrome pieces _assemble reuses, plus the screen size for the
+    -- centring container. _tab_widgets caches built native tab bodies.
+    self._buttons          = buttons
+    self._button_separator = button_separator
+    self._screen_w         = screen_w
+    self._screen_h         = screen_h
+    self._tab_widgets      = {}
+    self:_assemble()
+end
 
+-- Build a FRESH book-detail header (cover + metadata) inset by the header pads,
+-- or nil if no header_builder. Fresh each call because the cover bb is one-shot
+-- (freed after paint); a reused header would paint garbage on the next layout.
+function ReviewsModal:_buildHeader()
+    if not self.header_builder then return nil end
+    local pad = self._side_pad  -- L/R + top match the tabs / body inset
+    local inner = self.header_builder(self.width - 2 * pad)
+    if not inner then return nil end
+    return FrameContainer:new{
+        bordersize     = 0,
+        margin         = 0,
+        padding_left   = pad,
+        padding_right  = pad,
+        padding_top    = pad,
+        padding_bottom = Screen:scaleBySize(8),  -- tight to the tab bar below
+        inner,
+    }
+end
+
+-- Active tab's body widget. Returns (widget, is_native). Native bodies (e.g. the
+-- tag pills) are built once via their widget_builder and cached; HTML tabs reuse
+-- the single scroll_html (its content is set on switch). Only the returned body
+-- is mounted, so a native scroller never coexists with the HTML scroller.
+function ReviewsModal:_activeBody()
+    local tab = self._tabs and self._tabs[self._active_tab]
+    if tab and tab.widget_builder then
+        if not self._tab_widgets[self._active_tab] then
+            self._tab_widgets[self._active_tab] =
+                tab.widget_builder(self.width, self._body_h, self)
+        end
+        return self._tab_widgets[self._active_tab], true
+    end
+    return self.scroll_html, false
+end
+
+-- (Re)build the vgroup + frame from the current active tab's body. Called once
+-- at init and again on each tab switch (a full re-layout, cheap for this modal).
+function ReviewsModal:_assemble()
+    local body, is_native = self:_activeBody()
+    -- Crop inner self-repaints (pill tap-feedback inverts) to the native scroll
+    -- body when it's active; HTML tabs manage their own painting.
+    self.cropping_widget = is_native and body or nil
+    local vg = VerticalGroup:new{ align = "left" }
+    local header = self:_buildHeader()
+    if header then vg[#vg + 1] = header end
+    if self._tab_row then
+        vg[#vg + 1] = self._tab_row
+        self._tabrow_pos = #vg
+    end
+    vg[#vg + 1] = body
+    vg[#vg + 1] = self._button_separator
+    vg[#vg + 1] = self._buttons
+    self._vgroup = vg
     self.frame = FrameContainer:new{
         background  = Blitbuffer.COLOR_WHITE,
         radius      = Size.radius.window,
         bordersize  = Size.border.window,
         padding     = 0,
-        self._vgroup,
+        vg,
     }
-
     -- Fixed, centred -- no MovableContainer, so it can't be dragged around.
     self[1] = CenterContainer:new{
-        dimen = Geom:new{ w = screen_w, h = screen_h },
+        dimen = Geom:new{ w = self._screen_w, h = self._screen_h },
         self.frame,
     }
 end
@@ -397,20 +427,30 @@ function ReviewsModal:_changeFontSize(delta)
     -- re-renders. Flushed once at onCloseWidget.
     Store.saveDeferred(DESC_FONT_KEY, new)
     self._font_size_dirty = true
-    -- Re-render at the new size. setContent recomputes the page count; reset
-    -- to the top so the scrollbar and page state stay consistent.
+    -- Native tab bodies (e.g. the tag pills, sized from self.font_size) must be
+    -- rebuilt at the new size; drop the cache so _assemble rebuilds them.
+    self._tab_widgets = {}
+    -- Re-render the HTML scroller at the new size, then reassemble so the active
+    -- body (HTML or rebuilt native) and the header reflect it.
     self:_renderHtml(self:_activeHtml())
+    self:_assemble()
     UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
 end
 
 -- _activeHtml(): the HTML body to display -- the active tab's, or the single
--- html_body when there are no tabs.
+-- html_body when there are no tabs. When the active tab is a native (widget)
+-- tab it has no html, so fall back to the first HTML tab (the scroll widget
+-- needs valid content even while it's offscreen), else an empty paragraph.
 function ReviewsModal:_activeHtml()
     if self._tabs then
         local t = self._tabs[self._active_tab]
-        return (t and t.html) or ""
+        if t and t.html then return t.html end
+        for _i, tt in ipairs(self._tabs) do
+            if tt.html then return tt.html end
+        end
+        return "<p></p>"
     end
-    return self.html_body or ""
+    return self.html_body or "<p></p>"
 end
 
 -- _renderHtml(html): re-render the scroll widget in place at the current font
@@ -441,15 +481,40 @@ function ReviewsModal:_buildTabRow()
     }
 end
 
--- _switchTab(i): show tab i's content and move the active highlight. The tab
--- strip's geometry is stable (labels don't change weight), so flipping
--- .active + repainting is enough -- no rebuild/relayout.
+-- setTabHtml(i, html): replace a tab's content after construction (used for an
+-- async tab, e.g. Hardcover reviews that load after the popup is shown). Updates
+-- the stored html and, if that tab is the active one, re-renders in place. Safe
+-- to call after dismiss -- it no-ops once the widget is gone.
+function ReviewsModal:setTabHtml(i, html)
+    if self._dismissed then return end
+    if self._tabs and self._tabs[i] then
+        self._tabs[i].html = html
+        if i == self._active_tab then
+            self:_renderHtml(self:_activeHtml())
+            UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
+        end
+    elseif i == 1 and not self._tabs then
+        -- Single-source modal (no tab bar): the body is html_body.
+        self.html_body = html
+        self:_renderHtml(html)
+        UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
+    end
+end
+
+-- _switchTab(i): show tab i's body and move the active highlight. HTML tabs
+-- re-render the shared scroll widget in place; switching to/from a native
+-- (widget) tab swaps which body is mounted, so the frame is reassembled.
 function ReviewsModal:_switchTab(i)
     if not self._tabs or i == self._active_tab
             or i < 1 or i > #self._tabs then return end
     self._active_tab = i
     if self._tab_row then self._tab_row.active = i end
-    self:_renderHtml(self:_activeHtml())
+    local tab = self._tabs[i]
+    if not tab.widget_builder then
+        -- HTML tab: load its content into the shared scroll widget first.
+        self:_renderHtml(self:_activeHtml())
+    end
+    self:_assemble()
     UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
 end
 
@@ -480,6 +545,7 @@ function ReviewsModal:onMultiSwipe(_arg, _ges)
 end
 
 function ReviewsModal:onClose()
+    self._dismissed = true  -- so a late async tab fill (setTabHtml) no-ops
     UIManager:close(self)
     -- Report the tab being viewed at dismiss time (once), so the caller can
     -- adopt that source. Independent of the Refresh-suppress flag.
