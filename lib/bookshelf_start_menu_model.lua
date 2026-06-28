@@ -40,7 +40,10 @@ function M.DEFAULTS()
         { id = "sm_settings", type = "action", label = _("Bookshelf menu"),
           icon = "\xE2\x9A\x99", internal = "settings" },                -- U+2699 ⚙
         { id = "sm_close",    type = "action", label = _("Exit bookshelf"),
-          icon = "\xEE\xA4\x85", internal = "close" },                   -- U+E905 exit-to-app
+          icon = "\xEE\xA4\x85", internal = "close", scope = "library" }, -- U+E905 exit-to-app
+        { id = "sm_reader_home", type = "action", label = _("Close book"),
+          icon = "\xEE\xA4\x85", menu_path = { { id = "filemanager" } },  -- U+E905 exit-to-app
+          scope = "reader" },
         { id = "sm_sleep",    type = "action", label = _("Sleep"),
           icon = "\xEE\xAC\xA4", action = { suspend = true } },          -- U+EB24 power-sleep
     }

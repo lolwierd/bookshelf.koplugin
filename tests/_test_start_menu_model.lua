@@ -23,7 +23,7 @@ local t = helpers.runner()
 t.test("first load seeds defaults and sets seeded flag", function()
     kv = {}
     local items = Model.load()
-    assert(#items == 7, "expected starter set, got " .. #items)
+    assert(#items == 8, "expected starter set, got " .. #items)
     assert(kv.start_menu_seeded == true, "seeded flag not set")
     assert(type(kv.start_menu_items) == "table", "items not persisted")
 end)
@@ -261,6 +261,22 @@ t.test("imageIconName extracts NAME from [icon=NAME] whole-value tokens", functi
     assert(Model.imageIconName("[icon=]") == nil, "empty name -> nil")
     assert(Model.imageIconName("a[icon=x]b") == nil, "not a whole-value token -> nil")
     assert(Model.imageIconName(nil) == nil, "nil -> nil")
+end)
+
+t.test("filterByScope hides sm_close in reader and shows sm_reader_home only in reader", function()
+    local d = Model.DEFAULTS()
+    local lib = Model.filterByScope(d, "library")
+    local rdr = Model.filterByScope(d, "reader")
+
+    local function hasId(list, id)
+        for _, e in ipairs(list) do if e.id == id then return true end end
+        return false
+    end
+
+    assert(hasId(lib, "sm_close"),      "sm_close should appear in library")
+    assert(not hasId(rdr, "sm_close"),  "sm_close should not appear in reader")
+    assert(hasId(rdr, "sm_reader_home"), "sm_reader_home should appear in reader")
+    assert(not hasId(lib, "sm_reader_home"), "sm_reader_home should not appear in library")
 end)
 
 t.done()
