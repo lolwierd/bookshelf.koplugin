@@ -298,6 +298,24 @@ function Store.nilOrTrue(key)
     return _open():nilOrTrue(key)
 end
 
+-- Per-book preferred genre source ("calibre" | "embedded" | "hardcover").
+-- Stored as one filepath-keyed map; nil clears the override (back to auto).
+-- Read by the repository's genre resolution and by the Hardcover enrichment
+-- (so an explicit non-Hardcover choice suppresses its genre override).
+function Store.genreSource(filepath)
+    if not filepath then return nil end
+    local map = Store.read("genre_source")
+    return (type(map) == "table") and map[filepath] or nil
+end
+
+function Store.setGenreSource(filepath, source)
+    if not filepath then return end
+    local map = Store.read("genre_source")
+    if type(map) ~= "table" then map = {} end
+    map[filepath] = source  -- source string, or nil to clear
+    Store.save("genre_source", map)
+end
+
 -- Path the settings live at. Exposed so a future "uninstall plugin"
 -- feature can find and remove it without re-deriving the convention.
 function Store.path() return SETTINGS_PATH end

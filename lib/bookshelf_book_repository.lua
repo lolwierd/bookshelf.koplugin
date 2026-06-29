@@ -66,6 +66,52 @@ local function splitGenreTags(src)
     return #t > 0 and t or nil
 end
 
+-- The KOReader custom Keywords override (.sdr custom_props.keywords) for a book,
+-- or nil when none is set. An explicit empty string is preserved (the user
+-- cleared the keywords) so the embedded source reads as "no genres", not a
+-- fall-back to the file's own keywords.
+local function _customKeywords(filepath)
+    if not filepath then return nil end
+    local ok, DocSettings = pcall(require, "docsettings")
+    if not (ok and DocSettings and DocSettings.findCustomMetadataFile) then return nil end
+    local cmf = DocSettings:findCustomMetadataFile(filepath)
+    if not cmf then return nil end
+    local ok2, cp = pcall(function()
+        return DocSettings.openSettingsFile(cmf):readSetting("custom_props")
+    end)
+    if ok2 and type(cp) == "table" and cp.keywords ~= nil then return cp.keywords end
+    return nil
+end
+
+-- Per-source genre lists (each nil when that source has none for this book).
+local function _calibreGenres(cb)
+    if cb and type(cb.tags) == "table" and #cb.tags > 0 then return splitGenreTags(cb.tags) end
+    return nil
+end
+local function _embeddedGenres(filepath, info)
+    local kw = _customKeywords(filepath)
+    if kw == nil then kw = info and info.keywords end
+    if kw and kw ~= "" then return splitGenreTags(kw) end
+    return nil
+end
+
+-- Resolve a book's genres honouring the per-book source preference, AND return
+-- the per-source lists (for the source chip bar). Calibre and embedded are
+-- resolved here; "hardcover" leaves the base (calibre > embedded), which
+-- Hardcover.enrichBook then overrides (and stamps sources.hardcover). No
+-- preference = auto priority calibre > embedded (the previous behaviour).
+-- Returns: resolved_list, sources_table { calibre=, embedded= }.
+local function genreData(filepath, cb, info)
+    local calibre  = _calibreGenres(cb)
+    local embedded = _embeddedGenres(filepath, info)
+    local pref = BookshelfSettings.genreSource and BookshelfSettings.genreSource(filepath)
+    local resolved
+    if pref == "calibre"  and calibre  then resolved = calibre
+    elseif pref == "embedded" and embedded then resolved = embedded
+    else resolved = calibre or embedded end
+    return resolved, { calibre = calibre, embedded = embedded }
+end
+
 -- Supported e-book extensions (used in getCurrent and walkBooks via
 -- _supportedExt). Mirrors the document formats KOReader itself registers
 -- (frontend/document/*), minus pure images and code/scripts -- those are
@@ -564,13 +610,10 @@ function Repo.buildBookMeta(filepath, opts)
         title = filename
     end
 
-    -- Genres: Calibre `tags` (array) → BIM `keywords` (string) → none.
-    local genres
-    if cb and type(cb.tags) == "table" and #cb.tags > 0 then
-        genres = splitGenreTags(cb.tags)
-    elseif info.keywords and info.keywords ~= "" then
-        genres = splitGenreTags(info.keywords)
-    end
+    -- Genres honour the per-book source preference (calibre / embedded /
+    -- hardcover); with none set, auto priority Calibre > embedded. The Hardcover
+    -- override (when chosen, or auto + sync) is applied later by enrichBook.
+    local genres, genre_sources = genreData(filepath, cb, info)
 
     local book = {
         filepath    = filepath,
@@ -588,6 +631,9 @@ function Repo.buildBookMeta(filepath, opts)
         author_sort = cb and type(cb.author_sort) == "string"
                        and cb.author_sort ~= "" and cb.author_sort or nil,
         genres      = genres,
+        -- Per-source genre lists for the book-detail Tags tab's source chip bar
+        -- (Hardcover added by enrichBook). Cheap by-products of genre resolution.
+        genre_sources = genre_sources,
         -- `series` is the raw "Foundation #1" string used by some
         -- consumers; reconstruct it from Calibre fields when needed.
         series      = info.series
@@ -716,12 +762,7 @@ local function _buildLightMetaFromInfo(fp, info)
         authors = splitAuthors(info.authors)
     end
 
-    local genres
-    if cb and type(cb.tags) == "table" and #cb.tags > 0 then
-        genres = splitGenreTags(cb.tags)
-    elseif info.keywords and info.keywords ~= "" then
-        genres = splitGenreTags(info.keywords)
-    end
+    local genres, genre_sources = genreData(fp, cb, info)
 
     local filename = (fp:match("([^/]+)$") or fp):gsub("%.[^.]+$", "")
     local title
@@ -751,6 +792,7 @@ local function _buildLightMetaFromInfo(fp, info)
         author_sort = cb and type(cb.author_sort) == "string"
                        and cb.author_sort ~= "" and cb.author_sort or nil,
         genres      = genres,
+        genre_sources = genre_sources,
         title       = title,
         lang        = (cb and type(cb.languages) == "table" and cb.languages[1])
                        or info.language,

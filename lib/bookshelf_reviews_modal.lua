@@ -508,7 +508,7 @@ function ReviewsModal:_buildHeader()
     local inner = self.header_builder(self.width - 2 * pad)
     if not inner then return nil end
     self._owned_cover_bb = inner._owned_cover_bb
-    self._header_widget = FrameContainer:new{
+    local frame = FrameContainer:new{
         bordersize     = 0,
         margin         = 0,
         padding_left   = pad,
@@ -516,6 +516,32 @@ function ReviewsModal:_buildHeader()
         padding_top    = pad,
         padding_bottom = Screen:scaleBySize(8),  -- tight to the tab bar below
         inner,
+    }
+    -- Top-right close icon (nf window-close). The old title bar that carried one
+    -- was removed in favour of this cover/metadata header. Opaque white so it
+    -- sits cleanly over a long title behind it; a tap closes the popup. The icon
+    -- glyph carries more empty space above its ink than beside it (font top
+    -- bearing), so the top inset is smaller than the side to look balanced.
+    local side_m = Screen:scaleBySize(8)
+    local top_m  = Screen:scaleBySize(2)
+    local x_box = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE, bordersize = 0, margin = 0,
+        padding = Screen:scaleBySize(4),  -- small tap target around the glyph
+        TextWidget:new{ text = "\xEE\xB2\xAC",  -- U+ECAC nf-md-window_close
+            face = BFont:getFace("symbols", Screen:scaleBySize(15)),
+            fgcolor = Blitbuffer.COLOR_BLACK },
+    }
+    local x_btn = InputContainer:new{
+        dimen = Geom:new{ w = x_box:getSize().w, h = x_box:getSize().h }, x_box }
+    x_btn.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = x_btn.dimen } } }
+    x_btn.onTap = function() self:onClose(); return true end
+    local OverlapGroup = require("ui/widget/overlapgroup")
+    local hsize = frame:getSize()
+    x_btn.overlap_offset = { hsize.w - x_btn:getSize().w - side_m, top_m }
+    self._header_widget = OverlapGroup:new{
+        dimen = Geom:new{ w = hsize.w, h = hsize.h },
+        frame,
+        x_btn,
     }
     return self._header_widget
 end

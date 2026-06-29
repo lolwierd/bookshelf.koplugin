@@ -101,6 +101,19 @@ local SHELF_PACK_FLOOR = 1.0
 -- fill its card better while still leaving room for details.
 local HERO_COVER_MAX_FRAC = 0.58
 
+-- FrameContainer that pixel-inverts its own rect after painting (selected
+-- chips): paints black-on-white then flips, so the inversion is device-
+-- independent (some Kindles don't honour TextWidget fgcolor). Mirrors the
+-- segmented chips in the description tab. Defined here (above its first use in
+-- _segmentedChips) so the file-scope local is in scope.
+local InvertedFrame = require("ui/widget/container/framecontainer"):extend{}
+function InvertedFrame:paintTo(bb, x, y)
+    require("ui/widget/container/framecontainer").paintTo(self, bb, x, y)
+    if self._invert and self.dimen then
+        bb:invertRect(x, y, self.dimen.w, self.dimen.h)
+    end
+end
+
 -- ─── BookshelfWidget ──────────────────────────────────────────────────────────
 
 local BookshelfWidget = InputContainer:extend{
@@ -8414,6 +8427,7 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
             end
         end
         pill_specs[#pill_specs + 1] = {
+            cat    = "author",
             label  = display_author,
             on_tap = _wrap(function()
                 local group = Repo.findGroup("author", author_name)
@@ -8438,6 +8452,7 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
             series_label = series_label .. " #" .. tostring(book.series_num)
         end
         pill_specs[#pill_specs + 1] = {
+            cat    = "series",
             label  = series_label,
             on_tap = _wrap(function()
                 local group = Repo.findGroup("series", series_name)
@@ -8466,6 +8481,7 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
     for _i, coll_name in ipairs(_show("collections") and coll_names or {}) do
         local display = (coll_name == default_coll_name) and _("Favourites") or coll_name
         pill_specs[#pill_specs + 1] = {
+            cat    = "collections",
             label  = display,
             on_tap = _wrap(function()
                 local rc = require("readcollection")
@@ -8508,6 +8524,7 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
             if key ~= "" and not _seen[key] then
                 _seen[key] = true
                 pill_specs[#pill_specs + 1] = {
+                    cat    = "genres",
                     label  = genre_name,
                     on_tap = _wrap(function()
                         local group = Repo.findGroup("genre", genre_name)
@@ -8538,6 +8555,7 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
     if _show("folder") and parent_dir and parent_dir ~= "" and parent_dir ~= home_dir then
         local folder_label = parent_dir:match("([^/]+)$") or parent_dir
         pill_specs[#pill_specs + 1] = {
+            cat    = "folder",
             label  = folder_label,
             on_tap = _wrap(function()
                 _navResetAndClose()
@@ -8547,6 +8565,81 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
     end
 
     return pill_specs
+end
+
+-- _sectionHeadingBar(text, content_w, font_size, inset) — a full-width black
+-- strip with white uppercase text, the section heading used by the book-detail
+-- Edit and Tags tabs. Paints a hair wider than content_w so the bar reaches the
+-- window border (FrameContainer:getSize ignores `width`, so the slop can't widen
+-- the layout). Left-inset so the heading text aligns with the body text.
+function BookshelfWidget:_sectionHeadingBar(text, content_w, font_size, inset)
+    local FrameContainer = require("ui/widget/container/framecontainer")
+    local TextWidget     = require("ui/widget/textwidget")
+    local face, bold = BFont:getFace("cfont", math.max(10, (font_size or 18) - 3), { bold = true })
+    return FrameContainer:new{
+        background  = Blitbuffer.COLOR_BLACK,
+        bordersize  = 0, margin = 0, width = content_w + Size.border.window,
+        padding_left = inset, padding_right = inset,
+        padding_top = Screen:scaleBySize(4), padding_bottom = Screen:scaleBySize(4),
+        TextWidget:new{ text = TextSegments.upper(text), face = face, bold = bold,
+            fgcolor = Blitbuffer.COLOR_WHITE },
+    }
+end
+
+-- _segmentedChips(items, active_key, on_pick, font_size, inset) — a compact
+-- segmented control matching the description tab's source chips: uppercase
+-- labels, square corners, cells butted with thin separators inside one bordered
+-- frame, the active cell inverted. items = { {key=, label=}, ... }. Tapping an
+-- inactive chip fires on_pick(key). Left-inset to align with the body text.
+function BookshelfWidget:_segmentedChips(items, active_key, on_pick, font_size, inset)
+    local FrameContainer  = require("ui/widget/container/framecontainer")
+    local TextWidget      = require("ui/widget/textwidget")
+    local InputContainer  = require("ui/widget/container/inputcontainer")
+    local HorizontalGroup = require("ui/widget/horizontalgroup")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local LineWidget      = require("ui/widget/linewidget")
+    local GestureRange    = require("ui/gesturerange")
+    local sep_w = Size.border.thin
+    local h_pad = Size.padding.large
+    local v_pad = Size.padding.small
+    local size  = Screen:scaleBySize(12)
+    local labels, cell_h = {}, 0
+    for i, it in ipairs(items) do
+        local face, bold = BFont:getFace("infofont", size, { bold = true })
+        labels[i] = TextWidget:new{ text = TextSegments.upper(it.label or ""),
+            face = face, bold = bold, fgcolor = Blitbuffer.COLOR_BLACK }
+        cell_h = math.max(cell_h, labels[i]:getSize().h)
+    end
+    cell_h = cell_h + 2 * v_pad
+    local row = HorizontalGroup:new{ align = "center" }
+    for i, it in ipairs(items) do
+        if i > 1 then
+            row[#row + 1] = LineWidget:new{ background = Blitbuffer.COLOR_BLACK,
+                dimen = Geom:new{ w = sep_w, h = cell_h } }
+        end
+        local cell_w = labels[i]:getSize().w + 2 * h_pad
+        local body = InvertedFrame:new{
+            _invert = (it.key == active_key),
+            bordersize = 0, margin = 0, padding = 0, background = Blitbuffer.COLOR_WHITE,
+            CenterContainer:new{ dimen = Geom:new{ w = cell_w, h = cell_h }, labels[i] },
+        }
+        local chip = InputContainer:new{ dimen = Geom:new{ w = cell_w, h = cell_h }, body }
+        chip.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = chip.dimen } } }
+        local key = it.key
+        chip.onTap = function()
+            if key ~= active_key and on_pick then on_pick(key) end
+            return true
+        end
+        row[#row + 1] = chip
+    end
+    local framed = FrameContainer:new{
+        bordersize = Size.border.thin, margin = 0, padding = 0, row }
+    return FrameContainer:new{
+        bordersize = 0, margin = 0,
+        padding_left = inset, padding_right = inset,
+        padding_top = Screen:scaleBySize(12), padding_bottom = Screen:scaleBySize(12),
+        framed,
+    }
 end
 
 -- _buildPillGroup(pill_specs, available_w, max_rows)
@@ -9013,7 +9106,6 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
     end
 
     -- ── Hardcover availability + cached rating (read-only) ───────────────────
-    local Tokens = require("lib/bookshelf_tokens")
     local _ok_hc, _HC = pcall(require, "lib/bookshelf_hardcover")
     local hc_available = _ok_hc and _HC and _HC.isAvailable and _HC.isAvailable()
     local hc_rating
@@ -9205,18 +9297,10 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             }
         end
         local function heading(text)
-            local face, bold = BFont:getFace("cfont", math.max(10, font_size - 3), { bold = true })
-            return FrameContainer:new{
-                background  = Blitbuffer.COLOR_BLACK,
-                -- +1 border-width of paint slop on the right so the black bar
-                -- reaches the window border (the body sits a hair inside it).
-                -- getSize ignores `width`, so this can't widen the layout.
-                bordersize  = 0, margin = 0, width = content_w + Size.border.window,
-                padding_left = inset, padding_right = inset,
-                padding_top = Screen:scaleBySize(4), padding_bottom = Screen:scaleBySize(4),
-                TextWidget:new{ text = TextSegments.upper(text), face = face, bold = bold,
-                    fgcolor = Blitbuffer.COLOR_WHITE },
-            }
+            -- Pass the FULL tab width (not the scroll-reduced content_w) so the
+            -- bar reaches the frame edge; getSize ignores width, so it can't widen
+            -- the layout, and the scroll crop trims any overhang behind the bar.
+            return bw:_sectionHeadingBar(text, avail_w, font_size, inset)
         end
         local function padded(widget, top, bottom)
             return FrameContainer:new{
@@ -9240,15 +9324,20 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         first_bt = btSection(_("Reading status"), status_rows)
 
         -- 2. Ratings: editable "Your rating" stars and, inline, the read-only
-        -- Hardcover rating (hero star glyphs via Tokens.starString -- includes a
-        -- half star whose full-star outline reads as intentional -- + the value).
-        local STAR_FULL, STAR_EMPTY = "\xEF\x80\x85", "\xEF\x80\x86"  -- nf-fa-star / star_o
+        -- Hardcover rating (same star glyphs + spacing; a half star where the
+        -- rating lands on a half) plus the numeric value.
+        -- nf-fa-star / star_half_empty / star_o (the half matches the hero glyphs).
+        local STAR_FULL, STAR_HALF, STAR_EMPTY = "\xEF\x80\x85", "\xEF\x84\xA3", "\xEF\x80\x86"
         local star_size = font_size + 4
+        -- A padded star glyph. With on_tap it's an interactive (tappable) star;
+        -- without, just the padded glyph -- so interactive and read-only star rows
+        -- get identical per-star spacing.
         local function buildStar(glyph, on_tap)
             local tw = TextWidget:new{ text = glyph,
                 face = BFont:getFace("symbols", star_size), fgcolor = Blitbuffer.COLOR_BLACK }
             local frame = FrameContainer:new{
                 bordersize = 0, margin = 0, padding = Screen:scaleBySize(3), tw }
+            if not on_tap then return frame end
             local fsz = frame:getSize()
             local star = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, frame }
             star.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = star.dimen } } }
@@ -9285,15 +9374,21 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
                     if t.id == "reviews" then reviews_idx = ti; break end
                 end
             end
-            local hc_stars = TextWidget:new{
-                text = Tokens.starString(hc_rating),
-                face = BFont:getFace("symbols", star_size), fgcolor = Blitbuffer.COLOR_BLACK }
+            -- Read-only stars built the same way as the user-rating stars (same
+            -- per-star padding) so the two rows line up, with a half star where
+            -- the rating falls on a half.
+            local halves = math.floor(hc_rating * 2 + 0.5)  -- 0..10 half-units
+            local hc_stars = HorizontalGroup:new{ align = "center" }
+            for i = 1, 5 do
+                local glyph = STAR_EMPTY
+                if halves >= 2 * i then glyph = STAR_FULL
+                elseif halves == 2 * i - 1 then glyph = STAR_HALF end
+                hc_stars[#hc_stars + 1] = buildStar(glyph, nil)
+            end
             local hc_stars_widget = hc_stars
             if reviews_idx and modal._switchTab then
-                local fr  = FrameContainer:new{ bordersize = 0, margin = 0,
-                    padding = Screen:scaleBySize(2), hc_stars }
-                local fsz = fr:getSize()
-                local ic  = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, fr }
+                local fsz = hc_stars:getSize()
+                local ic  = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, hc_stars }
                 ic.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = ic.dimen } } }
                 ic.onTap = function() modal:_switchTab(reviews_idx); return true end
                 hc_stars_widget = ic
@@ -9321,44 +9416,52 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         vg[#vg + 1] = heading(_("Ratings"))
         vg[#vg + 1] = padded(ratings_widget, Screen:scaleBySize(8), Screen:scaleBySize(10))
 
-        -- A compact chip-style action button (square corners, thin border,
-        -- uppercase) matching the description tab's chips.
-        local function chipButton(label, cb)
-            local face, bold = BFont:getFace("infofont", math.max(10, font_size - 2), { bold = true })
-            local frame = FrameContainer:new{
-                bordersize = Size.border.thin, background = Blitbuffer.COLOR_WHITE,
-                radius = 0, margin = 0,
-                -- Roomy padding -> a comfortable tap target.
-                padding_left = Size.padding.large, padding_right = Size.padding.large,
-                padding_top = Size.padding.default, padding_bottom = Size.padding.default,
-                TextWidget:new{ text = TextSegments.upper(label), face = face, bold = bold,
-                    fgcolor = Blitbuffer.COLOR_BLACK },
-            }
-            local fsz = frame:getSize()
-            local btn = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, frame }
-            btn.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = btn.dimen } } }
-            btn.onTap = function() cb(); return true end
-            return btn, fsz.w
-        end
-
-        -- An info row: descriptive text on the left, a compact chip button on the
-        -- right -- used by Collections + Hardcover so the action sits inline
-        -- rather than on its own full-width row.
+        -- An info row styled like a File-&-metadata button row: the value on the
+        -- left (inset to align with the headings), a thin vertical gray separator
+        -- matching the ButtonTable column separators, then a real (borderless)
+        -- Button on the right -- same font, weight and height as the other
+        -- buttons. Used by Collections + Hardcover. Edge-to-edge so the separator
+        -- reads the same as the ones between the file buttons.
+        local CenterContainer = require("ui/widget/container/centercontainer")
+        local Button          = require("ui/widget/button")
         local function infoRow(text, btn_label, cb)
-            local btn, btn_w = chipButton(btn_label, cb)
-            local gap   = Screen:scaleBySize(12)
-            local txt_w = math.max(Screen:scaleBySize(40),
-                content_w - 2 * inset - btn_w - gap)
-            return FrameContainer:new{
-                bordersize = 0, margin = 0,
-                padding_left = inset, padding_right = inset,
-                padding_top = Screen:scaleBySize(6), padding_bottom = Screen:scaleBySize(6),
-                HorizontalGroup:new{ align = "center",
-                    TextBoxWidget:new{ text = text,
-                        face = BFont:getFace("cfont", font_size), width = txt_w },
-                    HorizontalSpan:new{ width = gap },
-                    btn },
+            local sep_w = Size.line.medium
+            -- Right cell: a borderless Button (matches the ButtonTable buttons:
+            -- bold cfont at the same size, same row height), given a wide fixed
+            -- width for a comfortable target.
+            local btn_w = Screen:scaleBySize(150)
+            local btn = Button:new{
+                text = btn_label, callback = cb,
+                text_font_size = font_size,
+                bordersize = 0, margin = 0, radius = 0,
+                -- Match the ButtonTable buttons' (taller) padding so the row is
+                -- the same height as the File & metadata rows.
+                padding = Size.padding.buttontable,
+                padding_h = Size.padding.button,
+                width = btn_w, show_parent = modal,
             }
+            local btn_h = btn:getSize().h
+            -- Left cell: the value text, inset on the left to align with headings.
+            local left_w = math.max(Screen:scaleBySize(60), content_w - sep_w - btn_w)
+            local txt = TextBoxWidget:new{ text = text,
+                face  = BFont:getFace("cfont", font_size),
+                width = math.max(Screen:scaleBySize(40), left_w - inset - Screen:scaleBySize(8)) }
+            -- Row height matches a button-table row: the button band plus the
+            -- vertical spans ButtonTable puts around each row. Grows only if the
+            -- value wraps. Value + button vertically centred within it.
+            local row_h = math.max(btn_h, txt:getSize().h) + 2 * Size.span.vertical_default
+            local top_pad = math.floor((row_h - txt:getSize().h) / 2)
+            local left_cell = FrameContainer:new{
+                bordersize = 0, margin = 0,
+                padding_left = inset, padding_right = Screen:scaleBySize(8),
+                padding_top = top_pad, padding_bottom = row_h - txt:getSize().h - top_pad,
+                txt,
+            }
+            local sep = LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
+                dimen = Geom:new{ w = sep_w, h = row_h } }
+            local btn_cell = CenterContainer:new{
+                dimen = Geom:new{ w = btn_w, h = row_h }, btn }
+            return HorizontalGroup:new{ align = "top", left_cell, sep, btn_cell }
         end
 
         -- 3. Collections: current names + inline Edit button.
@@ -9474,20 +9577,34 @@ function BookshelfWidget:_showBookDetail(book, opts)
         end,
     }
 
-    -- Tags tab (appended LAST, after description + reviews): the full pill set,
-    -- scrollable, each tappable (closes the popup then drills). Built lazily as a
-    -- native widget body when the tab is shown.
+    -- Tags tab (appended LAST, after description + reviews): the pill set split
+    -- into sections under the same black heading bars as the Edit tab (Author /
+    -- Series / Collections / Genres / Folder), scrollable, each pill tappable
+    -- (closes the popup then drills). Built lazily as a native widget body.
+    local TAG_SECTIONS = {
+        { cat = "author",      title = _("Author") },
+        { cat = "series",      title = _("Series") },
+        { cat = "collections", title = _("Collections") },
+        { cat = "genres",      title = _("Genres") },
+        { cat = "folder",      title = _("Folder") },
+    }
     local tags_tab
     if #pill_specs > 0 then
         tags_tab = {
             id = "tags",
             label = _("Tags"),
+            -- Starts with a black heading strip, like the Edit tab, so keep the
+            -- active tab's open-bottom black (no white notch).
+            dark_body = true,
             widget_builder = function(avail_w, avail_h, show_parent)
                 local FrameContainer = require("ui/widget/container/framecontainer")
-                local wrapped = {}
+                -- Group the specs by category, wrapping each tap to close first.
+                local by_cat = {}
                 for _i, s in ipairs(pill_specs) do
+                    local cat  = s.cat or "folder"
                     local orig = s.on_tap
-                    wrapped[#wrapped + 1] = {
+                    by_cat[cat] = by_cat[cat] or {}
+                    by_cat[cat][#by_cat[cat] + 1] = {
                         label  = s.label,
                         on_tap = orig and function()
                             if modal then UIManager:close(modal) end
@@ -9497,29 +9614,109 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 end
                 local lpad  = (show_parent and show_parent._side_pad)
                     or Screen:scaleBySize(20)
-                local bar_w = Screen:scaleBySize(3)  -- flush snug scrollbar
-                -- Pill size tracks the modal's font knob so the +/- buttons
-                -- resize the tags the same as the description/review tabs.
-                local base = (show_parent and show_parent.font_size) or 18
-                -- Size the pills so the padded content is exactly the snug crop
-                -- width (avail_w - bar_w): lpad each side, the bar flush right.
-                -- No content wider than the crop -> no spurious horizontal bar.
-                local pills = self:_buildPillGroup(wrapped, avail_w - 2 * lpad - bar_w,
-                    9999, base, "left", Screen:scaleBySize(8))
-                local padded = FrameContainer:new{
-                    bordersize = 0, margin = 0,
-                    padding_left = lpad, padding_right = lpad,
-                    -- Top padding matches the description tabs' body padding so
-                    -- the first pill row sits at the same height as body text.
-                    padding_top = Screen:scaleBySize(28),
-                    padding_bottom = Screen:scaleBySize(14),
-                    pills,
-                }
+                local bar_w = Screen:scaleBySize(3)   -- flush snug scrollbar
+                local base  = (show_parent and show_parent.font_size) or 18
+                local content_w = avail_w - bar_w     -- the snug crop width
+                local pills_w   = avail_w - 2 * lpad - bar_w
+                local function pillsFrame(specs)
+                    return FrameContainer:new{
+                        bordersize = 0, margin = 0,
+                        padding_left = lpad, padding_right = lpad,
+                        padding_top = Screen:scaleBySize(10),
+                        padding_bottom = Screen:scaleBySize(12),
+                        self:_buildPillGroup(specs, pills_w, 9999, base, "left",
+                            Screen:scaleBySize(8)),
+                    }
+                end
+                local vg = VerticalGroup:new{ align = "left" }
+                for _s = 1, #TAG_SECTIONS do
+                    local sec = TAG_SECTIONS[_s]
+                    if sec.cat == "genres" then
+                        -- Genres are special: a source chip bar (Embedded /
+                        -- Calibre / Hardcover) over the SELECTED source's genres.
+                        -- Picking a source persists a per-book preference and
+                        -- re-resolves genres app-wide.
+                        local srcs = book.genre_sources or {}
+                        local function has(k) return type(srcs[k]) == "table" and #srcs[k] > 0 end
+                        if has("calibre") or has("embedded") or has("hardcover") then
+                            local pref = BookshelfSettings.genreSource
+                                and BookshelfSettings.genreSource(book.filepath)
+                            local active = (pref and (has(pref) or pref == "embedded") and pref)
+                                or (has("hardcover") and "hardcover")
+                                or (has("calibre")  and "calibre")
+                                or "embedded"
+                            vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
+                            -- Embedded is always offered (it's the editable source);
+                            -- Calibre / Hardcover only when that source has genres.
+                            local SRC = {
+                                { key = "embedded",  label = _("Embedded") },
+                                { key = "calibre",   label = _("Calibre") },
+                                { key = "hardcover", label = _("Hardcover") },
+                            }
+                            local items = {}
+                            for _j = 1, #SRC do
+                                if SRC[_j].key == "embedded" or has(SRC[_j].key) then
+                                    items[#items + 1] = SRC[_j]
+                                end
+                            end
+                            if #items > 1 then
+                                vg[#vg + 1] = self:_segmentedChips(items, active, function(key)
+                                    BookshelfSettings.setGenreSource(book.filepath, key)
+                                    Repo.invalidateBookCache("genre-source")
+                                    self:_rebuild(); UIManager:setDirty(self, "ui")
+                                    if modal and modal.rebuildTab then modal:rebuildTab() end
+                                end, base, lpad)
+                            end
+                            -- Pills for the active source's genres (drill in on tap).
+                            local gpills = {}
+                            for _g = 1, #(srcs[active] or {}) do
+                                local gname = srcs[active][_g]
+                                gpills[#gpills + 1] = {
+                                    label  = gname,
+                                    on_tap = function()
+                                        if modal then UIManager:close(modal) end
+                                        local group = Repo.findGroup("genre", gname)
+                                            or { kind = "genre", series_name = gname,
+                                                 books = { book }, latest = 0 }
+                                        self._drilldown_path = {}
+                                        self:_expandGenre(group)
+                                    end,
+                                }
+                            end
+                            if #gpills > 0 then
+                                vg[#vg + 1] = pillsFrame(gpills)
+                            else
+                                -- Empty source: a quiet placeholder (Phase 2 will
+                                -- add a "+ Add" affordance for the embedded source).
+                                local msg = (active == "embedded")
+                                    and _("This book has no embedded tags.")
+                                    or _("No tags from this source.")
+                                local TextBoxWidget = require("ui/widget/textboxwidget")
+                                vg[#vg + 1] = FrameContainer:new{
+                                    bordersize = 0, margin = 0,
+                                    padding_left = lpad, padding_right = lpad,
+                                    padding_top = Screen:scaleBySize(6),
+                                    padding_bottom = Screen:scaleBySize(12),
+                                    TextBoxWidget:new{ text = msg,
+                                        face = BFont:getFace("cfont", base),
+                                        fgcolor = Blitbuffer.COLOR_GRAY,
+                                        width = pills_w },
+                                }
+                            end
+                        end
+                    else
+                        local specs = by_cat[sec.cat]
+                        if specs and #specs > 0 then
+                            vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
+                            vg[#vg + 1] = pillsFrame(specs)
+                        end
+                    end
+                end
                 return SnugScroll:new{
                     dimen = Geom:new{ w = avail_w, h = avail_h },
                     scroll_bar_width = bar_w,
                     show_parent = show_parent,
-                    padded,
+                    vg,
                 }
             end,
         }
