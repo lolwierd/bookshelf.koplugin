@@ -8684,7 +8684,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     -- extra_pad widens a pill's L/R padding (and so its tap target) without
     -- touching the others -- used to make the small "+N" overflow pill easier
     -- to hit.
-    local function _buildPill(label_text, on_tap_cb, extra_pad)
+    local function _buildPill(label_text, on_tap_cb, extra_pad, on_hold_cb)
         local label_w = TextWidget_:new{
             text = TextSegments.upper(label_text or ""),
             face = pill_face,
@@ -8713,6 +8713,10 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
         pill.ges_events = {
             Tap = { GestureRange_:new{ ges = "tap", range = pill.dimen } },
         }
+        if on_hold_cb then
+            pill.ges_events.Hold = { GestureRange_:new{ ges = "hold", range = pill.dimen } }
+            pill.onHold = function() on_hold_cb(); return true end
+        end
         pill.onTap = function()
             -- Pre-callback tap feedback: invert the pill's bg/fg, paint
             -- the new state into the fb, drain the refresh queue with
@@ -8746,7 +8750,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     local pill_widgets = {}
     for _i, spec in ipairs(pill_specs) do
         local on_tap = spec.on_tap
-        local pill, pw = _buildPill(spec.label, on_tap)
+        local pill, pw = _buildPill(spec.label, on_tap, nil, spec.on_hold)
         pill_widgets[#pill_widgets + 1] = { widget = pill, w = pw }
     end
 
@@ -9663,11 +9667,127 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                 vg[#vg + 1] = self:_segmentedChips(items, active, function(key)
                                     BookshelfSettings.setGenreSource(book.filepath, key)
                                     Repo.invalidateBookCache("genre-source")
+                                    Repo.invalidateLightMeta()  -- record content changed
                                     self:_rebuild(); UIManager:setDirty(self, "ui")
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
                                 end, base, lpad)
                             end
-                            -- Pills for the active source's genres (drill in on tap).
+                            -- Pills for the active source's genres. When Embedded
+                            -- is active they're editable: long-press removes a tag
+                            -- and a trailing "+ Add" pill prompts for a new one.
+                            -- Edits go to the shared KOReader Keywords override.
+                            local editable = (active == "embedded")
+                            local function applyEdit(new_list)
+                                Repo.setEmbeddedGenres(book.filepath, new_list)
+                                book.genre_sources = book.genre_sources or {}
+                                book.genre_sources.embedded = new_list
+                                if active == "embedded" then
+                                    book.genres = (#new_list > 0) and new_list or nil
+                                end
+                                self:_rebuild(); UIManager:setDirty(self, "ui")
+                                if modal and modal.rebuildTab then modal:rebuildTab() end
+                            end
+                            local function withoutGenre(gname)
+                                local new = {}
+                                for _g2 = 1, #(srcs[active] or {}) do
+                                    if srcs[active][_g2] ~= gname then new[#new + 1] = srcs[active][_g2] end
+                                end
+                                return new
+                            end
+                            local function addOne(name)
+                                name = (name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                                if name == "" then return end
+                                local new = {}
+                                local dup = false
+                                for _g2 = 1, #(srcs[active] or {}) do
+                                    new[#new + 1] = srcs[active][_g2]
+                                    if srcs[active][_g2]:lower() == name:lower() then dup = true end
+                                end
+                                if not dup then new[#new + 1] = name end
+                                applyEdit(new)
+                            end
+                            local function newTagDialog()
+                                local InputDialog = require("ui/widget/inputdialog")
+                                local idlg
+                                idlg = InputDialog:new{
+                                    title = _("New tag"), input = "",
+                                    buttons = {{
+                                        { text = _("Cancel"), id = "close",
+                                          callback = function() UIManager:close(idlg) end },
+                                        { text = _("Add"), is_enter_default = true,
+                                          callback = function()
+                                            local v = idlg:getInputText()
+                                            UIManager:close(idlg); addOne(v)
+                                          end },
+                                    }},
+                                }
+                                UIManager:show(idlg)
+                                idlg:onShowKeyboard()
+                            end
+                            -- Reuse the library's genre list (same data the
+                            -- "Specific genre" chip picker uses) in the same
+                            -- searchable grid picker (bookshelf_library_modal) so
+                            -- adding picks from existing tags; "New tag..." covers
+                            -- novel ones. Falls back to free text if the modal
+                            -- can't load.
+                            local function addGenre()
+                                local present = {}
+                                for _g2 = 1, #(srcs[active] or {}) do
+                                    present[srcs[active][_g2]:lower()] = true
+                                end
+                                local all = Repo.getGroupChoices and Repo.getGroupChoices("genre") or {}
+                                local choices = {}
+                                for _i = 1, #all do
+                                    local v = all[_i].value
+                                    if v and v ~= "" and not present[v:lower()] then
+                                        choices[#choices + 1] = all[_i]
+                                    end
+                                end
+                                table.sort(choices, function(a, b)
+                                    return (a.label or ""):lower() < (b.label or ""):lower() end)
+                                local ok_lm, LibraryModal = pcall(require, "lib/bookshelf_library_modal")
+                                if not (ok_lm and LibraryModal and LibraryModal.new) then
+                                    newTagDialog(); return
+                                end
+                                local query, visible = nil, choices
+                                local function recompute()
+                                    if not query or query == "" then visible = choices; return end
+                                    visible = {}
+                                    for _i = 1, #choices do
+                                        if (choices[_i].label or ""):lower():find(query:lower(), 1, true) then
+                                            visible[#visible + 1] = choices[_i]
+                                        end
+                                    end
+                                end
+                                local modal2
+                                modal2 = LibraryModal:new{ config = {
+                                    title = _("Add tag"),
+                                    search_placeholder = function() return _("Search\xE2\x80\xA6") end,
+                                    on_search_submit = function(q)
+                                        query = q; recompute()
+                                        if modal2 then modal2.page = 1; modal2:refresh() end
+                                    end,
+                                    grid_cols = 2,
+                                    cells_per_page = function()
+                                        return Screen:getWidth() > Screen:getHeight() and 8 or 10
+                                    end,
+                                    item_count = function() return #visible end,
+                                    item_at = function(idx) return visible[idx] end,
+                                    cell_renderer = function(item, dimen)
+                                        return require("lib/bookshelf_picker_cell").render(item, dimen)
+                                    end,
+                                    on_cell_tap = function(item)
+                                        UIManager:close(modal2); addOne(item.value)
+                                    end,
+                                    footer_actions = {
+                                        { label = _("New tag\xE2\x80\xA6"),
+                                          on_tap = function() UIManager:close(modal2); newTagDialog() end },
+                                        { label = _("Close"),
+                                          on_tap = function() UIManager:close(modal2) end },
+                                    },
+                                } }
+                                UIManager:show(modal2)
+                            end
                             local gpills = {}
                             for _g = 1, #(srcs[active] or {}) do
                                 local gname = srcs[active][_g]
@@ -9681,27 +9801,37 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                         self._drilldown_path = {}
                                         self:_expandGenre(group)
                                     end,
+                                    on_hold = editable
+                                        and function() applyEdit(withoutGenre(gname)) end or nil,
                                 }
                             end
-                            if #gpills > 0 then
-                                vg[#vg + 1] = pillsFrame(gpills)
-                            else
-                                -- Empty source: a quiet placeholder (Phase 2 will
-                                -- add a "+ Add" affordance for the embedded source).
-                                local msg = (active == "embedded")
-                                    and _("This book has no embedded tags.")
-                                    or _("No tags from this source.")
+                            -- Tags first.
+                            if #gpills > 0 then vg[#vg + 1] = pillsFrame(gpills) end
+                            -- Then the help / empty-state line.
+                            local msg
+                            if editable then
+                                msg = (#(srcs[active] or {}) > 0)
+                                    and _("Long-press a tag to remove it.")
+                                    or _("This book has no embedded tags.")
+                            elseif #gpills == 0 then
+                                msg = _("No tags from this source.")
+                            end
+                            if msg then
                                 local TextBoxWidget = require("ui/widget/textboxwidget")
                                 vg[#vg + 1] = FrameContainer:new{
                                     bordersize = 0, margin = 0,
                                     padding_left = lpad, padding_right = lpad,
-                                    padding_top = Screen:scaleBySize(6),
-                                    padding_bottom = Screen:scaleBySize(12),
+                                    padding_top = Screen:scaleBySize(2),
+                                    padding_bottom = editable and Screen:scaleBySize(6)
+                                        or Screen:scaleBySize(12),
                                     TextBoxWidget:new{ text = msg,
-                                        face = BFont:getFace("cfont", base),
-                                        fgcolor = Blitbuffer.COLOR_GRAY,
-                                        width = pills_w },
+                                        face = BFont:getFace("cfont", math.max(10, base - 2)),
+                                        fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
                                 }
+                            end
+                            -- "+ Add" last, after the tags + help line.
+                            if editable then
+                                vg[#vg + 1] = pillsFrame({ { label = _("+ Add"), on_tap = addGenre } })
                             end
                         end
                     else

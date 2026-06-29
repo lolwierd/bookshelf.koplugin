@@ -112,6 +112,61 @@ local function genreData(filepath, cb, info)
     return resolved, { calibre = calibre, embedded = embedded }
 end
 
+-- Write an edit of the embedded genres to KOReader's custom Keywords override
+-- (the same field Show info edits), shared both ways. `genres` is the full
+-- replacement list; an empty list clears the keywords (shows as no genres).
+-- Creates the custom-metadata file with a copy of the original doc_props (as
+-- KOReader expects) when none exists, flushes it, and broadcasts so KOReader's
+-- own book-info UIs refresh. Invalidates the book cache so genres re-resolve.
+function Repo.setEmbeddedGenres(filepath, genres)
+    if not filepath then return end
+    local DocSettings = require("docsettings")
+    local keywords = (type(genres) == "table" and #genres > 0)
+        and table.concat(genres, ", ") or ""
+    local cmf = DocSettings:findCustomMetadataFile(filepath)
+    local cds
+    if cmf then
+        cds = DocSettings.openSettingsFile(cmf)
+    else
+        cds = DocSettings.openSettingsFile()
+        -- KOReader's own setCustomMetadata stashes a copy of the ORIGINAL
+        -- doc_props here (title/authors/keywords/...) so a never-opened book
+        -- still resolves its metadata when CoverBrowser is off. A never-opened
+        -- book has no regular sidecar, so DocSettings:open() yields nothing;
+        -- fall back to BIM's extracted props (originals, no custom file exists
+        -- yet to overlay) so the copy isn't empty.
+        local props
+        local ok, sds = pcall(function() return DocSettings:open(filepath) end)
+        if ok and sds then props = sds:readSetting("doc_props") end
+        if not props or next(props) == nil then
+            local ok_bim, BookInfoManager = pcall(require, "bookinfomanager")
+            if ok_bim and BookInfoManager and BookInfoManager.getDocProps then
+                local bim_props = BookInfoManager:getDocProps(filepath)
+                if bim_props and next(bim_props) ~= nil then props = bim_props end
+            end
+        end
+        cds:saveSetting("doc_props", props or {})  -- originals, for restore/“customized”
+    end
+    local custom_props = cds:readSetting("custom_props", {})
+    custom_props.keywords = keywords
+    cds:flushCustomMetadata(filepath)
+    -- The file's effective keywords changed: drop the grouping caches AND the
+    -- light-meta records (invalidateBookCache keeps the latter warm) so genres
+    -- re-resolve from the new override on the next read.
+    Repo.invalidateBookCache("embedded-genres")
+    Repo.invalidateLightMeta()
+    local ok_ev, Event = pcall(require, "ui/event")
+    local ok_um, UIManager = pcall(require, "ui/uimanager")
+    if ok_ev and ok_um then
+        -- InvalidateMetadataCache deletes BIM's cached row so its next
+        -- getDocProps re-extracts and overlays the new keywords; without it
+        -- KOReader's Show-info keeps showing the pre-edit keywords (it reads
+        -- the stale cached row). BookMetadataChanged then refreshes the UIs.
+        UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", filepath))
+        UIManager:broadcastEvent(Event:new("BookMetadataChanged", { filepath = filepath }))
+    end
+end
+
 -- Supported e-book extensions (used in getCurrent and walkBooks via
 -- _supportedExt). Mirrors the document formats KOReader itself registers
 -- (frontend/document/*), minus pure images and code/scripts -- those are
