@@ -8939,7 +8939,6 @@ function BookshelfWidget:_commitBookStatus(book, status)
     end
 end
 
--- TEMP memory diagnostics (issue: RAM climbs using the book-detail popup).
 -- A ScrollableContainer whose vertical scrollbar sits flush against the right
 -- edge with no side padding. The stock container reserves 3x the bar width
 -- (gap | bar | gap); this reclaims both gaps so the content butts the bar and
@@ -8947,8 +8946,19 @@ end
 local SnugScroll = require("ui/widget/container/scrollablecontainer"):extend{}
 function SnugScroll:initState()
     require("ui/widget/container/scrollablecontainer").initState(self)
-    if self._v_scroll_bar and not require("ui/bidi").mirroredUILayout() then
+    if not self._is_scrollable or require("ui/bidi").mirroredUILayout() then return end
+    if self._v_scroll_bar then
         self._crop_w = self.dimen.w - self.scroll_bar_width  -- content up to the bar
+    end
+    -- The parent decided horizontal overflow against its 3x reserve, so content
+    -- sized to the snug crop still triggered a spurious horizontal bar (and ate
+    -- height). Re-decide it against the real crop width and drop the h-bar when
+    -- the content actually fits.
+    local content_w = self[1]:getSize().w
+    self._max_scroll_offset_x = math.max(0, content_w - self._crop_w)
+    if self._max_scroll_offset_x == 0 and self._h_scroll_bar then
+        self._h_scroll_bar = nil
+        self._crop_h = self.dimen.h
     end
 end
 function SnugScroll:paintTo(bb, x, y)
@@ -9473,7 +9483,6 @@ function BookshelfWidget:_showBookDetail(book, opts)
             id = "tags",
             label = _("Tags"),
             widget_builder = function(avail_w, avail_h, show_parent)
-                local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
                 local FrameContainer = require("ui/widget/container/framecontainer")
                 local wrapped = {}
                 for _i, s in ipairs(pill_specs) do
@@ -9486,25 +9495,29 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         end or nil,
                     }
                 end
-                local lpad = (show_parent and show_parent._side_pad)
+                local lpad  = (show_parent and show_parent._side_pad)
                     or Screen:scaleBySize(20)
-                local sb   = ScrollableContainer:getScrollbarWidth()
+                local bar_w = Screen:scaleBySize(3)  -- flush snug scrollbar
                 -- Pill size tracks the modal's font knob so the +/- buttons
                 -- resize the tags the same as the description/review tabs.
                 local base = (show_parent and show_parent.font_size) or 18
-                local pills = self:_buildPillGroup(wrapped, avail_w - lpad - sb,
+                -- Size the pills so the padded content is exactly the snug crop
+                -- width (avail_w - bar_w): lpad each side, the bar flush right.
+                -- No content wider than the crop -> no spurious horizontal bar.
+                local pills = self:_buildPillGroup(wrapped, avail_w - 2 * lpad - bar_w,
                     9999, base, "left", Screen:scaleBySize(8))
                 local padded = FrameContainer:new{
                     bordersize = 0, margin = 0,
-                    padding_left = lpad, padding_right = sb,
+                    padding_left = lpad, padding_right = lpad,
                     -- Top padding matches the description tabs' body padding so
                     -- the first pill row sits at the same height as body text.
                     padding_top = Screen:scaleBySize(28),
                     padding_bottom = Screen:scaleBySize(14),
                     pills,
                 }
-                return ScrollableContainer:new{
+                return SnugScroll:new{
                     dimen = Geom:new{ w = avail_w, h = avail_h },
+                    scroll_bar_width = bar_w,
                     show_parent = show_parent,
                     padded,
                 }
