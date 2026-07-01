@@ -9701,13 +9701,22 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     -- section header -- rather than being its own preceding
                     -- sibling, which would leave the box flush against IT
                     -- instead of the header, looking like it got pushed down.
+                    -- _segmentedChips already bakes in its own top/bottom
+                    -- padding (used standalone elsewhere), so skip this frame's
+                    -- own top_pad when it's present -- otherwise the two stack
+                    -- and the chips (and everything below them) sit noticeably
+                    -- lower than when they're absent (e.g. the non-editable
+                    -- Hardcover source, which renders them standalone with just
+                    -- their own padding, no wrapping top_pad at all).
                     local left_content = pills
+                    local effective_top_pad = top_pad
                     if extra_top_widget then
                         left_content = VerticalGroup:new{ align = "left",
                             extra_top_widget, pills }
+                        effective_top_pad = 0
                     end
-                    local row_h = top_pad + math.max(left_content:getSize().h, btn:getSize().h)
-                        + bottom_pad
+                    local row_h = effective_top_pad
+                        + math.max(left_content:getSize().h, btn:getSize().h) + bottom_pad
 
                     -- Left column: pills (+ extra_top_widget, if any), in their
                     -- own padded frame (unchanged rhythm vs. plain pillsFrame
@@ -9715,9 +9724,9 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     local left_col = FrameContainer:new{
                         bordersize = 0, margin = 0,
                         padding_left = lpad, padding_right = 0,
-                        padding_top = top_pad, padding_bottom = bottom_pad,
+                        padding_top = effective_top_pad, padding_bottom = bottom_pad,
                         LeftContainer:new{ dimen = Geom:new{
-                            w = left_w, h = row_h - top_pad - bottom_pad }, left_content },
+                            w = left_w, h = row_h - effective_top_pad - bottom_pad }, left_content },
                     }
                     return HorizontalGroup:new{ align = "top", left_col,
                         self:_actionButtonColumn(btn, box_w, row_h, want_bottom_border) }
