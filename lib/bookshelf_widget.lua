@@ -9503,6 +9503,13 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
                     your_group, VerticalSpan:new{ width = Screen:scaleBySize(8) }, hc_group }
             end
         end
+        -- Centre the rating row(s) within the section instead of hugging the
+        -- left inset -- reads better as a standalone block of content rather
+        -- than a left-aligned label/value pair like the rows above it.
+        ratings_widget = CenterContainer:new{
+            dimen = Geom:new{ w = content_w - 2 * inset, h = ratings_widget:getSize().h },
+            ratings_widget,
+        }
         vg[#vg + 1] = heading(_("Ratings"))
         vg[#vg + 1] = padded(ratings_widget, Screen:scaleBySize(8), Screen:scaleBySize(10))
 
