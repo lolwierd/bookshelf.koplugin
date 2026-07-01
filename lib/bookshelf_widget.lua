@@ -8664,6 +8664,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     local VerticalSpan_    = require("ui/widget/verticalspan")
     local InputContainer_  = require("ui/widget/container/inputcontainer")
     local GestureRange_    = require("ui/gesturerange")
+    local UnderlineContainer_ = require("ui/widget/container/underlinecontainer")
 
     max_rows = max_rows or 2
     -- align controls horizontal placement of the pill block (#99). Rows
@@ -8688,19 +8689,31 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
 
     -- extra_pad widens a pill's L/R padding (and so its tap target) without
     -- touching the others -- used to make the small "+N" overflow pill easier
-    -- to hit.
-    local function _buildPill(label_text, on_tap_cb, extra_pad, on_hold_cb)
+    -- to hit. link_style renders an action (e.g. "Edit…") inline with the
+    -- data pills but styled as a link -- no border, underlined label --
+    -- so it reads as an action rather than another tag.
+    local function _buildPill(label_text, on_tap_cb, extra_pad, on_hold_cb, link_style)
         local label_w = TextWidget_:new{
             text = TextSegments.upper(label_text or ""),
             face = pill_face,
             bold = pill_bold,
             max_width = pill_label_max,
         }
+        local content = label_w
+        local underline
+        if link_style then
+            underline = UnderlineContainer_:new{
+                linesize = Size.line.medium,
+                color    = Blitbuffer.COLOR_BLACK,
+                label_w,
+            }
+            content = underline
+        end
         -- Explicit white bg so the tap-feedback inversion has something to
         -- invert to black (without this, the frame's transparent fill
         -- can't be flipped). Matches KOReader's Button feedback pattern.
         local frame = FrameContainer_:new{
-            bordersize     = Size.border.thin,
+            bordersize     = link_style and 0 or Size.border.thin,
             background     = Blitbuffer.COLOR_WHITE,
             radius         = Size.radius.button,
             padding_left   = pill_pad_h + (extra_pad or 0),
@@ -8708,7 +8721,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             padding_top    = pill_pad_v,
             padding_bottom = pill_pad_v,
             margin         = 0,
-            label_w,
+            content,
         }
         local frame_size = frame:getSize()
         local pill = InputContainer_:new{
@@ -8734,6 +8747,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             if on_tap_cb and frame and frame.dimen then
                 frame.background = frame.background:invert()
                 label_w.fgcolor  = label_w.fgcolor:invert()
+                if underline then underline.color = underline.color:invert() end
                 UIManager:widgetRepaint(frame, frame.dimen.x, frame.dimen.y)
                 UIManager:setDirty(nil, "fast", frame.dimen)
                 -- This is the critical bit -- without it, setDirty
@@ -8755,7 +8769,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     local pill_widgets = {}
     for _i, spec in ipairs(pill_specs) do
         local on_tap = spec.on_tap
-        local pill, pw = _buildPill(spec.label, on_tap, nil, spec.on_hold)
+        local pill, pw = _buildPill(spec.label, on_tap, nil, spec.on_hold, spec.link)
         pill_widgets[#pill_widgets + 1] = { widget = pill, w = pw }
     end
 
@@ -9075,9 +9089,8 @@ function SnugScroll:paintTo(bb, x, y)
     self.dimen.w = real_w
 end
 
--- Shared by the Edit tab's infoRow (File & metadata / Hardcover rows) and
--- the Tags tab's pillsFrameWithEdit (Collections / Genres): a thin gray
--- separator + a pre-built Button, both centred in a cell row_h tall. The
+-- Used by the Edit tab's infoRow (File & metadata / Hardcover rows): a thin
+-- gray separator + a pre-built Button, both centred in a cell row_h tall. The
 -- separator is inset top/bottom by Size.span.vertical_default -- the same
 -- gap ButtonTable leaves around ITS OWN row separators (buttontable.lua's
 -- addVerticalSpan calls either side of addVerticalSeparator) -- rather than
@@ -9465,11 +9478,9 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         -- left (inset to align with the headings), a thin vertical gray separator
         -- matching the ButtonTable column separators, then a real (borderless)
         -- Button on the right -- same font, weight and height as the other
-        -- buttons. Used by Collections + Hardcover.
+        -- buttons. Used by the Hardcover row.
         local Button = require("ui/widget/button")
         local function infoRow(text, btn_label, cb, want_bottom_border)
-            -- Matches pillsFrameWithEdit's (Tags tab) button column width, so
-            -- both tabs' action buttons line up.
             local btn_w = Screen:scaleBySize(150)
             local btn = Button:new{
                 text = btn_label, callback = cb,
@@ -9638,7 +9649,6 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     or Screen:scaleBySize(20)
                 local bar_w = Screen:scaleBySize(3)   -- flush snug scrollbar
                 local base  = (show_parent and show_parent.font_size) or 18
-                local content_w = avail_w - bar_w     -- the snug crop width
                 local pills_w   = avail_w - 2 * lpad - bar_w
                 local function pillsFrame(specs)
                     return FrameContainer:new{
@@ -9649,87 +9659,6 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         self:_buildPillGroup(specs, pills_w, 9999, base, "left",
                             Screen:scaleBySize(8)),
                     }
-                end
-                -- Pills (if any) wrap on the left, padded the same as every other
-                -- pill section. The Edit button sits in its own column on the
-                -- right (self:_actionButtonColumn -- same helper the Edit tab's
-                -- File & metadata / Hardcover rows use), flush against the
-                -- section's own black heading bar above (this row has no top
-                -- padding of its own). A second button would sit alongside the
-                -- first in that same column without touching the pill layout.
-                -- Used by Collections (always) and editable Genres sources.
-                local function pillsFrameWithEdit(specs, on_edit, empty_text, want_bottom_border, extra_top_widget)
-                    local Button        = require("ui/widget/button")
-                    local LeftContainer = require("ui/widget/container/leftcontainer")
-                    local top_pad    = Screen:scaleBySize(10)
-                    local bottom_pad = Screen:scaleBySize(12)
-                    -- Matches infoRow's Edit/Link and Hardcover button column
-                    -- width (Edit tab), so both tabs' action buttons line up.
-                    local box_w = Screen:scaleBySize(150)
-                    local btn = Button:new{
-                        text = _("Edit\xE2\x80\xA6"), callback = on_edit,
-                        text_font_size = base,
-                        bordersize = 0, margin = 0, radius = 0,
-                        padding = Size.padding.buttontable,
-                        padding_h = Size.padding.button,
-                        width = box_w,
-                        show_parent = show_parent,
-                    }
-                    -- Row spans content_w (the full snug crop width the heading
-                    -- bar above is also drawn at), not pills_w -- pills_w already
-                    -- has a right-side lpad baked in for OTHER rows' symmetric
-                    -- pill padding, which would leave this box short of the tab's
-                    -- true right edge instead of flush with it.
-                    local left_w = math.max(Screen:scaleBySize(40),
-                        content_w - lpad - Size.line.medium - box_w)
-                    -- With no pills, an empty_text caption (e.g. "Not in any
-                    -- collection.") fills the same row as the button instead of
-                    -- leaving it blank with the caption on a separate line below.
-                    local pills
-                    if (not specs or #specs == 0) and empty_text then
-                        local TextBoxWidget = require("ui/widget/textboxwidget")
-                        pills = TextBoxWidget:new{ text = empty_text,
-                            face = BFont:getFace("cfont", math.max(10, base - 2)),
-                            fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = left_w }
-                    else
-                        pills = self:_buildPillGroup(specs, left_w, 9999, base,
-                            "left", Screen:scaleBySize(8))
-                    end
-                    -- extra_top_widget (e.g. the genre-source segmented chips)
-                    -- stacks above the pills WITHIN this same left column, so
-                    -- the Edit… box spans both and stays flush against the
-                    -- section header -- rather than being its own preceding
-                    -- sibling, which would leave the box flush against IT
-                    -- instead of the header, looking like it got pushed down.
-                    -- _segmentedChips already bakes in its own top/bottom
-                    -- padding (used standalone elsewhere), so skip this frame's
-                    -- own top_pad when it's present -- otherwise the two stack
-                    -- and the chips (and everything below them) sit noticeably
-                    -- lower than when they're absent (e.g. the non-editable
-                    -- Hardcover source, which renders them standalone with just
-                    -- their own padding, no wrapping top_pad at all).
-                    local left_content = pills
-                    local effective_top_pad = top_pad
-                    if extra_top_widget then
-                        left_content = VerticalGroup:new{ align = "left",
-                            extra_top_widget, pills }
-                        effective_top_pad = 0
-                    end
-                    local row_h = effective_top_pad
-                        + math.max(left_content:getSize().h, btn:getSize().h) + bottom_pad
-
-                    -- Left column: pills (+ extra_top_widget, if any), in their
-                    -- own padded frame (unchanged rhythm vs. plain pillsFrame
-                    -- rows).
-                    local left_col = FrameContainer:new{
-                        bordersize = 0, margin = 0,
-                        padding_left = lpad, padding_right = 0,
-                        padding_top = effective_top_pad, padding_bottom = bottom_pad,
-                        LeftContainer:new{ dimen = Geom:new{
-                            w = left_w, h = row_h - effective_top_pad - bottom_pad }, left_content },
-                    }
-                    return HorizontalGroup:new{ align = "top", left_col,
-                        self:_actionButtonColumn(btn, box_w, row_h, want_bottom_border) }
                 end
                 local vg = VerticalGroup:new{ align = "left" }
                 for _s = 1, #TAG_SECTIONS do
@@ -9767,19 +9696,10 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             -- and a trailing "+ Add" pill prompts for a new one.
                             -- Edits go to the shared KOReader Keywords override.
                             local editable = (active == "embedded")
-                            -- Captured rather than appended to vg directly: it
-                            -- needs to sit INSIDE pillsFrameWithEdit's left
-                            -- column (below), not as its own preceding sibling
-                            -- -- otherwise the Edit… box (flush against whatever
-                            -- comes right before it) ends up flush against the
-                            -- chip bar instead of the section header above it.
-                            -- inset=0 when editable: _segmentedChips bakes in its
-                            -- own left/right padding, which would otherwise stack
-                            -- with left_col's padding_left=lpad once nested inside
-                            -- it, shifting the chips right of the pills below them.
-                            -- The non-editable branch still renders this as its
-                            -- own top-level row (no left_col to inherit padding
-                            -- from), so it needs the real lpad there.
+                            -- Its own row above the pills, for every source --
+                            -- editable and read-only sources share the same
+                            -- pill-row shape below; only whether an Edit… link
+                            -- pill gets appended to it differs.
                             local source_chips
                             if #items > 1 then
                                 source_chips = self:_segmentedChips(items, active, function(key)
@@ -9788,7 +9708,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     Repo.invalidateLightMeta()  -- record content changed
                                     self:_rebuild(); UIManager:setDirty(self, "ui")
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
-                                end, base, editable and 0 or lpad)
+                                end, base, lpad)
                             end
                             local function applyEdit(new_list)
                                 Repo.setEmbeddedGenres(book.filepath, new_list)
@@ -10089,28 +10009,23 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     on_hold = function() holdMenu(gname) end,
                                 }
                             end
-                            -- Tags + "Edit…" share one row (editable sources only):
-                            -- pills wrap on the left, the edit button sits in its
-                            -- own column on the right, with source_chips (if any)
-                            -- stacked above the pills in that SAME column so the
-                            -- box still spans flush from the header -- rather than
-                            -- being its own row above, which would leave the box
-                            -- flush against the chips instead. Read-only sources
-                            -- (Calibre/Hardcover) get the chips (if any) and a
-                            -- plain pill row, no button, same as before.
-                            -- Bottom border: the help/empty-state message always
-                            -- follows this row directly (never another section's
-                            -- heading), so nothing else closes it off below.
+                            -- Tags + "Edit…" share one pill row (editable
+                            -- sources only): the edit action is just another
+                            -- pill, styled as a link and appended last, so it
+                            -- wraps inline with the rest instead of needing its
+                            -- own column. Read-only sources (Calibre/Hardcover)
+                            -- get a plain pill row, no edit action.
                             if editable then
-                                vg[#vg + 1] = pillsFrameWithEdit(gpills, editGenres, nil, true,
-                                    source_chips)
-                            else
-                                if source_chips then vg[#vg + 1] = source_chips end
-                                if #gpills > 0 then vg[#vg + 1] = pillsFrame(gpills) end
+                                gpills[#gpills + 1] = {
+                                    label  = _("Edit\xE2\x80\xA6"),
+                                    link   = true,
+                                    on_tap = editGenres,
+                                }
                             end
+                            if source_chips then vg[#vg + 1] = source_chips end
+                            if #gpills > 0 then vg[#vg + 1] = pillsFrame(gpills) end
                             -- Then the help / empty-state line -- always the last
-                            -- thing in this section now that Edit moved into the
-                            -- row above.
+                            -- thing in this section.
                             local msg
                             if editable then
                                 msg = (#(srcs[active] or {}) > 0)
@@ -10134,38 +10049,54 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         end
                     elseif sec.cat == "collections" then
                         -- Collections: the per-collection drill-in pills share a
-                        -- row with the "Edit…" button (own column, right side) that
-                        -- opens the collection manager. Always shown (even with no
-                        -- memberships) so the manager is reachable here -- this is
-                        -- the single place collections are surfaced (the Edit tab
-                        -- no longer duplicates them).
+                        -- row with an "Edit…" link pill (opens the collection
+                        -- manager), appended last so it wraps inline with the
+                        -- rest. Always shown (even with no memberships) so the
+                        -- manager is reachable here -- this is the single place
+                        -- collections are surfaced (the Edit tab no longer
+                        -- duplicates them).
                         local specs = by_cat[sec.cat]
                         vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
-                        -- Pills + "Edit…" share one row, directly under the header
-                        -- so the button box is always flush against it. With no
-                        -- memberships, "Not in any collection." fills the same row
-                        -- (passed as empty_text) instead of leaving it blank with
-                        -- the caption on a separate line below. No bottom border
-                        -- needed (omitted, defaults to none): Genres' heading bar
-                        -- always follows this section directly and closes it off.
-                        vg[#vg + 1] = pillsFrameWithEdit(specs or {}, function()
-                            -- Leave the everything-modal OPEN behind the
-                            -- collection dialog (no_header drops its redundant
-                            -- book header). On close, refresh the membership in
-                            -- place: reassign the captured pill_specs upvalue
-                            -- and rebuild the Tags tab body (which re-reads it),
-                            -- so no flash from closing/reopening the popup.
-                            require("lib/bookshelf_collection_manager").show{
-                                book = book, bw = self, no_header = true,
-                                on_close = function()
-                                    local rc = require("readcollection")
-                                    in_collections = (rc.getCollectionsWithFile
-                                        and rc:getCollectionsWithFile(book.filepath)) or {}
-                                    pill_specs = self:_buildPillSpecs(book, in_collections, nil, nil)
-                                    self:_rebuild(); UIManager:setDirty(self, "ui")
-                                    if modal and modal.rebuildTab then modal:rebuildTab() end
-                                end }
-                        end, _("Not in any collection."))
+                        local collection_pills = {}
+                        for _i = 1, #(specs or {}) do
+                            collection_pills[#collection_pills + 1] = specs[_i]
+                        end
+                        collection_pills[#collection_pills + 1] = {
+                            label  = _("Edit\xE2\x80\xA6"),
+                            link   = true,
+                            on_tap = function()
+                                -- Leave the everything-modal OPEN behind the
+                                -- collection dialog (no_header drops its
+                                -- redundant book header). On close, refresh the
+                                -- membership in place: reassign the captured
+                                -- pill_specs upvalue and rebuild the Tags tab
+                                -- body (which re-reads it), so no flash from
+                                -- closing/reopening the popup.
+                                require("lib/bookshelf_collection_manager").show{
+                                    book = book, bw = self, no_header = true,
+                                    on_close = function()
+                                        local rc = require("readcollection")
+                                        in_collections = (rc.getCollectionsWithFile
+                                            and rc:getCollectionsWithFile(book.filepath)) or {}
+                                        pill_specs = self:_buildPillSpecs(book, in_collections, nil, nil)
+                                        self:_rebuild(); UIManager:setDirty(self, "ui")
+                                        if modal and modal.rebuildTab then modal:rebuildTab() end
+                                    end }
+                            end,
+                        }
+                        vg[#vg + 1] = pillsFrame(collection_pills)
+                        if not (specs and #specs > 0) then
+                            local TextBoxWidget = require("ui/widget/textboxwidget")
+                            vg[#vg + 1] = FrameContainer:new{
+                                bordersize = 0, margin = 0,
+                                padding_left = lpad, padding_right = lpad,
+                                padding_top = Screen:scaleBySize(2),
+                                padding_bottom = Screen:scaleBySize(12),
+                                TextBoxWidget:new{ text = _("Not in any collection."),
+                                    face = BFont:getFace("cfont", math.max(10, base - 2)),
+                                    fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
+                            }
+                        end
                     else
                         local specs = by_cat[sec.cat]
                         if specs and #specs > 0 then
