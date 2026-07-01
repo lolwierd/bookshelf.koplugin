@@ -9626,7 +9626,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 -- whenever width is set). A second button would stack below the
                 -- first inside the same box without touching the pill layout.
                 -- Used by Collections (always) and editable Genres sources.
-                local function pillsFrameWithEdit(specs, on_edit)
+                local function pillsFrameWithEdit(specs, on_edit, empty_text)
                     local LineWidget    = require("ui/widget/linewidget")
                     local Button        = require("ui/widget/button")
                     local LeftContainer = require("ui/widget/container/leftcontainer")
@@ -9652,8 +9652,19 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     -- true right edge instead of flush with it.
                     local left_w = math.max(Screen:scaleBySize(40),
                         content_w - lpad - box_w)
-                    local pills  = self:_buildPillGroup(specs, left_w, 9999, base,
-                        "left", Screen:scaleBySize(8))
+                    -- With no pills, an empty_text caption (e.g. "Not in any
+                    -- collection.") fills the same row as the button instead of
+                    -- leaving it blank with the caption on a separate line below.
+                    local pills
+                    if (not specs or #specs == 0) and empty_text then
+                        local TextBoxWidget = require("ui/widget/textboxwidget")
+                        pills = TextBoxWidget:new{ text = empty_text,
+                            face = BFont:getFace("cfont", math.max(10, base - 2)),
+                            fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = left_w }
+                    else
+                        pills = self:_buildPillGroup(specs, left_w, 9999, base,
+                            "left", Screen:scaleBySize(8))
+                    end
                     local row_h = top_pad + math.max(pills:getSize().h, btn:getSize().h)
                         + bottom_pad
 
@@ -10070,10 +10081,11 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         -- no longer duplicates them).
                         local specs = by_cat[sec.cat]
                         vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
-                        -- Pills + "Edit…" first, directly under the header (like
-                        -- Genres), so the button box is always flush against it --
-                        -- an empty-state message before this row would otherwise
-                        -- sit between them and disconnect the box from the header.
+                        -- Pills + "Edit…" share one row, directly under the header
+                        -- so the button box is always flush against it. With no
+                        -- memberships, "Not in any collection." fills the same row
+                        -- (passed as empty_text) instead of leaving it blank with
+                        -- the caption on a separate line below.
                         vg[#vg + 1] = pillsFrameWithEdit(specs or {}, function()
                             -- Leave the everything-modal OPEN behind the
                             -- collection dialog (no_header drops its redundant
@@ -10091,19 +10103,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     self:_rebuild(); UIManager:setDirty(self, "ui")
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
                                 end }
-                        end)
-                        if not (specs and #specs > 0) then
-                            local TextBoxWidget = require("ui/widget/textboxwidget")
-                            vg[#vg + 1] = FrameContainer:new{
-                                bordersize = 0, margin = 0,
-                                padding_left = lpad, padding_right = lpad,
-                                padding_top = Screen:scaleBySize(2),
-                                padding_bottom = Screen:scaleBySize(6),
-                                TextBoxWidget:new{ text = _("Not in any collection."),
-                                    face = BFont:getFace("cfont", math.max(10, base - 2)),
-                                    fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
-                            }
-                        end
+                        end, _("Not in any collection."))
                     else
                         local specs = by_cat[sec.cat]
                         if specs and #specs > 0 then
