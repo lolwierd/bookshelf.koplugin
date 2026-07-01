@@ -103,10 +103,6 @@ local REVIEW_CSS = [[
     b, strong   { font-weight: bold; }
     blockquote  { margin: 0.4em 1em; color: #444444; }
     ul, ol      { margin: 0.3em 0 0.3em 1.2em; }
-    /* The inline "Refresh" action link (see reviewsHtml/show_refresh) -- plain
-       black + underline, not link-blue, so it reads the same on grayscale/
-       e-ink as the rest of the app's underlined-link convention. */
-    a      { color: inherit; text-decoration: underline; font-weight: bold; }
 ]]
 
 -- A segmented-control tab strip: text-width cells butted together inside one
@@ -499,16 +495,6 @@ function ReviewsModal:init()
         width             = self.width,
         height            = html_h,
         dialog            = self,
-        -- Inline actions embedded in the HTML (reviewsHtml's "Refresh" link)
-        -- tap through here rather than a widget overlaid on the scrollable
-        -- area, whose own scrollbar tap zone could steal the touch. Links are
-        -- namespaced "bookshelf://<action>"; only "refresh" exists today.
-        html_link_tapped_callback = function(link)
-            if link and link.uri == "bookshelf://refresh" then
-                local tab = self._tabs and self._tabs[self._active_tab]
-                if tab and tab.on_refresh then tab.on_refresh() end
-            end
-        end,
     }
 
     -- Separator line between the scrollable reviews and the button row, so

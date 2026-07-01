@@ -455,8 +455,9 @@ function Tokens.sanitiseReviewHtml(raw)
 end
 
 -- reviewsHtml(payload): build the HTML body for the Hardcover reviews modal.
--- payload = { title, rating, ratings_count, reviews_count, reviews = {...} }.
--- The book title is a bold header; each review gets a bold "Review by" line
+-- payload = { title, reviews = {...} }. The overall rating/counts/Refresh
+-- summary is a separate native widget row (bookshelf_widget.lua), not part of
+-- this HTML. The book title is a bold header; each review gets a bold "Review by" line
 -- with the reviewer name in italics plus rating/date/likes meta, then the
 -- sanitised review body. Stars use the plain Unicode star (U+2605) so they
 -- render in the MuPDF HTML engine's normal font (the Nerd Font PUA glyphs
@@ -492,33 +493,11 @@ function Tokens.reviewsHtml(payload)
         out[#out + 1] = "<h1>" .. _escHtml(payload.title) .. "</h1>"
     end
 
-    -- Overall rating: the shared star glyph row (in a span so only the glyphs
-    -- use the embedded symbols font), with the rating/review counts inline on
-    -- the SAME line, just after the stars. A Refresh link (payload.show_refresh)
-    -- goes last on this same line -- inline with the ratings/totals rather than
-    -- a widget pinned over the scrollable area, which the scrollbar's own tap
-    -- zone could steal taps from. ScrollHtmlWidget supports tapping HTML links
-    -- (html_link_tapped_callback, wired in bookshelf_reviews_modal.lua) via a
-    -- custom "bookshelf://" URI scheme.
-    local parts = {}
-    local rating = tonumber(payload.rating)
-    if rating and rating > 0 then
-        parts[#parts + 1] = '<span class="stars">' .. Tokens.starString(rating) .. "</span>"
-            .. " " .. string.format("%.1f", rating)
-    end
-    if tonumber(payload.ratings_count) and tonumber(payload.ratings_count) > 0 then
-        parts[#parts + 1] = string.format("%d ratings", tonumber(payload.ratings_count))
-    end
-    if tonumber(payload.reviews_count) and tonumber(payload.reviews_count) > 0 then
-        parts[#parts + 1] = string.format("%d reviews", tonumber(payload.reviews_count))
-    end
-    if payload.show_refresh then
-        parts[#parts + 1] = '<a href="bookshelf://refresh">' .. _escHtml(_("Refresh")) .. "</a>"
-    end
-    if #parts > 0 then
-        out[#out + 1] = '<p class="rating">' .. table.concat(parts, " \xC2\xB7 ") .. "</p>"
-    end
-
+    -- The overall rating/counts/Refresh summary line now renders as native
+    -- widgets above this HTML (bookshelf_widget.lua's ReviewsHeader) instead
+    -- of here: an HTML <a> link had no tap feedback and couldn't easily match
+    -- the surrounding text's own (zoom-adjustable) font size. Per-review star
+    -- rows below still use the HTML star glyphs (Tokens.starString).
     local reviews = type(payload.reviews) == "table" and payload.reviews or {}
     if #reviews == 0 then
         out[#out + 1] = "<p>No non-spoiler reviews found.</p>"

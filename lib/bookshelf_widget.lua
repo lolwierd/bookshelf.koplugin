@@ -9611,6 +9611,117 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
     return scroll
 end
 
+-- Native "★★★★☆ 3.6 · 54 ratings · 14 reviews  [reload Refresh]" header row for
+-- the Reviews tab, sitting above its own HTML review list (_buildReviewsTab
+-- below). The summary used to be part of that HTML with an inline "Refresh"
+-- <a> link; moved out to a native row so Refresh gets real tap feedback
+-- (pixel-inverts while the fetch is in flight) and its label can match the
+-- summary text's own (zoom-adjustable) font size, using the same small-button
+-- style as the Icons Library's search/close buttons (bookshelf_chip_button).
+function BookshelfWidget:_buildReviewsHeader(tab, modal, avail_w, refreshReviews)
+    local HorizontalSpan = require("ui/widget/horizontalspan")
+    local VerticalSpan   = require("ui/widget/verticalspan")
+    local ChipButton     = require("lib/bookshelf_chip_button")
+    local font_size = (modal and modal.font_size) or 20
+    local inset = (modal and modal._side_pad) or Screen:scaleBySize(28)
+    local content_w = avail_w - 2 * inset
+
+    -- Same read-only star glyphs/sizing as the Edit tab's Hardcover rating row.
+    local STAR_FULL, STAR_HALF, STAR_EMPTY = "\xEF\x80\x85", "\xEF\x84\xA3", "\xEF\x80\x86"
+    local star_face = BFont:getFace("symbols", font_size + 4)
+    local text_face = BFont:getFace("cfont", font_size)
+
+    local left = HorizontalGroup:new{ align = "center" }
+    local data = tab.data
+    local rating = data and tonumber(data.rating)
+    if rating and rating > 0 then
+        local halves = math.floor(rating * 2 + 0.5)  -- 0..10 half-units
+        for i = 1, 5 do
+            local glyph = STAR_EMPTY
+            if halves >= 2 * i then glyph = STAR_FULL
+            elseif halves == 2 * i - 1 then glyph = STAR_HALF end
+            left[#left + 1] = FrameContainer:new{
+                bordersize = 0, margin = 0, padding = Screen:scaleBySize(3),
+                TextWidget:new{ text = glyph, face = star_face, fgcolor = Blitbuffer.COLOR_BLACK },
+            }
+        end
+        left[#left + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(6) }
+        left[#left + 1] = TextWidget:new{
+            text = string.format("%.1f", rating), face = text_face, fgcolor = Blitbuffer.COLOR_BLACK }
+    end
+    local function addStat(text)
+        if #left > 0 then
+            left[#left + 1] = TextWidget:new{
+                text = "  \xC2\xB7  ", face = text_face, fgcolor = Blitbuffer.COLOR_BLACK }
+        end
+        left[#left + 1] = TextWidget:new{ text = text, face = text_face, fgcolor = Blitbuffer.COLOR_BLACK }
+    end
+    if data and tonumber(data.ratings_count) and tonumber(data.ratings_count) > 0 then
+        addStat(string.format(_("%d ratings"), tonumber(data.ratings_count)))
+    end
+    if data and tonumber(data.reviews_count) and tonumber(data.reviews_count) > 0 then
+        addStat(string.format(_("%d reviews"), tonumber(data.reviews_count)))
+    end
+
+    -- Refresh chip: sized to the summary text's own line height so it reads as
+    -- part of the same line, pixel-inverted while a fetch is in flight.
+    local probe = TextWidget:new{ text = "Hg", face = text_face }
+    local text_h = probe:getSize().h
+    local refresh_btn = ChipButton.build{
+        text      = _("Refresh"),
+        face      = text_face,
+        icon      = "cre.render.reload",
+        icon_size = text_h,
+        height    = text_h + 2 * Screen:scaleBySize(5),
+        inverted  = tab.busy or false,
+        on_tap    = function() if not tab.busy then refreshReviews() end end,
+    }
+
+    local left_w, right_w = left:getSize().w, refresh_btn:getSize().w
+    local gap = Screen:scaleBySize(10)
+    local row
+    if left_w > 0 and left_w + gap + right_w <= content_w then
+        row = HorizontalGroup:new{ align = "center",
+            left, HorizontalSpan:new{ width = content_w - left_w - right_w }, refresh_btn }
+    elseif left_w > 0 then
+        -- Doesn't fit side by side (narrow screen / large zoom) -- stack.
+        row = VerticalGroup:new{ align = "left",
+            left, VerticalSpan:new{ width = Screen:scaleBySize(6) }, refresh_btn }
+    else
+        -- No rating data yet (still loading) -- just the button, flush right
+        -- where it'll end up once the summary text appears.
+        row = HorizontalGroup:new{ align = "center",
+            HorizontalSpan:new{ width = math.max(0, content_w - right_w) }, refresh_btn }
+    end
+
+    return FrameContainer:new{
+        bordersize = 0, margin = 0,
+        padding_left = inset, padding_right = inset,
+        padding_top = Screen:scaleBySize(10), padding_bottom = Screen:scaleBySize(10),
+        row,
+    }
+end
+
+-- _buildReviewsTab: the Reviews tab's body -- the native header above, then
+-- the review-list HTML in its own scroller sized to whatever height the
+-- header leaves. A dedicated ScrollHtmlWidget rather than the modal's shared
+-- one, so this tab's own native header can sit above it without disturbing
+-- the shared scroller's fixed height used by the other (headerless) HTML tabs.
+function BookshelfWidget:_buildReviewsTab(tab, modal, avail_w, avail_h, refreshReviews)
+    local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
+    local header = self:_buildReviewsHeader(tab, modal, avail_w, refreshReviews)
+    local header_h = header:getSize().h
+    local scroller = ScrollHtmlWidget:new{
+        html_body         = tab.html or "<p></p>",
+        css               = modal._css,
+        default_font_size = Screen:scaleBySize((modal and modal.font_size) or 20),
+        width             = avail_w,
+        height            = math.max(Screen:scaleBySize(80), avail_h - header_h),
+        dialog            = modal,
+    }
+    return VerticalGroup:new{ align = "left", header, scroller }
+end
+
 -- _showBookDetail(book, opts) — the combined book-detail popup, a tabbed window:
 -- an Edit tab (the book actions, immediate-commit -- replaces the long-press
 -- ButtonDialog menu), the book/Hardcover Description tab(s), a Hardcover Reviews
@@ -10225,51 +10336,57 @@ function BookshelfWidget:_showBookDetail(book, opts)
         and Hardcover.getLink(book.filepath) or nil
     local book_id = book.hardcover_book_id or (link and link.book_id)
     local has_reviews = (ok_hc and Hardcover and book_id) and true or false
-    local function reviewsHtml(result)
-        return Tokens.reviewsHtml{
-            -- No title: the popup header already shows the book title/author.
-            rating        = result.rating,
-            ratings_count = result.ratings_count,
-            reviews_count = result.reviews_count,
-            reviews       = result.reviews,
-            -- Inline Refresh link, next to the ratings/totals line (a tap
-            -- lands on ReviewsModal's html_link_tapped_callback).
-            show_refresh  = true,
-        }
+    -- No title: the popup header already shows the book title/author. The
+    -- rating/counts summary is a native row (_buildReviewsHeader), not part
+    -- of this HTML -- only the review list itself renders here.
+    local function reviewsListHtml(result)
+        return Tokens.reviewsHtml{ reviews = result and result.reviews }
     end
     local reviews_pending
-    -- Named so both the initial cache-miss load and the tab's own Refresh
-    -- link (see on_refresh below) can trigger the same re-fetch; `modal` is
-    -- assigned after this closure is created but before either caller can
-    -- actually invoke it (upvalue, read at call time).
+    local reviews_tab  -- forward ref: refreshReviews mutates it, its
+                        -- widget_builder (below) reads it back each rebuild.
+    -- Named so both the initial cache-miss load and the header's Refresh
+    -- button can trigger the same re-fetch; `modal` is assigned after this
+    -- closure is created but before either caller can actually invoke it
+    -- (upvalue, read at call time).
     local function refreshReviews()
+        if not reviews_tab then return end
+        reviews_tab.busy = true
+        if modal and modal._active_tab == reviews_idx and modal.rebuildTab then
+            modal:rebuildTab()
+        end
         Hardcover.fetchReviewsOnline(book_id, {}, function(ok, result)
             if modal._dismissed then return end
-            local html
+            reviews_tab.busy = false
             if ok and type(result) == "table" then
-                html = reviewsHtml(result)
+                reviews_tab.data = result
+                reviews_tab.html = reviewsListHtml(result)
             else
-                html = "<p>" .. _("Reviews couldn't be fetched.") .. "</p>"
+                reviews_tab.html = "<p>" .. _("Reviews couldn't be fetched.") .. "</p>"
             end
-            if modal.setTabHtml then modal:setTabHtml(reviews_idx, html) end
+            if modal._active_tab == reviews_idx and modal.rebuildTab then
+                modal:rebuildTab()
+            end
         end)
     end
     if has_reviews then
         reviews_idx = #tabs + 1
-        local html = "<p>" .. _("Loading reviews\xE2\x80\xA6") .. "</p>"
+        local data, html
         local ok_cached, cached = Hardcover.fetchReviews(book_id, { cache_only = true })
         if ok_cached and type(cached) == "table" then
-            html = reviewsHtml(cached)
+            data = cached
+            html = reviewsListHtml(cached)
         else
+            html = "<p>" .. _("Loading reviews\xE2\x80\xA6") .. "</p>"
             reviews_pending = true
         end
-        -- on_refresh: a chip pinned top-right of this tab's scrollable body
-        -- (ReviewsModal:_assemble) -- replaces the standalone reviews
-        -- popup's old footer Refresh button, lost when Reviews became a tab
-        -- of the shared book-detail modal (the footer is now shared chrome
-        -- across every tab, not reviews-specific).
-        tabs[reviews_idx] = { id = "reviews", label = _("Reviews"), html = html,
-            on_refresh = refreshReviews }
+        reviews_tab = {
+            id = "reviews", label = _("Reviews"), data = data, html = html,
+            widget_builder = function(avail_w, avail_h, show_parent)
+                return self:_buildReviewsTab(reviews_tab, show_parent, avail_w, avail_h, refreshReviews)
+            end,
+        }
+        tabs[reviews_idx] = reviews_tab
     end
 
     -- Tags last.
