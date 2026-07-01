@@ -8412,33 +8412,46 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
 
     local pill_specs = {}
 
-    -- 1. Author. Display respects the "Author name formatting" setting
-    -- so the pill matches the form used elsewhere (hero, Authors chip).
-    -- Drilldown still keys on the RAW author so the lookup matches the
-    -- group regardless of which form the user has selected.
-    if _show("author") and book.author and book.author ~= "" then
-        local author_name = book.author
-        local display_author = author_name
-        local fmt = BookshelfSettings.read("author_format") or "auto"
-        if fmt ~= "auto" then
-            local ok_a, _AN = pcall(require, "lib/bookshelf_author_name")
-            if ok_a and _AN and _AN.formatted then
-                display_author = _AN.formatted(author_name, fmt)
+    -- 1. Author(s): one pill per co-author (book.authors, KOReader's own
+    -- one-per-<dc:creator>-line split), not just book.author (= authors[1]),
+    -- so a multi-author book doesn't silently lose every name but the
+    -- first. Falls back to the single book.author field for older/simpler
+    -- records that never populated the authors array. Display respects the
+    -- "Author name formatting" setting so each pill matches the form used
+    -- elsewhere (hero, Authors chip). Drilldown still keys on the RAW name
+    -- so the lookup matches the group regardless of the display form.
+    if _show("author") then
+        local names = (type(book.authors) == "table" and #book.authors > 0)
+            and book.authors
+            or (book.author and book.author ~= "" and { book.author } or nil)
+        if names then
+            local fmt = BookshelfSettings.read("author_format") or "auto"
+            local AuthorName
+            if fmt ~= "auto" then
+                local ok_a, mod = pcall(require, "lib/bookshelf_author_name")
+                if ok_a then AuthorName = mod end
+            end
+            for _i = 1, #names do
+                local author_name = names[_i]
+                local display_author = author_name
+                if AuthorName and AuthorName.formatted then
+                    display_author = AuthorName.formatted(author_name, fmt)
+                end
+                pill_specs[#pill_specs + 1] = {
+                    cat    = "author",
+                    label  = display_author,
+                    on_tap = _wrap(function()
+                        local group = Repo.findGroup("author", author_name)
+                        if not group then
+                            group = { kind = "author", series_name = author_name,
+                                      books = { book }, latest = 0 }
+                        end
+                        _navResetAndClose()
+                        bw:_expandAuthor(group)
+                    end),
+                }
             end
         end
-        pill_specs[#pill_specs + 1] = {
-            cat    = "author",
-            label  = display_author,
-            on_tap = _wrap(function()
-                local group = Repo.findGroup("author", author_name)
-                if not group then
-                    group = { kind = "author", series_name = author_name,
-                              books = { book }, latest = 0 }
-                end
-                _navResetAndClose()
-                bw:_expandAuthor(group)
-            end),
-        }
     end
 
     -- 2. Series -- appends " #N" when book.series_num is set so the
@@ -9799,7 +9812,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
     -- Series / Collections / Genres / Folder), scrollable, each pill tappable
     -- (closes the popup then drills). Built lazily as a native widget body.
     local TAG_SECTIONS = {
-        { cat = "author",      title = _("Author") },
+        { cat = "author",      title = _("Author(s)") },
         { cat = "series",      title = _("Series") },
         { cat = "collections", title = _("Collections") },
         { cat = "genres",      title = _("Genres") },
@@ -9817,6 +9830,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 local FrameContainer = require("ui/widget/container/framecontainer")
                 local LineWidget = require("ui/widget/linewidget")
                 local ChipButton = require("lib/bookshelf_chip_button")
+                local HorizontalSpan = require("ui/widget/horizontalspan")
                 -- Group the specs by category, wrapping each tap to close first.
                 local by_cat = {}
                 for _i, s in ipairs(pill_specs) do
@@ -9854,8 +9868,10 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 -- (same ChipButton style as the Reviews tab's Refresh) below
                 -- an editable section's pills -- replaces the earlier inline
                 -- "Edit…" link pill, which read as just another tag rather
-                -- than a distinct action.
-                local function editActionRow(on_tap)
+                -- than a distinct action. An optional help/empty-state
+                -- message (e.g. "Not in any collection.") sits inline to the
+                -- button's right, in the same row, instead of its own line.
+                local function editActionRow(on_tap, msg)
                     local edit_face = BFont:getFace("cfont", base)
                     local probe = TextWidget:new{ text = "Hg", face = edit_face }
                     local text_h = probe:getSize().h
@@ -9871,6 +9887,19 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         height    = text_h + 2 * Screen:scaleBySize(5),
                         on_tap    = on_tap,
                     }
+                    local row = btn
+                    if msg and msg ~= "" then
+                        local gap = Screen:scaleBySize(12)
+                        local msg_w = math.max(Screen:scaleBySize(40),
+                            pills_w - btn:getSize().w - gap)
+                        row = HorizontalGroup:new{ align = "center",
+                            btn,
+                            HorizontalSpan:new{ width = gap },
+                            TextBoxWidget:new{ text = msg,
+                                face = BFont:getFace("cfont", math.max(10, base - 2)),
+                                fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = msg_w },
+                        }
+                    end
                     return VerticalGroup:new{ align = "left",
                         hairline,
                         FrameContainer:new{
@@ -9878,7 +9907,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             padding_left = lpad, padding_right = lpad,
                             padding_top = Screen:scaleBySize(10),
                             padding_bottom = Screen:scaleBySize(20),
-                            btn,
+                            row,
                         },
                     }
                 end
@@ -10257,33 +10286,28 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             end
                             if source_chips then vg[#vg + 1] = source_chips end
                             if #gpills > 0 then vg[#vg + 1] = pillsFrame(gpills) end
-                            -- Then the help / empty-state line -- always the last
-                            -- thing in this section.
-                            local msg
+                            -- Editable (Embedded) source: the help line sits
+                            -- inline with the Edit button's hairline row, not
+                            -- another pill or its own line. Read-only sources
+                            -- (Calibre/Hardcover) get no edit action, so an
+                            -- empty-source message (if any) stays on its own
+                            -- line -- there's no button row to pair it with.
                             if editable then
-                                msg = (#(srcs[active] or {}) > 0)
+                                local msg = (#(srcs[active] or {}) > 0)
                                     and _("Long-press a tag for options.")
                                     or _("This book has no embedded tags.")
+                                vg[#vg + 1] = editActionRow(editGenres, msg)
                             elseif #gpills == 0 then
-                                msg = _("No tags from this source.")
-                            end
-                            if msg then
-                                local TextBoxWidget = require("ui/widget/textboxwidget")
                                 vg[#vg + 1] = FrameContainer:new{
                                     bordersize = 0, margin = 0,
                                     padding_left = lpad, padding_right = lpad,
                                     padding_top = Screen:scaleBySize(2),
                                     padding_bottom = Screen:scaleBySize(20),
-                                    TextBoxWidget:new{ text = msg,
+                                    TextBoxWidget:new{ text = _("No tags from this source."),
                                         face = BFont:getFace("cfont", math.max(10, base - 2)),
                                         fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
                                 }
                             end
-                            -- Editable (Embedded) source only: a hairline +
-                            -- left-aligned Edit button, not another pill --
-                            -- read-only sources (Calibre/Hardcover) get no
-                            -- edit action.
-                            if editable then vg[#vg + 1] = editActionRow(editGenres) end
                         end
                     elseif sec.cat == "collections" then
                         -- Collections: the per-collection drill-in pills, then
@@ -10313,21 +10337,15 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
                                 end }
                         end
+                        -- Empty state sits inline with the Edit button's
+                        -- hairline row rather than its own line above it.
+                        local collections_msg
                         if specs and #specs > 0 then
                             vg[#vg + 1] = pillsFrame(specs)
                         else
-                            local TextBoxWidget = require("ui/widget/textboxwidget")
-                            vg[#vg + 1] = FrameContainer:new{
-                                bordersize = 0, margin = 0,
-                                padding_left = lpad, padding_right = lpad,
-                                padding_top = Screen:scaleBySize(2),
-                                padding_bottom = Screen:scaleBySize(20),
-                                TextBoxWidget:new{ text = _("Not in any collection."),
-                                    face = BFont:getFace("cfont", math.max(10, base - 2)),
-                                    fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
-                            }
+                            collections_msg = _("Not in any collection.")
                         end
-                        vg[#vg + 1] = editActionRow(editCollections)
+                        vg[#vg + 1] = editActionRow(editCollections, collections_msg)
                     else
                         local specs = by_cat[sec.cat]
                         if specs and #specs > 0 then
