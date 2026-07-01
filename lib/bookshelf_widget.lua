@@ -9645,7 +9645,13 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         width = box_w - border_w,
                         show_parent = show_parent,
                     }
-                    local left_w = math.max(Screen:scaleBySize(40), pills_w - box_w)
+                    -- Row spans content_w (the full snug crop width the heading
+                    -- bar above is also drawn at), not pills_w -- pills_w already
+                    -- has a right-side lpad baked in for OTHER rows' symmetric
+                    -- pill padding, which would leave this box short of the tab's
+                    -- true right edge instead of flush with it.
+                    local left_w = math.max(Screen:scaleBySize(40),
+                        content_w - lpad - box_w)
                     local pills  = self:_buildPillGroup(specs, left_w, 9999, base,
                         "left", Screen:scaleBySize(8))
                     local row_h = top_pad + math.max(pills:getSize().h, btn:getSize().h)
@@ -9669,11 +9675,11 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         btn }
                     local boxed_btn = VerticalGroup:new{ align = "left",
                         HorizontalGroup:new{ align = "top",
-                            LineWidget:new{ background = Blitbuffer.COLOR_BLACK,
+                            LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
                                 dimen = Geom:new{ w = border_w, h = row_h - border_w } },
                             btn_area,
                         },
-                        LineWidget:new{ background = Blitbuffer.COLOR_BLACK,
+                        LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
                             dimen = Geom:new{ w = box_w, h = border_w } },
                     }
                     return HorizontalGroup:new{ align = "top", left_col, boxed_btn }
