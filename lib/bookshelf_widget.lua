@@ -8580,7 +8580,7 @@ function BookshelfWidget:_sectionHeadingBar(text, content_w, font_size, inset)
         background  = Blitbuffer.COLOR_BLACK,
         bordersize  = 0, margin = 0, width = content_w + Size.border.window,
         padding_left = inset, padding_right = inset,
-        padding_top = Screen:scaleBySize(4), padding_bottom = Screen:scaleBySize(4),
+        padding_top = Screen:scaleBySize(7), padding_bottom = Screen:scaleBySize(4),
         TextWidget:new{ text = TextSegments.upper(text), face = face, bold = bold,
             fgcolor = Blitbuffer.COLOR_WHITE },
     }
