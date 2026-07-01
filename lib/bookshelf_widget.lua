@@ -10070,18 +10070,10 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         -- no longer duplicates them).
                         local specs = by_cat[sec.cat]
                         vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
-                        if not (specs and #specs > 0) then
-                            local TextBoxWidget = require("ui/widget/textboxwidget")
-                            vg[#vg + 1] = FrameContainer:new{
-                                bordersize = 0, margin = 0,
-                                padding_left = lpad, padding_right = lpad,
-                                padding_top = Screen:scaleBySize(2),
-                                padding_bottom = Screen:scaleBySize(6),
-                                TextBoxWidget:new{ text = _("Not in any collection."),
-                                    face = BFont:getFace("cfont", math.max(10, base - 2)),
-                                    fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
-                            }
-                        end
+                        -- Pills + "Edit…" first, directly under the header (like
+                        -- Genres), so the button box is always flush against it --
+                        -- an empty-state message before this row would otherwise
+                        -- sit between them and disconnect the box from the header.
                         vg[#vg + 1] = pillsFrameWithEdit(specs or {}, function()
                             -- Leave the everything-modal OPEN behind the
                             -- collection dialog (no_header drops its redundant
@@ -10100,6 +10092,18 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
                                 end }
                         end)
+                        if not (specs and #specs > 0) then
+                            local TextBoxWidget = require("ui/widget/textboxwidget")
+                            vg[#vg + 1] = FrameContainer:new{
+                                bordersize = 0, margin = 0,
+                                padding_left = lpad, padding_right = lpad,
+                                padding_top = Screen:scaleBySize(2),
+                                padding_bottom = Screen:scaleBySize(6),
+                                TextBoxWidget:new{ text = _("Not in any collection."),
+                                    face = BFont:getFace("cfont", math.max(10, base - 2)),
+                                    fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
+                            }
+                        end
                     else
                         local specs = by_cat[sec.cat]
                         if specs and #specs > 0 then
