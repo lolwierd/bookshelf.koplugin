@@ -8664,7 +8664,6 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     local VerticalSpan_    = require("ui/widget/verticalspan")
     local InputContainer_  = require("ui/widget/container/inputcontainer")
     local GestureRange_    = require("ui/gesturerange")
-    local UnderlineContainer_ = require("ui/widget/container/underlinecontainer")
 
     max_rows = max_rows or 2
     -- align controls horizontal placement of the pill block (#99). Rows
@@ -8699,16 +8698,6 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             bold = pill_bold,
             max_width = pill_label_max,
         }
-        local content = label_w
-        local underline
-        if link_style then
-            underline = UnderlineContainer_:new{
-                linesize = Size.line.medium,
-                color    = Blitbuffer.COLOR_BLACK,
-                label_w,
-            }
-            content = underline
-        end
         -- Explicit white bg so the tap-feedback inversion has something to
         -- invert to black (without this, the frame's transparent fill
         -- can't be flipped). Matches KOReader's Button feedback pattern.
@@ -8721,9 +8710,27 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             padding_top    = pill_pad_v,
             padding_bottom = pill_pad_v,
             margin         = 0,
-            content,
+            label_w,
         }
         local frame_size = frame:getSize()
+        -- link_style paints the underline as an overlay inside the frame's
+        -- own bottom padding (the same padding a bordered pill already
+        -- reserves) instead of wrapping label_w in a taller container --
+        -- that would grow this pill past its siblings' height and shift
+        -- its text upward once the row vertically centres pills of
+        -- different heights.
+        local underline_color
+        if link_style then
+            underline_color = Blitbuffer.COLOR_BLACK
+            local ul_h     = Size.line.medium
+            local ul_w     = label_w:getSize().w
+            local ul_x_off = pill_pad_h + (extra_pad or 0)
+            local ul_y_off = frame_size.h - ul_h
+            function frame:paintTo(bb, x, y)
+                FrameContainer_.paintTo(self, bb, x, y)
+                bb:paintRect(x + ul_x_off, y + ul_y_off, ul_w, ul_h, underline_color)
+            end
+        end
         local pill = InputContainer_:new{
             dimen = Geom:new{ w = frame_size.w, h = frame_size.h },
             frame,
@@ -8747,7 +8754,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             if on_tap_cb and frame and frame.dimen then
                 frame.background = frame.background:invert()
                 label_w.fgcolor  = label_w.fgcolor:invert()
-                if underline then underline.color = underline.color:invert() end
+                if underline_color then underline_color = underline_color:invert() end
                 UIManager:widgetRepaint(frame, frame.dimen.x, frame.dimen.y)
                 UIManager:setDirty(nil, "fast", frame.dimen)
                 -- This is the critical bit -- without it, setDirty
@@ -10017,7 +10024,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             -- get a plain pill row, no edit action.
                             if editable then
                                 gpills[#gpills + 1] = {
-                                    label  = _("Edit\xE2\x80\xA6"),
+                                    label  = _("Edit…"),
                                     link   = true,
                                     on_tap = editGenres,
                                 }
@@ -10062,7 +10069,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             collection_pills[#collection_pills + 1] = specs[_i]
                         end
                         collection_pills[#collection_pills + 1] = {
-                            label  = _("Edit\xE2\x80\xA6"),
+                            label  = _("Edit…"),
                             link   = true,
                             on_tap = function()
                                 -- Leave the everything-modal OPEN behind the
