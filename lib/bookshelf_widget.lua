@@ -9663,7 +9663,11 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         bordersize = 0, margin = 0,
                         padding_left = lpad, padding_right = lpad,
                         padding_top = Screen:scaleBySize(10),
-                        padding_bottom = Screen:scaleBySize(12),
+                        -- Section heading bars have no top margin of their own
+                        -- (self:_sectionHeadingBar) -- this is the only gap
+                        -- between one section's pills and the next heading, so
+                        -- it's a bit larger than the pill row's own top pad.
+                        padding_bottom = Screen:scaleBySize(20),
                         self:_buildPillGroup(specs, pills_w, 9999, base, "left",
                             Screen:scaleBySize(8)),
                     }
@@ -10059,7 +10063,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     bordersize = 0, margin = 0,
                                     padding_left = lpad, padding_right = lpad,
                                     padding_top = Screen:scaleBySize(2),
-                                    padding_bottom = Screen:scaleBySize(12),
+                                    padding_bottom = Screen:scaleBySize(20),
                                     TextBoxWidget:new{ text = msg,
                                         face = BFont:getFace("cfont", math.max(10, base - 2)),
                                         fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
@@ -10110,7 +10114,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                 bordersize = 0, margin = 0,
                                 padding_left = lpad, padding_right = lpad,
                                 padding_top = Screen:scaleBySize(2),
-                                padding_bottom = Screen:scaleBySize(12),
+                                padding_bottom = Screen:scaleBySize(20),
                                 TextBoxWidget:new{ text = _("Not in any collection."),
                                     face = BFont:getFace("cfont", math.max(10, base - 2)),
                                     fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
