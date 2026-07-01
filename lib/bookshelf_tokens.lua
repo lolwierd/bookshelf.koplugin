@@ -494,7 +494,12 @@ function Tokens.reviewsHtml(payload)
 
     -- Overall rating: the shared star glyph row (in a span so only the glyphs
     -- use the embedded symbols font), with the rating/review counts inline on
-    -- the SAME line, just after the stars.
+    -- the SAME line, just after the stars. A Refresh link (payload.show_refresh)
+    -- goes last on this same line -- inline with the ratings/totals rather than
+    -- a widget pinned over the scrollable area, which the scrollbar's own tap
+    -- zone could steal taps from. ScrollHtmlWidget supports tapping HTML links
+    -- (html_link_tapped_callback, wired in bookshelf_reviews_modal.lua) via a
+    -- custom "bookshelf://" URI scheme.
     local parts = {}
     local rating = tonumber(payload.rating)
     if rating and rating > 0 then
@@ -506,6 +511,9 @@ function Tokens.reviewsHtml(payload)
     end
     if tonumber(payload.reviews_count) and tonumber(payload.reviews_count) > 0 then
         parts[#parts + 1] = string.format("%d reviews", tonumber(payload.reviews_count))
+    end
+    if payload.show_refresh then
+        parts[#parts + 1] = '<a href="bookshelf://refresh">' .. _escHtml(_("Refresh")) .. "</a>"
     end
     if #parts > 0 then
         out[#out + 1] = '<p class="rating">' .. table.concat(parts, " \xC2\xB7 ") .. "</p>"

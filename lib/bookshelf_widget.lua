@@ -10232,11 +10232,14 @@ function BookshelfWidget:_showBookDetail(book, opts)
             ratings_count = result.ratings_count,
             reviews_count = result.reviews_count,
             reviews       = result.reviews,
+            -- Inline Refresh link, next to the ratings/totals line (a tap
+            -- lands on ReviewsModal's html_link_tapped_callback).
+            show_refresh  = true,
         }
     end
     local reviews_pending
     -- Named so both the initial cache-miss load and the tab's own Refresh
-    -- chip (see on_refresh below) can trigger the same re-fetch; `modal` is
+    -- link (see on_refresh below) can trigger the same re-fetch; `modal` is
     -- assigned after this closure is created but before either caller can
     -- actually invoke it (upvalue, read at call time).
     local function refreshReviews()

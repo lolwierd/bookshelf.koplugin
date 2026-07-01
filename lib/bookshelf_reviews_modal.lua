@@ -103,6 +103,10 @@ local REVIEW_CSS = [[
     b, strong   { font-weight: bold; }
     blockquote  { margin: 0.4em 1em; color: #444444; }
     ul, ol      { margin: 0.3em 0 0.3em 1.2em; }
+    /* The inline "Refresh" action link (see reviewsHtml/show_refresh) -- plain
+       black + underline, not link-blue, so it reads the same on grayscale/
+       e-ink as the rest of the app's underlined-link convention. */
+    a      { color: inherit; text-decoration: underline; font-weight: bold; }
 ]]
 
 -- A segmented-control tab strip: text-width cells butted together inside one
@@ -495,6 +499,16 @@ function ReviewsModal:init()
         width             = self.width,
         height            = html_h,
         dialog            = self,
+        -- Inline actions embedded in the HTML (reviewsHtml's "Refresh" link)
+        -- tap through here rather than a widget overlaid on the scrollable
+        -- area, whose own scrollbar tap zone could steal the touch. Links are
+        -- namespaced "bookshelf://<action>"; only "refresh" exists today.
+        html_link_tapped_callback = function(link)
+            if link and link.uri == "bookshelf://refresh" then
+                local tab = self._tabs and self._tabs[self._active_tab]
+                if tab and tab.on_refresh then tab.on_refresh() end
+            end
+        end,
     }
 
     -- Separator line between the scrollable reviews and the button row, so
@@ -582,47 +596,6 @@ function ReviewsModal:_buildHeader()
         x_btn,
     }
     return self._header_widget
-end
-
--- Small pill pinned top-right of a tab's scrollable body (see _assemble),
--- wired to that tab's own `on_refresh` callback -- currently only the
--- Reviews tab sets one. Replaces the old standalone reviews popup's footer
--- Refresh button, lost when Reviews became a tab of this shared modal (the
--- footer is global chrome shared by every tab, not reviews-specific).
--- Opaque white so it sits cleanly over HTML content scrolled underneath it.
--- Same pill look (bordered, rounded, bold uppercase label) as the Tags-tab
--- pills in bookshelf_widget.lua, and the same pre-callback tap-feedback
--- (invert + forceRePaint before firing the callback) so a slow network
--- fetch doesn't read as an inert tap.
-function ReviewsModal:_buildRefreshChip(on_refresh)
-    local size = math.max(10, (self.font_size or DESC_FONT_DEFAULT) - 6)
-    local face, bold = BFont:getFace("cfont", size, { bold = true })
-    local label = TextWidget:new{
-        text = TextSegments.upper(_("Refresh")), face = face, bold = bold,
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-    local box = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE, bordersize = Size.border.thin,
-        radius = Size.radius.button, margin = 0,
-        padding_left = Size.padding.default, padding_right = Size.padding.default,
-        padding_top = Size.padding.small, padding_bottom = Size.padding.small,
-        label,
-    }
-    local chip = InputContainer:new{
-        dimen = Geom:new{ w = box:getSize().w, h = box:getSize().h }, box }
-    chip.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = chip.dimen } } }
-    chip.onTap = function()
-        if box.dimen then
-            box.background = box.background:invert()
-            label.fgcolor  = label.fgcolor:invert()
-            UIManager:widgetRepaint(box, box.dimen.x, box.dimen.y)
-            UIManager:setDirty(nil, "fast", box.dimen)
-            UIManager:forceRePaint()
-        end
-        on_refresh()
-        return true
-    end
-    return chip
 end
 
 -- Active tab's body widget. Returns (widget, is_native, focus_widget). Built
@@ -804,24 +777,6 @@ function ReviewsModal:_assemble()
     -- Crop inner self-repaints (pill tap-feedback inverts) to the native scroll
     -- body when it's active; HTML tabs manage their own painting.
     self.cropping_widget = is_native and body or nil
-    -- Overlay a Refresh chip top-right of the body when the active tab wants
-    -- one (currently only Reviews) -- laid over a SEPARATE display_body so
-    -- self._tab_body/cropping_widget still point at the real scroll widget,
-    -- not this wrapper (CloseWidget cascade + tap-feedback cropping are keyed
-    -- to the actual widget, not a cosmetic overlay around it).
-    local display_body = body
-    local active_tab_spec = self._tabs and self._tabs[self._active_tab]
-    if active_tab_spec and active_tab_spec.on_refresh then
-        local chip = self:_buildRefreshChip(active_tab_spec.on_refresh)
-        local body_sz = body:getSize()
-        local pad = Screen:scaleBySize(8)
-        chip.overlap_offset = { body_sz.w - chip:getSize().w - pad, pad }
-        display_body = OverlapGroup:new{
-            dimen = Geom:new{ w = body_sz.w, h = body_sz.h },
-            body,
-            chip,
-        }
-    end
     local buttons = self:_buildButtons()
     local _t3 = _gettime()
     local vg = VerticalGroup:new{ align = "left" }
@@ -832,7 +787,7 @@ function ReviewsModal:_assemble()
         vg[#vg + 1] = self._tab_row
         self._tabrow_pos = #vg
     end
-    vg[#vg + 1] = display_body
+    vg[#vg + 1] = body
     vg[#vg + 1] = self._button_separator
     vg[#vg + 1] = buttons
     self._vgroup = vg
@@ -963,15 +918,6 @@ function ReviewsModal:setTabHtml(i, html)
         self._tabs[i].html = html
         if i == self._active_tab then
             self:_renderHtml(self:_activeHtml())
-            if self._tabs[i].on_refresh then
-                -- Also reassemble: the tab's Refresh chip (_buildRefreshChip)
-                -- is built fresh once per _assemble, not per content update,
-                -- so without this it would stay stuck in its tap-feedback
-                -- inverted (black) state from the tap that triggered this.
-                -- _renderHtml above already updated scroll_html's content, so
-                -- _assemble (which just re-reads it) picks up the new text.
-                self:_assemble()
-            end
             UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
         end
     elseif i == 1 and not self._tabs then
