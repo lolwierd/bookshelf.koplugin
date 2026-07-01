@@ -22,6 +22,7 @@ local Geom            = require("ui/geometry")
 local GestureRange    = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan  = require("ui/widget/horizontalspan")
+local IconWidget      = require("ui/widget/iconwidget")
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local LineWidget      = require("ui/widget/linewidget")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
@@ -538,19 +539,20 @@ function ReviewsModal:_buildHeader()
         padding_bottom = Screen:scaleBySize(8),  -- tight to the tab bar below
         inner,
     }
-    -- Top-right close icon (nf window-close). The old title bar that carried one
-    -- was removed in favour of this cover/metadata header. Opaque white so it
-    -- sits cleanly over a long title behind it; a tap closes the popup. The icon
-    -- glyph carries more empty space above its ink than beside it (font top
-    -- bearing), so the top inset is smaller than the side to look balanced.
+    -- Top-right close icon. The old title bar that carried one was removed in
+    -- favour of this cover/metadata header. Opaque white so it sits cleanly
+    -- over a long title behind it; a tap closes the popup. Uses KOReader's
+    -- own stock "close" icon (resources/icons/mdlight/close.svg, the same
+    -- light-stroke X TitleBar uses everywhere else) instead of a Nerd Font
+    -- glyph -- the filled glyph read visibly heavier/bolder than the rest of
+    -- the app's close affordances.
     local side_m = Screen:scaleBySize(8)
-    local top_m  = Screen:scaleBySize(2)
+    local top_m  = Screen:scaleBySize(6)
     local x_box = FrameContainer:new{
         background = Blitbuffer.COLOR_WHITE, bordersize = 0, margin = 0,
-        padding = Screen:scaleBySize(4),  -- small tap target around the glyph
-        TextWidget:new{ text = "\xEE\xB2\xAC",  -- U+ECAC nf-md-window_close
-            face = BFont:getFace("symbols", Screen:scaleBySize(15)),
-            fgcolor = Blitbuffer.COLOR_BLACK },
+        padding = Screen:scaleBySize(4),  -- small tap target around the icon
+        IconWidget:new{ icon = "close",
+            width = Screen:scaleBySize(18), height = Screen:scaleBySize(18) },
     }
     local x_btn = InputContainer:new{
         dimen = Geom:new{ w = x_box:getSize().w, h = x_box:getSize().h }, x_box }
