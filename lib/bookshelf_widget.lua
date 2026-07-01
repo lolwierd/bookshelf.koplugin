@@ -9075,6 +9075,30 @@ function SnugScroll:paintTo(bb, x, y)
     self.dimen.w = real_w
 end
 
+-- Shared by the Edit tab's infoRow (File & metadata / Hardcover rows) and
+-- the Tags tab's pillsFrameWithEdit (Collections / Genres): a thin gray
+-- separator + a pre-built Button, both centred in a cell row_h tall. The
+-- separator is inset top/bottom by Size.span.vertical_default -- the same
+-- gap ButtonTable leaves around ITS OWN row separators (buttontable.lua's
+-- addVerticalSpan calls either side of addVerticalSeparator) -- rather than
+-- running edge-to-edge against the row's top/bottom, so it reads as the
+-- same "standard menu button" separator used everywhere else in this popup.
+-- No bottom border: only a left-hand separator, matching that convention.
+function BookshelfWidget:_actionButtonColumn(btn, box_w, row_h)
+    local LineWidget = require("ui/widget/linewidget")
+    local sep_w = Size.line.medium
+    local gap   = Size.span.vertical_default
+    local sep_h = math.max(Screen:scaleBySize(4), row_h - 2 * gap)
+    local sep = CenterContainer:new{
+        dimen = Geom:new{ w = sep_w, h = row_h },
+        LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
+            dimen = Geom:new{ w = sep_w, h = sep_h } },
+    }
+    local btn_cell = CenterContainer:new{
+        dimen = Geom:new{ w = box_w, h = row_h }, btn }
+    return HorizontalGroup:new{ align = "top", sep, btn_cell }
+end
+
 -- _buildBookEditTab(book, modal, avail_w, avail_h) — the Edit tab body:
 -- immediate-commit book actions (no draft / Apply / Cancel) grouped under
 -- section headings (Reading status / Ratings / Collections / Hardcover / File &
@@ -9429,15 +9453,11 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         -- left (inset to align with the headings), a thin vertical gray separator
         -- matching the ButtonTable column separators, then a real (borderless)
         -- Button on the right -- same font, weight and height as the other
-        -- buttons. Used by Collections + Hardcover. Edge-to-edge so the separator
-        -- reads the same as the ones between the file buttons.
-        local CenterContainer = require("ui/widget/container/centercontainer")
-        local Button          = require("ui/widget/button")
+        -- buttons. Used by Collections + Hardcover.
+        local Button = require("ui/widget/button")
         local function infoRow(text, btn_label, cb)
-            local sep_w = Size.line.medium
-            -- Right cell: a borderless Button (matches the ButtonTable buttons:
-            -- bold cfont at the same size, same row height), given a wide fixed
-            -- width for a comfortable target.
+            -- Matches pillsFrameWithEdit's (Tags tab) button column width, so
+            -- both tabs' action buttons line up.
             local btn_w = Screen:scaleBySize(150)
             local btn = Button:new{
                 text = btn_label, callback = cb,
@@ -9451,7 +9471,8 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             }
             local btn_h = btn:getSize().h
             -- Left cell: the value text, inset on the left to align with headings.
-            local left_w = math.max(Screen:scaleBySize(60), content_w - sep_w - btn_w)
+            local left_w = math.max(Screen:scaleBySize(60),
+                content_w - Size.line.medium - btn_w)
             local txt = TextBoxWidget:new{ text = text,
                 face  = BFont:getFace("cfont", font_size),
                 width = math.max(Screen:scaleBySize(40), left_w - inset - Screen:scaleBySize(8)) }
@@ -9466,11 +9487,8 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
                 padding_top = top_pad, padding_bottom = row_h - txt:getSize().h - top_pad,
                 txt,
             }
-            local sep = LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
-                dimen = Geom:new{ w = sep_w, h = row_h } }
-            local btn_cell = CenterContainer:new{
-                dimen = Geom:new{ w = btn_w, h = row_h }, btn }
-            return HorizontalGroup:new{ align = "top", left_cell, sep, btn_cell }
+            return HorizontalGroup:new{ align = "top", left_cell,
+                bw:_actionButtonColumn(btn, btn_w, row_h) }
         end
 
         -- 3. File & metadata.
@@ -9618,21 +9636,18 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     }
                 end
                 -- Pills (if any) wrap on the left, padded the same as every other
-                -- pill section. The Edit button sits boxed on the right -- left +
-                -- bottom border drawn here, top border is simply the section's
-                -- own black heading bar (this whole row starts flush against it,
-                -- no gap), so the box reads as hanging directly off the header.
-                -- Label is centred in the box (Button's default align, active
-                -- whenever width is set). A second button would stack below the
-                -- first inside the same box without touching the pill layout.
+                -- pill section. The Edit button sits in its own column on the
+                -- right (self:_actionButtonColumn -- same helper the Edit tab's
+                -- File & metadata / Hardcover rows use), flush against the
+                -- section's own black heading bar above (this row has no top
+                -- padding of its own). A second button would sit alongside the
+                -- first in that same column without touching the pill layout.
                 -- Used by Collections (always) and editable Genres sources.
                 local function pillsFrameWithEdit(specs, on_edit, empty_text)
-                    local LineWidget    = require("ui/widget/linewidget")
                     local Button        = require("ui/widget/button")
                     local LeftContainer = require("ui/widget/container/leftcontainer")
                     local top_pad    = Screen:scaleBySize(10)
                     local bottom_pad = Screen:scaleBySize(12)
-                    local border_w   = Size.line.medium
                     -- Matches infoRow's Edit/Link and Hardcover button column
                     -- width (Edit tab), so both tabs' action buttons line up.
                     local box_w = Screen:scaleBySize(150)
@@ -9642,7 +9657,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         bordersize = 0, margin = 0, radius = 0,
                         padding = Size.padding.buttontable,
                         padding_h = Size.padding.button,
-                        width = box_w - border_w,
+                        width = box_w,
                         show_parent = show_parent,
                     }
                     -- Row spans content_w (the full snug crop width the heading
@@ -9651,7 +9666,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                     -- pill padding, which would leave this box short of the tab's
                     -- true right edge instead of flush with it.
                     local left_w = math.max(Screen:scaleBySize(40),
-                        content_w - lpad - box_w)
+                        content_w - lpad - Size.line.medium - box_w)
                     -- With no pills, an empty_text caption (e.g. "Not in any
                     -- collection.") fills the same row as the button instead of
                     -- leaving it blank with the caption on a separate line below.
@@ -9677,23 +9692,8 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         LeftContainer:new{ dimen = Geom:new{
                             w = left_w, h = row_h - top_pad - bottom_pad }, pills },
                     }
-
-                    -- Right column: the boxed button, full row_h tall (no top
-                    -- padding) so its top edge sits exactly where the heading
-                    -- bar above ends.
-                    local btn_area = CenterContainer:new{
-                        dimen = Geom:new{ w = box_w - border_w, h = row_h - border_w },
-                        btn }
-                    local boxed_btn = VerticalGroup:new{ align = "left",
-                        HorizontalGroup:new{ align = "top",
-                            LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
-                                dimen = Geom:new{ w = border_w, h = row_h - border_w } },
-                            btn_area,
-                        },
-                        LineWidget:new{ background = Blitbuffer.COLOR_GRAY,
-                            dimen = Geom:new{ w = box_w, h = border_w } },
-                    }
-                    return HorizontalGroup:new{ align = "top", left_col, boxed_btn }
+                    return HorizontalGroup:new{ align = "top", left_col,
+                        self:_actionButtonColumn(btn, box_w, row_h) }
                 end
                 local vg = VerticalGroup:new{ align = "left" }
                 for _s = 1, #TAG_SECTIONS do
