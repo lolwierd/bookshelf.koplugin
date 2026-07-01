@@ -8567,22 +8567,30 @@ function BookshelfWidget:_buildPillSpecs(book, collection_set, close_cb, filter)
     return pill_specs
 end
 
--- _sectionHeadingBar(text, content_w, font_size, inset) — a full-width black
--- strip with white uppercase text, the section heading used by the book-detail
--- Edit and Tags tabs. Paints a hair wider than content_w so the bar reaches the
--- window border (FrameContainer:getSize ignores `width`, so the slop can't widen
--- the layout). Left-inset so the heading text aligns with the body text.
+-- _sectionHeadingBar(text, content_w, font_size, inset) — uppercase black
+-- label over a black bottom border, the section heading used by the
+-- book-detail Edit and Tags tabs. The border paints a hair wider than
+-- content_w so it reaches the window border (FrameContainer:getSize ignores
+-- `width`, so the slop can't widen the layout). Left-inset so the heading
+-- text aligns with the body text. No FrameContainer per-side border support
+-- exists upstream, so the border is hand-composed as its own LineWidget
+-- below the label (same technique as _actionButtonColumn's box).
 function BookshelfWidget:_sectionHeadingBar(text, content_w, font_size, inset)
-    local FrameContainer = require("ui/widget/container/framecontainer")
-    local TextWidget     = require("ui/widget/textwidget")
+    local LineWidget = require("ui/widget/linewidget")
     local face, bold = BFont:getFace("cfont", math.max(10, (font_size or 18) - 3), { bold = true })
-    return FrameContainer:new{
-        background  = Blitbuffer.COLOR_BLACK,
-        bordersize  = 0, margin = 0, width = content_w + Size.border.window,
+    local label = FrameContainer:new{
+        bordersize = 0, margin = 0,
         padding_left = inset, padding_right = inset,
         padding_top = Screen:scaleBySize(4), padding_bottom = Screen:scaleBySize(4),
         TextWidget:new{ text = TextSegments.upper(text), face = face, bold = bold,
-            fgcolor = Blitbuffer.COLOR_WHITE },
+            fgcolor = Blitbuffer.COLOR_BLACK },
+    }
+    return VerticalGroup:new{ align = "left",
+        label,
+        LineWidget:new{
+            background = Blitbuffer.COLOR_BLACK,
+            dimen = Geom:new{ w = content_w + Size.border.window, h = Size.line.medium },
+        },
     }
 end
 
