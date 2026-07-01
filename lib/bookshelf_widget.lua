@@ -9640,10 +9640,12 @@ function BookshelfWidget:_buildReviewsHeader(tab, modal, avail_w, refreshReviews
             local glyph = STAR_EMPTY
             if halves >= 2 * i then glyph = STAR_FULL
             elseif halves == 2 * i - 1 then glyph = STAR_HALF end
-            left[#left + 1] = FrameContainer:new{
-                bordersize = 0, margin = 0, padding = Screen:scaleBySize(3),
-                TextWidget:new{ text = glyph, face = star_face, fgcolor = Blitbuffer.COLOR_BLACK },
-            }
+            -- No per-star padding here (unlike the Edit tab's tappable "Your
+            -- rating" stars, which need the extra gap as a bigger touch
+            -- target) -- read-only, so they sit flush like the per-review
+            -- star rows in the HTML below.
+            left[#left + 1] = TextWidget:new{
+                text = glyph, face = star_face, fgcolor = Blitbuffer.COLOR_BLACK }
         end
         left[#left + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(6) }
         left[#left + 1] = TextWidget:new{
@@ -9675,6 +9677,7 @@ function BookshelfWidget:_buildReviewsHeader(tab, modal, avail_w, refreshReviews
         face       = text_face,
         icon_glyph = "\xEE\xAD\x92",
         icon_face  = BFont:getFace("symbols", font_size),
+        icon_after = true,
         height     = text_h + 2 * Screen:scaleBySize(5),
         inverted   = tab.busy or false,
         on_tap     = function() if not tab.busy then refreshReviews() end end,
@@ -9812,6 +9815,8 @@ function BookshelfWidget:_showBookDetail(book, opts)
             dark_body = true,
             widget_builder = function(avail_w, avail_h, show_parent)
                 local FrameContainer = require("ui/widget/container/framecontainer")
+                local LineWidget = require("ui/widget/linewidget")
+                local ChipButton = require("lib/bookshelf_chip_button")
                 -- Group the specs by category, wrapping each tap to close first.
                 local by_cat = {}
                 for _i, s in ipairs(pill_specs) do
@@ -9843,6 +9848,38 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         padding_bottom = Screen:scaleBySize(20),
                         self:_buildPillGroup(specs, pills_w, 9999, base, "left",
                             Screen:scaleBySize(8)),
+                    }
+                end
+                -- A full-width hairline then a left-aligned "Edit" button
+                -- (same ChipButton style as the Reviews tab's Refresh) below
+                -- an editable section's pills -- replaces the earlier inline
+                -- "Edit…" link pill, which read as just another tag rather
+                -- than a distinct action.
+                local function editActionRow(on_tap)
+                    local edit_face = BFont:getFace("cfont", base)
+                    local probe = TextWidget:new{ text = "Hg", face = edit_face }
+                    local text_h = probe:getSize().h
+                    local hairline = LineWidget:new{
+                        background = Blitbuffer.COLOR_DARK_GRAY,
+                        dimen = Geom:new{ w = avail_w, h = Size.line.medium },
+                    }
+                    local btn = ChipButton.build{
+                        text      = _("Edit"),
+                        face      = edit_face,
+                        icon      = "edit",
+                        icon_size = text_h,
+                        height    = text_h + 2 * Screen:scaleBySize(5),
+                        on_tap    = on_tap,
+                    }
+                    return VerticalGroup:new{ align = "left",
+                        hairline,
+                        FrameContainer:new{
+                            bordersize = 0, margin = 0,
+                            padding_left = lpad, padding_right = lpad,
+                            padding_top = Screen:scaleBySize(10),
+                            padding_bottom = Screen:scaleBySize(20),
+                            btn,
+                        },
                     }
                 end
                 local vg = VerticalGroup:new{ align = "left" }
@@ -10218,19 +10255,6 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     on_hold = function() holdMenu(gname) end,
                                 }
                             end
-                            -- Tags + "Edit…" share one pill row (editable
-                            -- sources only): the edit action is just another
-                            -- pill, styled as a link and appended last, so it
-                            -- wraps inline with the rest instead of needing its
-                            -- own column. Read-only sources (Calibre/Hardcover)
-                            -- get a plain pill row, no edit action.
-                            if editable then
-                                gpills[#gpills + 1] = {
-                                    label  = _("Edit…"),
-                                    link   = true,
-                                    on_tap = editGenres,
-                                }
-                            end
                             if source_chips then vg[#vg + 1] = source_chips end
                             if #gpills > 0 then vg[#vg + 1] = pillsFrame(gpills) end
                             -- Then the help / empty-state line -- always the last
@@ -10255,46 +10279,43 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                         fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
                                 }
                             end
+                            -- Editable (Embedded) source only: a hairline +
+                            -- left-aligned Edit button, not another pill --
+                            -- read-only sources (Calibre/Hardcover) get no
+                            -- edit action.
+                            if editable then vg[#vg + 1] = editActionRow(editGenres) end
                         end
                     elseif sec.cat == "collections" then
-                        -- Collections: the per-collection drill-in pills share a
-                        -- row with an "Edit…" link pill (opens the collection
-                        -- manager), appended last so it wraps inline with the
-                        -- rest. Always shown (even with no memberships) so the
-                        -- manager is reachable here -- this is the single place
-                        -- collections are surfaced (the Edit tab no longer
-                        -- duplicates them).
+                        -- Collections: the per-collection drill-in pills, then
+                        -- a hairline + Edit button opening the collection
+                        -- manager. Always shown (even with no memberships) so
+                        -- the manager is reachable here -- this is the single
+                        -- place collections are surfaced (the Edit tab no
+                        -- longer duplicates them).
                         local specs = by_cat[sec.cat]
                         vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
-                        local collection_pills = {}
-                        for _i = 1, #(specs or {}) do
-                            collection_pills[#collection_pills + 1] = specs[_i]
+                        local function editCollections()
+                            -- Leave the everything-modal OPEN behind the
+                            -- collection dialog (no_header drops its
+                            -- redundant book header). On close, refresh the
+                            -- membership in place: reassign the captured
+                            -- pill_specs upvalue and rebuild the Tags tab
+                            -- body (which re-reads it), so no flash from
+                            -- closing/reopening the popup.
+                            require("lib/bookshelf_collection_manager").show{
+                                book = book, bw = self, no_header = true,
+                                on_close = function()
+                                    local rc = require("readcollection")
+                                    in_collections = (rc.getCollectionsWithFile
+                                        and rc:getCollectionsWithFile(book.filepath)) or {}
+                                    pill_specs = self:_buildPillSpecs(book, in_collections, nil, nil)
+                                    self:_rebuild(); UIManager:setDirty(self, "ui")
+                                    if modal and modal.rebuildTab then modal:rebuildTab() end
+                                end }
                         end
-                        collection_pills[#collection_pills + 1] = {
-                            label  = _("Edit…"),
-                            link   = true,
-                            on_tap = function()
-                                -- Leave the everything-modal OPEN behind the
-                                -- collection dialog (no_header drops its
-                                -- redundant book header). On close, refresh the
-                                -- membership in place: reassign the captured
-                                -- pill_specs upvalue and rebuild the Tags tab
-                                -- body (which re-reads it), so no flash from
-                                -- closing/reopening the popup.
-                                require("lib/bookshelf_collection_manager").show{
-                                    book = book, bw = self, no_header = true,
-                                    on_close = function()
-                                        local rc = require("readcollection")
-                                        in_collections = (rc.getCollectionsWithFile
-                                            and rc:getCollectionsWithFile(book.filepath)) or {}
-                                        pill_specs = self:_buildPillSpecs(book, in_collections, nil, nil)
-                                        self:_rebuild(); UIManager:setDirty(self, "ui")
-                                        if modal and modal.rebuildTab then modal:rebuildTab() end
-                                    end }
-                            end,
-                        }
-                        vg[#vg + 1] = pillsFrame(collection_pills)
-                        if not (specs and #specs > 0) then
+                        if specs and #specs > 0 then
+                            vg[#vg + 1] = pillsFrame(specs)
+                        else
                             local TextBoxWidget = require("ui/widget/textboxwidget")
                             vg[#vg + 1] = FrameContainer:new{
                                 bordersize = 0, margin = 0,
@@ -10306,6 +10327,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     fgcolor = Blitbuffer.COLOR_DARK_GRAY, width = pills_w },
                             }
                         end
+                        vg[#vg + 1] = editActionRow(editCollections)
                     else
                         local specs = by_cat[sec.cat]
                         if specs and #specs > 0 then

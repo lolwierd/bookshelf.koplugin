@@ -54,6 +54,7 @@ local ChipButton = {}
 --   opts.radius     corner radius (default Size.radius.default)
 --   opts.pad_h      horizontal inner padding (default Screen:scaleBySize(12))
 --   opts.gap        icon/label gap when both are set (default Screen:scaleBySize(6))
+--   opts.icon_after put the icon after the label instead of before (default false)
 --   opts.inverted   render pixel-inverted (busy/active state)
 --   opts.on_tap     function() fired on tap
 function ChipButton.build(opts)
@@ -62,24 +63,33 @@ function ChipButton.build(opts)
     local gap    = opts.gap or Screen:scaleBySize(6)
     local height = opts.height
 
-    local content = {}
+    local icon_widget
     if opts.icon_glyph then
-        content[#content + 1] = TextWidget:new{
+        icon_widget = TextWidget:new{
             text = opts.icon_glyph, face = opts.icon_face, fgcolor = Blitbuffer.COLOR_BLACK,
         }
     elseif opts.icon then
-        content[#content + 1] = IconWidget:new{
+        icon_widget = IconWidget:new{
             icon = opts.icon, width = opts.icon_size, height = opts.icon_size,
         }
     end
+    local label_widget
     if opts.text then
-        if #content > 0 then
-            content[#content + 1] = HorizontalSpan:new{ width = gap }
-        end
-        content[#content + 1] = TextWidget:new{
+        label_widget = TextWidget:new{
             text = opts.text, face = opts.face, bold = opts.bold or false,
             fgcolor = Blitbuffer.COLOR_BLACK,
         }
+    end
+    local content = {}
+    local function addPart(w)
+        if not w then return end
+        if #content > 0 then content[#content + 1] = HorizontalSpan:new{ width = gap } end
+        content[#content + 1] = w
+    end
+    if opts.icon_after then
+        addPart(label_widget); addPart(icon_widget)
+    else
+        addPart(icon_widget); addPart(label_widget)
     end
     local row = HorizontalGroup:new{ align = "center", unpack(content) }
     local row_size = row:getSize()
