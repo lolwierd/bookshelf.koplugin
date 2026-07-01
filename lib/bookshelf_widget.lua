@@ -8630,14 +8630,16 @@ function BookshelfWidget:_segmentedChips(items, active_key, on_pick, font_size, 
     end
     cell_h = cell_h + 2 * v_pad
     local row = HorizontalGroup:new{ align = "center" }
+    local focus_row = {}
     for i, it in ipairs(items) do
         if i > 1 then
             row[#row + 1] = LineWidget:new{ background = Blitbuffer.COLOR_BLACK,
                 dimen = Geom:new{ w = sep_w, h = cell_h } }
         end
         local cell_w = labels[i]:getSize().w + 2 * h_pad
+        local is_active = (it.key == active_key)
         local body = InvertedFrame:new{
-            _invert = (it.key == active_key),
+            _invert = is_active,
             bordersize = 0, margin = 0, padding = 0, background = Blitbuffer.COLOR_WHITE,
             CenterContainer:new{ dimen = Geom:new{ w = cell_w, h = cell_h }, labels[i] },
         }
@@ -8648,16 +8650,25 @@ function BookshelfWidget:_segmentedChips(items, active_key, on_pick, font_size, 
             if key ~= active_key and on_pick then on_pick(key) end
             return true
         end
+        -- Dpad/keyboard focus highlight -- restores to the chip's own
+        -- active/inactive baseline on unfocus, not unconditionally false,
+        -- so the active chip stays visibly selected once focus moves away.
+        chip.onFocus = function() body._invert = true; return true end
+        chip.onUnfocus = function() body._invert = is_active; return true end
         row[#row + 1] = chip
+        focus_row[#focus_row + 1] = chip
     end
     local framed = FrameContainer:new{
         bordersize = Size.border.thin, margin = 0, padding = 0, row }
-    return FrameContainer:new{
+    local outer = FrameContainer:new{
         bordersize = 0, margin = 0,
         padding_left = inset, padding_right = inset,
         padding_top = Screen:scaleBySize(12), padding_bottom = Screen:scaleBySize(12),
         framed,
     }
+    -- Second return value: the chips as one dpad row, left-to-right, for
+    -- callers that want focus support (see _buildPillGroup's focus_rows).
+    return outer, { focus_row }
 end
 
 -- _buildPillGroup(pill_specs, available_w, max_rows)
@@ -8665,8 +8676,11 @@ end
 -- as a self-contained widget that callers can drop into any layout.
 -- Greedy width-bounded packing, capped at max_rows; overflow collapses
 -- into a non-tappable "+N" pill. Returns a VerticalGroup (possibly
--- empty if pill_specs is empty / nil). Pure widget builder — no state
--- on self other than what the spec callbacks capture.
+-- empty if pill_specs is empty / nil), plus a second return value:
+-- focus_rows, the same row-wrapped pills (widgets only, left-to-right)
+-- for callers that want dpad focus support -- see _buildPill's
+-- onFocus/onUnfocus and FocusManager:mergeLayoutInVertical. Pure widget
+-- builder — no state on self other than what the spec callbacks capture.
 function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base_size, align, gap, on_overflow)
     local Font            = require("ui/font")
     local TextWidget_     = require("ui/widget/textwidget")
@@ -8684,7 +8698,7 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
     -- by the wrapper at the end.
     local row_align = (align == "center" or align == "right") and align or "left"
     local pill_group = VerticalGroup_:new{ align = row_align }
-    if not pill_specs or #pill_specs == 0 then return pill_group end
+    if not pill_specs or #pill_specs == 0 then return pill_group, {} end
 
     local pill_face, pill_bold = BFont:getFace("cfont", base_size or 14, { bold = true })
     local pill_pad_h = Size.padding.default
@@ -8783,6 +8797,11 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
             end
             return true
         end
+        -- Dpad/keyboard focus highlight -- frame is a stock FrameContainer,
+        -- so its native `invert` field (the same one KOReader's own Button
+        -- uses for onFocus/onUnfocus) works without any custom paintTo.
+        pill.onFocus = function() frame.invert = true; return true end
+        pill.onUnfocus = function() frame.invert = false; return true end
         return pill, frame_size.w
     end
 
@@ -8845,24 +8864,33 @@ function BookshelfWidget:_buildPillGroup(pill_specs, available_w, max_rows, base
         last_row[#last_row + 1] = { widget = more_pill, w = more_w }
     end
 
+    -- Focus rows mirror `rows`' wrapping exactly (one dpad row per visual
+    -- row, widgets left-to-right) so a caller can hand this straight to
+    -- FocusManager:mergeLayoutInVertical (via a `{layout=...}` wrapper)
+    -- without re-deriving the pack. Most callers (hero pills, menu strips)
+    -- ignore this second return value.
+    local focus_rows = {}
     for ri, row_pills in ipairs(rows) do
         local row_widget = HorizontalGroup_:new{ align = "center" }
+        local focus_row = {}
         for j, p in ipairs(row_pills) do
             if j > 1 then
                 row_widget[#row_widget + 1] = HorizontalSpan_:new{ width = pill_gap }
             end
             row_widget[#row_widget + 1] = p.widget
+            focus_row[#focus_row + 1] = p.widget
         end
         if ri > 1 then
             pill_group[#pill_group + 1] = VerticalSpan_:new{ width = pill_gap }
         end
         pill_group[#pill_group + 1] = row_widget
+        focus_rows[#focus_rows + 1] = focus_row
     end
     -- row_align (set above) aligns each row WITHIN the block when rows have
     -- unequal widths. Aligning the whole block within the hero column is the
     -- caller's job (the hero wraps this in a Left/Centre/Right container at
     -- the authoritative column width).
-    return pill_group
+    return pill_group, focus_rows
 end
 
 -- _setBookRating(book, new_rating): persist the rating to the book's
@@ -9124,6 +9152,21 @@ end
 -- same reasoning as why the row has no top border of its own). Total
 -- height always comes out to row_h either way, so callers don't need to
 -- adjust their own sizing based on which case applies.
+-- A minimal `{layout=...}` wrapper satisfying FocusManager:mergeLayoutInVertical's
+-- contract (child.layout + child:disableFocusManagement) for a one-off custom
+-- row that isn't itself a real FocusManager instance -- e.g. a single stock
+-- Button, or a hand-built row of custom InputContainers (star ratings, tag
+-- pills). disableFocusManagement is a no-op beyond recording the parent:
+-- unlike a real FocusManager (ButtonTable), this wrapper never independently
+-- owns a "currently selected" sub-widget to unfocus -- its rows are merged
+-- straight into the caller's own layout and never interacted with directly.
+local function focusRow(layout)
+    return {
+        layout = layout,
+        disableFocusManagement = function(self, parent) self._parent = parent end,
+    }
+end
+
 function BookshelfWidget:_actionButtonColumn(btn, box_w, row_h, want_bottom_border)
     local LineWidget = require("ui/widget/linewidget")
     local sep_w = Size.line.medium
@@ -9414,17 +9457,23 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             }
         end
         local vg = VerticalGroup:new{ align = "left" }
-        local first_bt
+        -- Every focusable section/row, in visual top-to-bottom order, so the
+        -- modal's dpad nav can chain across ALL of them -- not just the
+        -- first ButtonTable (each one already builds its own `.layout`,
+        -- see ui/widget/buttontable.lua; one-off custom rows below get a
+        -- `{layout=...}` wrapper to match that same shape).
+        local focus_tables = {}
         local function btSection(title, rows)
             vg[#vg + 1] = heading(title)
             local bt = ButtonTable:new{
                 width = content_w, buttons = sizeRows(rows), show_parent = modal }
             vg[#vg + 1] = bt
+            focus_tables[#focus_tables + 1] = bt
             return bt
         end
 
         -- 1. Reading status.
-        first_bt = btSection(_("Reading status"), status_rows)
+        btSection(_("Reading status"), status_rows)
 
         -- 2. Ratings: editable "Your rating" stars and, inline, the read-only
         -- Hardcover rating (same star glyphs + spacing; a half star where the
@@ -9445,6 +9494,9 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             local star = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, frame }
             star.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = star.dimen } } }
             star.onTap = function() on_tap(); return true end
+            -- Dpad/keyboard focus highlight -- frame is a stock FrameContainer.
+            star.onFocus = function() frame.invert = true; return true end
+            star.onUnfocus = function() frame.invert = false; return true end
             return star
         end
         -- Rating labels match the body text size (the number, collection names).
@@ -9459,14 +9511,19 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         local your_group = HorizontalGroup:new{ align = "center" }
         your_group[#your_group + 1] = lbl(_("Your rating"))
         your_group[#your_group + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(10) }
+        local your_stars = {}
         for i = 1, 5 do
             local glyph = (i <= cur) and STAR_FULL or STAR_EMPTY
-            your_group[#your_group + 1] = buildStar(glyph, function()
+            local star = buildStar(glyph, function()
                 local newv = (i == cur) and nil or i   -- tap current rating clears it
                 bw:_setBookRating(book, newv); book.rating = newv
                 if modal and modal.rebuildTab then modal:rebuildTab() end
             end)
+            your_group[#your_group + 1] = star
+            your_stars[#your_stars + 1] = star
         end
+        -- One dpad row, left-to-right across the 5 stars.
+        focus_tables[#focus_tables + 1] = focusRow({ your_stars })
 
         local ratings_widget = your_group
         if hc_rating then
@@ -9494,7 +9551,19 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
                 local ic  = InputContainer:new{ dimen = Geom:new{ w = fsz.w, h = fsz.h }, hc_stars }
                 ic.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = ic.dimen } } }
                 ic.onTap = function() modal:_switchTab(reviews_idx); return true end
+                -- Dpad/keyboard focus highlight: ic is a plain InputContainer
+                -- (no stock `invert`, unlike FrameContainer), so paint then
+                -- pixel-invert on top -- the same idiom as InvertedFrame
+                -- elsewhere in this file.
+                ic._focused = false
+                function ic:paintTo(bb, x, y)
+                    InputContainer.paintTo(self, bb, x, y)
+                    if self._focused then bb:invertRect(x, y, self.dimen.w, self.dimen.h) end
+                end
+                ic.onFocus = function() ic._focused = true; return true end
+                ic.onUnfocus = function() ic._focused = false; return true end
                 hc_stars_widget = ic
+                focus_tables[#focus_tables + 1] = focusRow({ { ic } })
             end
             local hc_group = HorizontalGroup:new{ align = "center",
                 lbl(_("Hardcover")),
@@ -9562,6 +9631,9 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
                 padding_top = top_pad, padding_bottom = row_h - txt:getSize().h - top_pad,
                 txt,
             }
+            -- btn is a stock Button (native onFocus/onUnfocus) -- just needs
+            -- registering as its own dpad row.
+            focus_tables[#focus_tables + 1] = focusRow({ { btn } })
             return HorizontalGroup:new{ align = "top", left_cell,
                 bw:_actionButtonColumn(btn, btn_w, row_h, want_bottom_border) }
         end
@@ -9595,14 +9667,14 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
 
         -- Close the last section so its final button has a bottom edge.
         vg[#vg + 1] = rule()
-        return vg, first_bt
+        return vg, focus_tables
     end
 
     -- Full width first; if the body overflows the tab height it will scroll, so
     -- rebuild scrollbar-width narrower to leave the bar its own strip.
-    local body, main_bt = buildBody(avail_w)
+    local body, focus_tables = buildBody(avail_w)
     if body:getSize().h + pad_top + pad_bottom > avail_h then
-        body, main_bt = buildBody(avail_w - sb)
+        body, focus_tables = buildBody(avail_w - sb)
     end
     local padded_body = FrameContainer:new{
         bordersize = 0, margin = 0,
@@ -9616,11 +9688,10 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
         show_parent = modal,
         padded_body,
     }
-    -- Expose the primary ButtonTable so the modal's FocusManager can merge its
-    -- focus layout (dpad nav). Only one table can be the focus table, so the
-    -- other sections aren't dpad-reachable -- consistent with the other
-    -- non-focusable bodies (Tags pills, HTML, the source chips).
-    scroll.focus_table = main_bt
+    -- Every section's focusable row(s), in visual order, so the modal's
+    -- FocusManager can chain dpad nav across the whole tab (see
+    -- ReviewsModal:_assemble's handling of an ARRAY focus_tables).
+    scroll.focus_tables = focus_tables
     return scroll
 end
 
@@ -9854,7 +9925,18 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 local bar_w = Screen:scaleBySize(3)   -- flush snug scrollbar
                 local base  = (show_parent and show_parent.font_size) or 18
                 local pills_w   = avail_w - 2 * lpad - bar_w
+                -- Every section's focusable row(s), in visual top-to-bottom
+                -- order -- pillsFrame/editActionRow below register into this
+                -- as they're called, so each section's own call site doesn't
+                -- need to change. See ReviewsModal:_assemble's handling of an
+                -- ARRAY focus_tables (bookshelf_reviews_modal.lua).
+                local focus_tables = {}
                 local function pillsFrame(specs)
+                    local pills, focus_rows = self:_buildPillGroup(specs, pills_w, 9999, base, "left",
+                        Screen:scaleBySize(8))
+                    if focus_rows and #focus_rows > 0 then
+                        focus_tables[#focus_tables + 1] = focusRow(focus_rows)
+                    end
                     return FrameContainer:new{
                         bordersize = 0, margin = 0,
                         padding_left = lpad, padding_right = lpad,
@@ -9864,8 +9946,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         -- between one section's pills and the next heading, so
                         -- it's a bit larger than the pill row's own top pad.
                         padding_bottom = Screen:scaleBySize(20),
-                        self:_buildPillGroup(specs, pills_w, 9999, base, "left",
-                            Screen:scaleBySize(8)),
+                        pills,
                     }
                 end
                 -- A full-width hairline then a left-aligned "Edit" button
@@ -9891,6 +9972,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         height    = text_h + 2 * Screen:scaleBySize(5),
                         on_tap    = on_tap,
                     }
+                    focus_tables[#focus_tables + 1] = focusRow({ { btn } })
                     local row = btn
                     if msg and msg ~= "" then
                         local gap = Screen:scaleBySize(12)
@@ -9965,7 +10047,8 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             -- pill gets appended to it differs.
                             local source_chips
                             if #items > 1 then
-                                source_chips = self:_segmentedChips(items, active, function(key)
+                                local chips_focus_rows
+                                source_chips, chips_focus_rows = self:_segmentedChips(items, active, function(key)
                                     -- The expensive part (light-meta invalidation + a full
                                     -- shelf _rebuild -- confirmed via [bookshelf perf] logging
                                     -- to cost ~600-900ms, ~90% of a tap) is deferred to modal
@@ -9977,6 +10060,7 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                     genre_source_changed = (key ~= genre_source_at_open)
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
                                 end, base, lpad)
+                                focus_tables[#focus_tables + 1] = focusRow(chips_focus_rows)
                             end
                             local function applyEdit(new_list)
                                 Repo.setEmbeddedGenres(book.filepath, new_list)
@@ -10358,12 +10442,14 @@ function BookshelfWidget:_showBookDetail(book, opts)
                         end
                     end
                 end
-                return SnugScroll:new{
+                local scroll = SnugScroll:new{
                     dimen = Geom:new{ w = avail_w, h = avail_h },
                     scroll_bar_width = bar_w,
                     show_parent = show_parent,
                     vg,
                 }
+                scroll.focus_tables = focus_tables
+                return scroll
             end,
         }
     end

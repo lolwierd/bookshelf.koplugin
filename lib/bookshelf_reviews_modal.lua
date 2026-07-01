@@ -586,14 +586,18 @@ end
 
 -- Active tab's body widget. Returns (widget, is_native, focus_widget). Built
 -- FRESH each call (no cache) so its focus layout is intact when merged into the
--- modal's (merging nils it). focus_widget is the body's focusable element (a
--- ButtonTable, e.g. the Edit tab) or nil (HTML / pills); the builder attaches it
--- as `.focus_table`. HTML tabs reuse the single scroll_html.
+-- modal's (merging nils it). focus_widget is the body's focusable element(s):
+-- a single object with a `.layout` (the builder attaches it as `.focus_table`,
+-- e.g. one ButtonTable) or an ARRAY of such objects in visual top-to-bottom
+-- order (`.focus_tables`, e.g. the Edit tab's several ButtonTables plus its
+-- one-off star/button rows) -- or nil for HTML / pills with no dpad support.
+-- HTML tabs reuse the single scroll_html.
 function ReviewsModal:_activeBody()
     local tab = self._tabs and self._tabs[self._active_tab]
     if tab and tab.widget_builder then
         local w = tab.widget_builder(self.width, self._body_h, self)
-        return w, true, (type(w) == "table" and w.focus_table) or nil
+        local focus = (type(w) == "table") and (w.focus_tables or w.focus_table) or nil
+        return w, true, focus
     end
     if tab and tab.sources and #tab.sources > 1 then
         -- Multi-source body: a chip bar above its own HTML scroller (built fresh
@@ -797,8 +801,18 @@ function ReviewsModal:_assemble()
         table.insert(self.layout, self._tab_row.focus_cells)
     end
     local body_start = #self.layout + 1
-    if body_focus and body_focus.layout then
-        self:mergeLayoutInVertical(body_focus)
+    if body_focus then
+        if body_focus.layout then
+            self:mergeLayoutInVertical(body_focus)
+        else
+            -- An array of focus tables (e.g. the Edit tab's several
+            -- ButtonTables plus its one-off star/button rows) -- merge each
+            -- in the order given, so the combined layout reads top-to-bottom
+            -- exactly like the visual body, not just the first one.
+            for _i, ft in ipairs(body_focus) do
+                if ft.layout then self:mergeLayoutInVertical(ft) end
+            end
+        end
     end
     local had_body = #self.layout >= body_start
     self:mergeLayoutInVertical(buttons)

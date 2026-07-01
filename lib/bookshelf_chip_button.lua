@@ -118,6 +118,11 @@ function ChipButton.build(opts)
         if opts.on_tap then opts.on_tap() end
         return true
     end
+    -- Dpad/keyboard focus highlight. Restores to the caller's own `inverted`
+    -- baseline (not unconditionally false) on unfocus, so focusing away from
+    -- a button that's mid-refresh doesn't clear its busy indicator.
+    btn.onFocus = function() frame.inverted = true; return true end
+    btn.onUnfocus = function() frame.inverted = opts.inverted or false; return true end
     return btn
 end
 
