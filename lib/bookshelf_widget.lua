@@ -9625,6 +9625,18 @@ function BookshelfWidget:_showBookDetail(book, opts)
 
     local modal  -- forward ref so a pill tap closes the popup before navigating
 
+    -- Genre-source switching (Tags tab, Embedded/Hardcover chips) is cheap to
+    -- preview live -- just a persisted preference write + a local pill-list
+    -- swap -- but the shelf-wide consequences (which genre set this book
+    -- contributes to elsewhere: the shelves it appears on, its hero tags)
+    -- require invalidating the shared light-meta cache and a full shelf
+    -- _rebuild. [bookshelf perf] logging showed that pair costing ~600-900ms,
+    -- ~90% of a chip tap, entirely behind this modal while the user is just
+    -- previewing sources. Deferred to modal close (Close or Open both route
+    -- through onClose), and only paid if the source actually ended up
+    -- different from what it was when the modal opened.
+    local genre_source_at_open, genre_source_changed
+
     local tabs = {}
     local edit_idx, tags_idx, desc_idx, reviews_idx
 
@@ -9713,6 +9725,14 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                 or (has("hardcover") and "hardcover")
                                 or (has("calibre")  and "calibre")
                                 or "embedded"
+                            -- Captured once: the widget_builder re-runs on every
+                            -- modal:rebuildTab() (each chip tap), so `active` itself
+                            -- already reflects the latest pick by the second run --
+                            -- genre_source_at_open must only ever be set from the
+                            -- FIRST run to stay a true "at open" baseline.
+                            if genre_source_at_open == nil then
+                                genre_source_at_open = active
+                            end
                             vg[#vg + 1] = self:_sectionHeadingBar(sec.title, avail_w, base, lpad)
                             -- Embedded is always offered (it's the editable source);
                             -- Calibre / Hardcover only when that source has genres.
@@ -9739,31 +9759,16 @@ function BookshelfWidget:_showBookDetail(book, opts)
                             local source_chips
                             if #items > 1 then
                                 source_chips = self:_segmentedChips(items, active, function(key)
-                                    -- Perf instrumentation: this switch has been reported as
-                                    -- slow. self:_rebuild() redraws the WHOLE shelf grid behind
-                                    -- the modal (already has its own detailed [bookshelf perf]
-                                    -- breakdown) even though only the Tags tab is visibly
-                                    -- affected -- timing each step here (plus
-                                    -- ReviewsModal:_assemble's own breakdown, fired by
-                                    -- modal:rebuildTab below) should show whether that shelf
-                                    -- rebuild is the actual bottleneck or just a red herring.
-                                    local _t0 = _gettime()
+                                    -- The expensive part (light-meta invalidation + a full
+                                    -- shelf _rebuild -- confirmed via [bookshelf perf] logging
+                                    -- to cost ~600-900ms, ~90% of a tap) is deferred to modal
+                                    -- close; see genre_source_changed above. Only the cheap,
+                                    -- per-book/per-chip caches refresh immediately so the Tags
+                                    -- tab itself updates fast.
                                     BookshelfSettings.setGenreSource(book.filepath, key)
-                                    local _t1 = _gettime()
                                     Repo.invalidateBookCache("genre-source")
-                                    local _t2 = _gettime()
-                                    Repo.invalidateLightMeta()  -- record content changed
-                                    local _t3 = _gettime()
-                                    self:_rebuild(); UIManager:setDirty(self, "ui")
-                                    local _t4 = _gettime()
+                                    genre_source_changed = (key ~= genre_source_at_open)
                                     if modal and modal.rebuildTab then modal:rebuildTab() end
-                                    local _t5 = _gettime()
-                                    logger.dbg(string.format(
-                                        "[bookshelf perf] genre-source switch: setSource=%.0fms"
-                                        .. " invalidateCache=%.0fms invalidateMeta=%.0fms"
-                                        .. " shelfRebuild=%.0fms tabRebuild=%.0fms TOTAL=%.0fms",
-                                        (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
-                                        (_t4 - _t3) * 1000, (_t5 - _t4) * 1000, (_t5 - _t0) * 1000))
                                 end, base, lpad)
                             end
                             local function applyEdit(new_list)
@@ -10261,7 +10266,18 @@ function BookshelfWidget:_showBookDetail(book, opts)
     local args = {
         tabs       = tabs,
         active_tab = active_tab,
-        on_close   = opts.on_close,
+        -- Flush the deferred genre-source invalidation (see
+        -- genre_source_changed above) before the caller's own on_close --
+        -- ReviewsModal:onClose runs this for BOTH the Close button and the
+        -- Open button (Open routes through onClose first), so the shelf is
+        -- caught up whichever way the popup closes.
+        on_close   = function()
+            if genre_source_changed then
+                Repo.invalidateLightMeta()
+                self:_rebuild(); UIManager:setDirty(self, "ui")
+            end
+            if opts.on_close then opts.on_close() end
+        end,
         -- "Open" footer button opens the book in the reader (the popup closes
         -- first via onClose). _openBook handles stale files + the Kobo path.
         on_open    = function() self:_openBook(book) end,
