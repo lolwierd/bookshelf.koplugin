@@ -3240,6 +3240,96 @@ function Settings:_pickStartMenuFontScale(touchmenu_instance)
     UIManager:show(dialog)
 end
 
+-- Nudge dialog for the book-detail popup's tab bar (Edit/Description/
+-- Reviews/Tags) label font scale. Same shape as _pickChipFontScale, but no
+-- live-rebuild call: the popup is per-book and not open while in Settings,
+-- so there's nothing on-screen to preview -- just persist and let the touch
+-- menu row's own label refresh.
+function Settings:_pickModalTabFontScale(touchmenu_instance)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local ReviewsModal = require("lib/bookshelf_reviews_modal")
+    local key = "modal_tab_font_scale"
+    local original = BookshelfSettings.read(key, 100)
+    -- See _pickCoverBadgeFontScale for the hide+restore rationale.
+    local restoreMenu = self._plugin:hideMenu(touchmenu_instance)
+
+    local function getValue() return BookshelfSettings.read(key, 100) end
+    local function setValue(v)
+        v = math.max(50, math.min(200, v))
+        BookshelfSettings.save(key, v)
+    end
+    local function refresh()
+        -- Live preview: if the book-detail popup is open (this setting is
+        -- normally tuned with it open, watching the tab strip), rebuild its
+        -- tab strip at the new label size in place. Only that strip changes.
+        local live = ReviewsModal._live
+        if live and not live._dismissed and live.refreshTabBar then
+            live:refreshTabBar()
+        end
+        -- Every font-scale picker here dirties a real on-screen widget in its
+        -- nudge callback; the one that didn't (this one, originally) stalled
+        -- the e-ink refresh pipeline and taps stopped registering (confirmed
+        -- on-device). The shelf rebuild is the proven repaint -- kept even
+        -- though this setting doesn't change the shelf itself.
+        if self._bw and self._bw._rebuild then
+            self._bw:_rebuild()
+            UIManager:setDirty(self._bw, "ui")
+        end
+        if touchmenu_instance and touchmenu_instance.updateItems then
+            touchmenu_instance:updateItems()
+        end
+    end
+
+    local dialog
+    -- ButtonDialog:reinit() is free()+init(), and init() unconditionally
+    -- rebuilds self.movable as a FRESH MovableContainer with its default
+    -- drag/hold/pan gestures -- discarding the lockdown below. Without
+    -- re-clearing it here, the second nudge's Focus.reinit() silently
+    -- restores dragging, and a tap on the closely-packed -/+ buttons that
+    -- lingers a touch too long gets claimed by the movable's hold/pan
+    -- handling instead of the button, wedging the touch state machine
+    -- (confirmed on-device: a detected tap with no callback firing, then
+    -- all further input going quiet).
+    local function reinitLocked()
+        Focus.reinit(dialog)
+        if dialog.movable then dialog.movable.ges_events = {} end
+    end
+    local function nudge(delta)
+        setValue(getValue() + delta)
+        refresh()
+        reinitLocked()
+    end
+    local function close() UIManager:close(dialog); restoreMenu() end
+    local function revert()
+        setValue(original)
+        refresh()
+    end
+
+    dialog = ButtonDialog:new{
+        dismissable = false,  -- nudge-dialog lockdown; see _pickCoverBadgeFontScale
+        title = _("Modal tab label font scale"),
+        buttons = {
+            {
+                { text = "-10",  callback = function() nudge(-10) end },
+                { text = "-5",   callback = function() nudge(-5)  end },
+                { text_func = function() return tostring(getValue()) .. "%" end,
+                  enabled = false },
+                { text = "+5",   callback = function() nudge(5)   end },
+                { text = "+10",  callback = function() nudge(10)  end },
+            },
+            {
+                { text = _("Cancel"), callback = function() revert(); close() end },
+                { text = _("Default"),
+                  callback = function() setValue(100); refresh(); reinitLocked() end },
+                { text = _("Apply"), is_enter_default = true, callback = close },
+            },
+        },
+        tap_close_callback = revert,
+    }
+    if dialog.movable then dialog.movable.ges_events = {} end
+    UIManager:show(dialog)
+end
+
 -- Bookshelf UI font picker -- reuses the hero line editor's font picker
 -- (bookends-rich preview when available, FontList file picker otherwise).
 -- Applies on tap: the chosen font is saved and the live bookshelf rebuilt
@@ -3298,6 +3388,7 @@ function Settings:_textSizeSubItems()
         row(_("Expanded shelf labels"), "expanded_shelf_font_scale", 100, "_pickExpandedShelfFontScale"),
         row(_("Cover badges"),          "cover_badge_font_scale",    100, "_pickCoverBadgeFontScale"),
         row(_("Start menu"),            "start_menu_font_scale",     100, "_pickStartMenuFontScale"),
+        row(_("Modal tabs"),            "modal_tab_font_scale",      100, "_pickModalTabFontScale"),
     }
 end
 
