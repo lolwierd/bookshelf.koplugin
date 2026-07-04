@@ -99,16 +99,6 @@ local _overlay_open_path = nil
 -- section, false again before our deferred work runs the show. (Pattern
 -- adapted from komadorirobin's fork.)
 local _suppress_close_document_show = false
--- Reader->home can make FileManager emit PathChanged for the just-read
--- book's folder while Bookshelf is being restored. Treat that as a return
--- transition, not a user folder jump, so the active chip stays selected.
-local _suppress_path_changed_until = 0
-
-local function _suppressPathChangedFor(seconds)
-    _suppress_path_changed_until = math.max(
-        _suppress_path_changed_until or 0,
-        _gettime() + (seconds or 3))
-end
 -- True once the cold-boot start_with=bookshelf takeover has run. Only the
 -- first FileManager init of the session (app start) should auto-raise
 -- Bookshelf; later FM inits are reader-close re-instantiations, where the
@@ -126,6 +116,14 @@ local _did_initial_takeover = false
 -- preceding close) are unaffected. A short timed clear is a backstop for a close
 -- that, for whatever reason, opens no FileManager.
 local _skip_next_onshow_takeover = false
+
+-- One-shot, set by onCloseDocument: while a book is closing, KOReader's file
+-- manager fires PathChanged echoes as it restores the folder around the
+-- just-closed book. onPathChanged must NOT follow those (they would drill the
+-- shelf to the file manager's folder and clobber the restored drilldown -- #204).
+-- Cleared deterministically when the shelf next re-shows (Bookshelf:show), with
+-- a scheduled backstop so a close that opens no shelf can't leave it stuck.
+local _restoring_from_reader = false
 
 -- Close a TouchMenu we received as the first callback argument. Used
 -- whenever a menu callback changes the visible UI layer (e.g. opens or
@@ -823,6 +821,13 @@ function Bookshelf:show()
         (_t_post_new - _t_pre_new) * 1000,
         (_gettime() - _diag_t0) * 1000))
     self:_evictHomescreenOverlay()
+    -- #204: the shelf has re-shown and (on a reader return) re-applied its
+    -- restored drilldown, so the FM's restore echoes for this transition have
+    -- drained. End the suppression on the next tick so any echo still queued in
+    -- this cycle is absorbed first; deliberate navigations then follow normally.
+    if _restoring_from_reader then
+        UIManager:nextTick(function() _restoring_from_reader = false end)
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1021,7 +1026,6 @@ function Bookshelf:_safeShow()
     end
     UIManager:forceRePaint()  -- commit the InfoMessage before onClose blocks
     _suppress_close_document_show = true
-    _suppressPathChangedFor(10)
     UIManager:nextTick(function()
         self.ui:onClose(false)
         if self.ui and self.ui.showFileManager then
@@ -1237,6 +1241,7 @@ function Bookshelf:_wireFastFileBrowserTab(force)
     local items = menu_ref.menu_items
     if not (items and items.filemanager) then return end
     local plugin = self
+    local prev_callback = items.filemanager.callback
     items.filemanager.callback = function()
         if menu_ref.onTapCloseMenu then menu_ref:onTapCloseMenu() end
         -- Decoupled from "Start with" (issue #98): route back to Bookshelf
@@ -1255,11 +1260,19 @@ function Bookshelf:_wireFastFileBrowserTab(force)
         if plugin:_isShowing() then
             -- Bookshelf is home: same fast-path as the gesture.
             plugin:_safeShow()
+        elseif prev_callback then
+            -- Another home-screen plugin (e.g. SimpleUI) wrapped this
+            -- callback before us. We won the last-writer race but should
+            -- not discard their logic: defer to them so their home-restore
+            -- path (e.g. closeReaderToHomescreen) runs instead of our plain
+            -- onClose + showFileManager, which would bypass their HS show.
+            -- onTapCloseMenu has already been called above; calling it
+            -- again inside prev_callback is harmless (idempotent).
+            prev_callback()
         else
-            -- File browser is home: plain go-to-FM, no bookshelf raise.
-            -- onClose(false) to suppress reader's internal full refresh,
-            -- showFileManager re-instantiates FM. Bookshelf may still be
-            -- on the stack from earlier gestures, but FM lands on top.
+            -- No prior callback: plain go-to-FM.
+            -- onClose(false) suppresses the reader's internal full refresh;
+            -- showFileManager re-instantiates FM.
             local file = plugin.ui and plugin.ui.document
                 and plugin.ui.document.file
             UIManager:nextTick(function()
@@ -1438,8 +1451,13 @@ function Bookshelf:onPathChanged(path)
     if self.ui and self.ui.document then return end
     if not (_live_widget and UIManager:isWidgetShown(_live_widget)) then return end
     if not path or path == "" then return end
-    if _gettime() < (_suppress_path_changed_until or 0) then return end
-    _suppress_path_changed_until = 0
+    -- #204: ignore the file manager's restore echoes during a reader return.
+    -- Keep _overlay_open_path in sync so the normal same-path dedup stays
+    -- consistent once following resumes.
+    if _restoring_from_reader then
+        _overlay_open_path = path
+        return
+    end
     -- Absorb the single PathChanged that FileManager fires while Bookshelf is
     -- taking over the home screen (same path the overlay opened over).
     -- Consume it ONCE, then forget. Previously the snapshot stayed set for the
@@ -1475,6 +1493,14 @@ function Bookshelf:onCloseWidget()
 end
 
 function Bookshelf:onCloseDocument()
+    -- #204: enter the reader-return transition. The file manager will fire
+    -- PathChanged echoes restoring its folder around the just-closed book;
+    -- onPathChanged ignores them while this is set so the restored drilldown
+    -- stands. Cleared when the shelf re-shows (Bookshelf:show); the scheduled
+    -- backstop guards a close that opens no shelf (same idiom as the flags above).
+    _restoring_from_reader = true
+    UIManager:scheduleIn(2, function() _restoring_from_reader = false end)
+
     -- The walk cache has a 30s TTL; sideloaded / moved / mtime-changed files
     -- surface within that window without an explicit invalidate. Skipping
     -- invalidation here avoids re-walking the entire library + per-candidate
@@ -1565,8 +1591,9 @@ function Bookshelf:onCloseDocument()
     -- Normal path (close-document not via _safeShow, e.g. exit-to-FM
     -- from KOReader's own menu): schedule show so bookshelf reappears
     -- on the next tick. self:show()'s refresh path handles the repaint
-    -- without exposing FileManager.
-    _suppressPathChangedFor(10)
+    -- without exposing FileManager. (The _restoring_from_reader flag set
+    -- at the top of onCloseDocument keeps the active chip selected against
+    -- the FM restore echoes — see onPathChanged.)
     UIManager:nextTick(function()
         self:show()
     end)

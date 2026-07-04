@@ -273,7 +273,18 @@ local function cachedFilenameKey(b)
     ensureEpoch(b)
     local v = b._filename_key_cache
     if v == nil then
-        v = b.filename or b.file or b.name or b.series_name
+        v = b.filename or b.file
+        -- Group-shape meta (_cacheGroupShapes) carries no `filename` field, so a
+        -- "Filename" within-group sort used to fall through to series_name --
+        -- which clustered series members and pushed standalones to the end
+        -- (issue #235). Derive the name from the filepath (every book record has
+        -- one), stripping the extension to match buildBookMeta's own derivation.
+        -- series_name stays as the last resort for group cards, which have no
+        -- filepath and legitimately sort a "Filename" key by their label.
+        if (v == nil or v == "") and b.filepath then
+            v = (b.filepath:match("([^/]+)$") or b.filepath):gsub("%.[^.]+$", "")
+        end
+        v = v or b.name or b.series_name
         v = (v ~= nil and v ~= "") and pinyinise(tostring(v):lower()) or false
         b._filename_key_cache = v
     end
@@ -460,11 +471,25 @@ SortEngine.ORDER = {
 function SortEngine.chainedComparator(priority)
     refreshPinyinFlag()
     local levels = {}
+    local used   = {}
     for _i, level in ipairs(priority) do
         local k = SortEngine.KEYS[level.key]
         if k then
             levels[#levels + 1] = { comparator = k.comparator, reverse = level.reverse }
+            used[level.key] = true
         end
+    end
+    -- Deterministic tie-break: when every requested level ties, fall back to
+    -- title then filename so equal books never fall into arbitrary order.
+    -- table.sort isn't stable, and some sources arrive in non-deterministic
+    -- pairs() order (e.g. collections), so without this the leftover order can
+    -- even shuffle between renders (#205/#208). filename is the book's path, so
+    -- it's unique -> a total order. Skipped if the user already sorts by it.
+    if not used.title then
+        levels[#levels + 1] = { comparator = SortEngine.KEYS.title.comparator, reverse = false }
+    end
+    if not used.filename then
+        levels[#levels + 1] = { comparator = SortEngine.KEYS.filename.comparator, reverse = false }
     end
     return function(a, b)
         for _i, lv in ipairs(levels) do

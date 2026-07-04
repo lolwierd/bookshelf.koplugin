@@ -51,6 +51,30 @@ test("sort: single-key ascending by title", function()
     assert(eq(ids(books), { 2, 3, 1 }), "got " .. table.concat(ids(books), ","))
 end)
 
+test("sort: tied primary key falls back to title then filename (#205/#208)", function()
+    -- All share last_opened, so the requested level ties; the implicit title
+    -- fallback decides, deterministically (never arbitrary/unstable order).
+    local books = {
+        { id = 1, last_opened = 100, title = "Charlie", filename = "c.epub" },
+        { id = 2, last_opened = 100, title = "Alice",   filename = "a.epub" },
+        { id = 3, last_opened = 100, title = "Bob",     filename = "b.epub" },
+    }
+    SortEngine.sort(books, { { key = "last_opened", reverse = true } })
+    assert(eq(ids(books), { 2, 3, 1 }), "tie -> title order; got " .. table.concat(ids(books), ","))
+end)
+
+test("sort: equal title falls back to filename (#205/#208)", function()
+    -- User sorts by title (all equal) -> filename breaks the tie. Confirms the
+    -- fallback still appends filename even when title is the explicit key.
+    local books = {
+        { id = 1, title = "Same", filename = "zzz.epub" },
+        { id = 2, title = "Same", filename = "aaa.epub" },
+        { id = 3, title = "Same", filename = "mmm.epub" },
+    }
+    SortEngine.sort(books, { { key = "title", reverse = false } })
+    assert(eq(ids(books), { 2, 3, 1 }), "got " .. table.concat(ids(books), ","))
+end)
+
 test("sort: title uses natural order (Vol 2 before Vol 10) -- issue #104", function()
     local books = {
         { id = 1, title = "Series, Vol 10" },
@@ -413,6 +437,26 @@ test("perf: 3000 books, one parse per book during sort", function()
         if b._surname_cache ~= nil then cached = cached + 1 end
     end
     assert(cached == 3000, "expected 3000 cached, got " .. cached)
+end)
+
+test("filename key derives from filepath when no filename field (#235)", function()
+    -- Group-shape meta (_cacheGroupShapes) carries filepath + series_name but
+    -- no `filename`. A "Filename" within-group sort must order by the real file
+    -- name, NOT fall through to series_name (which clustered series members and
+    -- pushed standalones to the end). Series books share a series_name; without
+    -- the fix they'd cluster + tie to title, and the standalone would sort last.
+    local books = {
+        { id = 1, filepath = "/b/Greek Myths - 2 - Heroes.epub",  series_name = "Greek Myths" },
+        { id = 2, filepath = "/b/Greek Myths - 1 - Mythos.epub",  series_name = "Greek Myths" },
+        { id = 3, filepath = "/b/Mythology - Edith Hamilton.epub" },  -- standalone, no series
+    }
+    SortEngine.sort(books, { { key = "filename", reverse = false } })
+    -- Real filename order (natsort): "Greek Myths - 1 - Mythos", "…- 2 - Heroes",
+    -- "Mythology…" => ids 2, 1, 3. The old fallback-to-series_name tied the two
+    -- series books on "Greek Myths" (no filename/title to break it) so they kept
+    -- input order 1, 2 => a different result, which is what this guards against.
+    assert(eq(ids(books), { 2, 1, 3 }),
+        "expected filename order 2,1,3 (Mythos, Heroes, Mythology), got " .. table.concat(ids(books), ","))
 end)
 
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))

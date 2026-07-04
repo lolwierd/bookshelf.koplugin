@@ -455,8 +455,9 @@ function Tokens.sanitiseReviewHtml(raw)
 end
 
 -- reviewsHtml(payload): build the HTML body for the Hardcover reviews modal.
--- payload = { title, rating, ratings_count, reviews_count, reviews = {...} }.
--- The book title is a bold header; each review gets a bold "Review by" line
+-- payload = { title, reviews = {...} }. The overall rating/counts/Refresh
+-- summary is a separate native widget row (bookshelf_widget.lua), not part of
+-- this HTML. The book title is a bold header; each review gets a bold "Review by" line
 -- with the reviewer name in italics plus rating/date/likes meta, then the
 -- sanitised review body. Stars use the plain Unicode star (U+2605) so they
 -- render in the MuPDF HTML engine's normal font (the Nerd Font PUA glyphs
@@ -485,27 +486,18 @@ end
 function Tokens.reviewsHtml(payload)
     payload = type(payload) == "table" and payload or {}
     local out = {}
-    -- Book title: a large heading above all reviews.
-    out[#out + 1] = "<h1>" .. _escHtml(payload.title or "Hardcover reviews") .. "</h1>"
-
-    -- Overall rating: the shared star glyph row (in a span so only the glyphs
-    -- use the embedded symbols font), with the rating/review counts inline on
-    -- the SAME line, just after the stars.
-    local parts = {}
-    local rating = tonumber(payload.rating)
-    if rating and rating > 0 then
-        parts[#parts + 1] = '<span class="stars">' .. Tokens.starString(rating) .. "</span>"
-    end
-    if tonumber(payload.ratings_count) and tonumber(payload.ratings_count) > 0 then
-        parts[#parts + 1] = string.format("%d ratings", tonumber(payload.ratings_count))
-    end
-    if tonumber(payload.reviews_count) and tonumber(payload.reviews_count) > 0 then
-        parts[#parts + 1] = string.format("%d reviews", tonumber(payload.reviews_count))
-    end
-    if #parts > 0 then
-        out[#out + 1] = '<p class="rating">' .. table.concat(parts, " \xC2\xB7 ") .. "</p>"
+    -- Book title: a large heading above all reviews. Omitted when no title is
+    -- given (the book-detail popup shows the title in its header already, so a
+    -- heading here would be redundant).
+    if payload.title and payload.title ~= "" then
+        out[#out + 1] = "<h1>" .. _escHtml(payload.title) .. "</h1>"
     end
 
+    -- The overall rating/counts/Refresh summary line now renders as native
+    -- widgets above this HTML (bookshelf_widget.lua's ReviewsHeader) instead
+    -- of here: an HTML <a> link had no tap feedback and couldn't easily match
+    -- the surrounding text's own (zoom-adjustable) font size. Per-review star
+    -- rows below still use the HTML star glyphs (Tokens.starString).
     local reviews = type(payload.reviews) == "table" and payload.reviews or {}
     if #reviews == 0 then
         out[#out + 1] = "<p>No non-spoiler reviews found.</p>"
@@ -515,7 +507,10 @@ function Tokens.reviewsHtml(payload)
     for _i, review in ipairs(reviews) do
         local name = review.user_name or review.username or "Unknown reader"
         local rr = tonumber(review.rating)
-        out[#out + 1] = "<hr/>"
+        -- No leading rule above the FIRST review: the native header now ends
+        -- in its own hairline (bookshelf_widget.lua's _buildReviewsTab), so a
+        -- second rule right below it read as a redundant double line.
+        if _i > 1 then out[#out + 1] = "<hr/>" end
         -- Stars on their own line above each review, so they always sit at the
         -- same left-aligned position regardless of name/date length.
         if rr and rr > 0 then
@@ -628,6 +623,9 @@ local function timeNow(state)
     return (state and state.now) or os.time()
 end
 local function fmt(spec, state) return os.date(spec, timeNow(state)) end
+-- os.date weekday/month names come from the C locale (English on Kindle),
+-- bypassing gettext -- localize them to the active UI language.
+local LocalDate = require("lib/bookshelf_localdate")
 
 Tokens.expanders.time     = function(_b, s) return fmt("%H:%M", s) end
 Tokens.expanders.time_24h = function(_b, s) return fmt("%H:%M", s) end
@@ -635,11 +633,11 @@ Tokens.expanders.time_12h = function(_b, s)
     local t = fmt("%I:%M %p", s)
     return (t:gsub("^0", ""))
 end
-Tokens.expanders.date          = function(_b, s) return fmt("%d %b", s):gsub("^0", "") end
-Tokens.expanders.date_long     = function(_b, s) return fmt("%d %B %Y", s):gsub("^0", "") end
+Tokens.expanders.date          = function(_b, s) return LocalDate.localize(fmt("%d %b", s)):gsub("^0", "") end
+Tokens.expanders.date_long     = function(_b, s) return LocalDate.localize(fmt("%d %B %Y", s)):gsub("^0", "") end
 Tokens.expanders.date_numeric  = function(_b, s) return fmt("%d/%m/%Y", s) end
-Tokens.expanders.weekday       = function(_b, s) return fmt("%A", s) end
-Tokens.expanders.weekday_short = function(_b, s) return fmt("%a", s) end
+Tokens.expanders.weekday       = function(_b, s) return LocalDate.localize(fmt("%A", s)) end
+Tokens.expanders.weekday_short = function(_b, s) return LocalDate.localize(fmt("%a", s)) end
 
 local function minutesToHM(m)
     if not m or m <= 0 then return "" end
