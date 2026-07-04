@@ -75,7 +75,7 @@ local function filterByMenuAvailability(items)
         -- explicit scope (library/reader/both) is the user's manual override --
         -- honour it as-is, even into a view where the item may not exist.
         if type(e) == "table" and type(e.menu_path) == "table" and e.scope == nil then
-            return MS.isAvailable(e.menu_path)
+            return MS.isAvailable(e.menu_path, e.menu_page)
         end
         return true
     end
@@ -938,7 +938,7 @@ function StartMenu:_markUnresolved(items)
                 -- a view where the item isn't available -- the tap is a no-op,
                 -- and the grey signals that up front. isAvailable fails open, so
                 -- a transient menu-build hiccup never greys a working shortcut.
-                if ok_ms and MS.isAvailable and not MS.isAvailable(it.menu_path) then
+                if ok_ms and MS.isAvailable and not MS.isAvailable(it.menu_path, it.menu_page) then
                     if it.id then ids[it.id] = true end
                 end
             elseif it.type == "action" and type(it.plugin) == "table" then
