@@ -656,6 +656,23 @@ function BookshelfWidget:_restoreDrillPath(saved)
     end
 end
 
+-- Make `key` the active chip and repaint. Mirrors the chip-tap switch in
+-- _rebuild's on_change (reset drilldown + cursor, persist, full rebuild), but
+-- as a reusable method so long-press-to-edit and add-new-chip can select the
+-- tab too. Full _rebuild (not the below-hero fast path) because the chip bar
+-- itself changes -- the selected highlight moves, and a freshly-added chip
+-- needs to appear.
+function BookshelfWidget:_selectChip(key)
+    self:_clearDpadFocus()
+    self._drilldown_path = {}
+    self.chip    = key
+    self._cursor = 1
+    self:_syncPageFromCursor()
+    BookshelfSettings.saveDeferred("active_chip", key)
+    self:_rebuild()
+    UIManager:setDirty(self, "ui")
+end
+
 function BookshelfWidget:_rebuild()
     -- A structural rebuild (chip switch, drill, settings change) invalidates
     -- any in-flight next-page preload — it was queued for the old view.
@@ -1342,6 +1359,10 @@ function BookshelfWidget:_rebuild()
                 self:_showModulesOptions()
                 return
             end
+            -- Long-pressing a chip that isn't the active one selects it first,
+            -- so editing a tab always leaves you on that tab (request). The
+            -- editor then opens over the now-selected shelf.
+            if key ~= self.chip then self:_selectChip(key) end
             local Editor = require("lib/bookshelf_chip_editor")
             Editor:editTab(key, {
                 on_change = function()

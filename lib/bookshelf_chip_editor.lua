@@ -773,7 +773,15 @@ function Editor:editTab(tab_id, opts)
                         })
                         TabModel.save(fresh)
                         UIManager:close(dialog)
-                        if opts.on_change then opts.on_change() end
+                        -- Auto-select the new tab so the user lands on it after
+                        -- editing (request), not back on the tab they added from.
+                        -- _selectChip does its own rebuild; fall back to on_change
+                        -- for any caller without a widget handle.
+                        if opts.bw and opts.bw._selectChip then
+                            opts.bw:_selectChip(new_id)
+                        elseif opts.on_change then
+                            opts.on_change()
+                        end
                         Editor:editTab(new_id, opts)
                     end,
                 },
