@@ -17,13 +17,24 @@ These are applied on top of every upstream release. None of them exist upstream.
 | 1 | **Screensaver host fallback** | `main.lua` (`_installScreensaverHostFallback`) | When Bookshelf is the visible home and KOReader suspends, neither `ReaderUI.instance` nor `FileManager.instance` exists. Stock `Screensaver:setup` needs one — without it the suspend path can inhibit input without drawing a sleep screen. Provides a minimal fake `FileManager` just for setup, then restores original state. |
 | 2 | **`onRequestSuspend` handler** | `lib/bookshelf_widget.lua` | Handles `RequestSuspend` events directly while BookshelfWidget is the topmost widget, calling `UIManager:suspend()`. Without this, suspend requests die because the widget consumes events but doesn't forward them. |
 | 3 | **Multiswipe sleep gesture** | `lib/bookshelf_widget.lua` (`handleEvent`) | When a multiswipe gesture is detected and the reader has a multiswipe→suspend binding, Bookshelf honours it instead of forwarding it as FileManager navigation. Checks `fm.gestures.settings_data.data.gesture_reader` for the binding. |
-| 4 | **PathChanged suppression timer** | `main.lua` (`_suppressPathChangedFor`) | When returning from a book to Bookshelf, FileManager can emit spurious `PathChanged` for the just-read book's folder. Without suppression this causes the active chip to jump away. A 10-second suppression window during `_safeShow` and `onCloseDocument` absorbs these events. |
 | 5 | **Updater → fork URLs** | `lib/bookshelf_updater.lua` | All GitHub API and web URLs point to `lolwierd/bookshelf.koplugin` instead of `AndyHazz/bookshelf.koplugin`. Uses `REPO_SLUG` constant with `githubApi()` / `githubWeb()` helpers. |
 
-### Fix that upstream already has (better)
+> **Note (fix #4 retired in v3.8.4.1):** The fork's old `_suppressPathChangedFor`
+> wall-clock window is gone. Upstream's `#204` `_restoring_from_reader` flag
+> (`main.lua`: set in `onCloseDocument`, cleared when the shelf re-shows in
+> `Bookshelf:show`) solves the *same* "active chip jumps to the wrong folder on
+> reader return" problem more cleanly — it is lifecycle-tied rather than a 10s
+> timer, and keeps `_overlay_open_path` dedup consistent. **Prefer upstream's;
+> do not reintroduce the timer.** Verify it survives future merges:
+> `grep -c '_restoring_from_reader' main.lua` should be `4+`.
+
+### Fixes that upstream already has (better)
 | Fix | Our version | Upstream version | Verdict |
 |---|---|---|---|
 | `onBookMetadataChanged` nil-safe | `tostring(prop_updated)` | `type(prop_updated) == "string"` check | **Use upstream's** — it correctly handles table props too |
+| PathChanged suppression on reader return (was fork fix #4) | `_suppressPathChangedFor` 10s timer | `_restoring_from_reader` lifecycle flag (#204) | **Use upstream's** — retired the fork timer in v3.8.4.1 |
+| FM touch-zone walk for menu open (#79) | inline walk in `handleEvent` | `GestureZones.tryFMZones` (shared module) | **Use upstream's** — byte-for-byte equivalent, shared with ReviewsModal |
+| Book-detail `FileManager.instance` nil-crash (bonus fix) | nil-guard inside `_openBookMenu` ButtonDialog | new tabbed `_showBookDetail` with already-guarded FM touches, no direct `BookmarkBrowser` open | **Use upstream's** — `_openBookMenu` removed; the crash path no longer exists |
 
 ## Syncing with upstream
 
@@ -56,12 +67,17 @@ git merge upstream/master
 grep -c '_installScreensaverHostFallback' main.lua          # should return 2+
 grep -c 'onRequestSuspend' lib/bookshelf_widget.lua         # should return 2+
 grep -c 'multiswipe' lib/bookshelf_widget.lua               # should return 2+
-grep -c '_suppressPathChangedFor' main.lua                  # should return 3+
+grep -c '_restoring_from_reader' main.lua                   # should return 4+ (upstream's replacement for old fork fix #4)
 grep -c 'lolwierd' lib/bookshelf_updater.lua                # should return 1+
 
 # 7. Run tests
 cd tests && bash run.sh
-# Expected: 38 suites, 0 failed, 1 skipped (tall_screen is on-device only)
+# Expected (properly-configured UTF-8 env): all suites pass, 1 skipped.
+# NOTE: on a C/POSIX-locale box with byte-based Lua 5.1, a handful of UTF-8
+# tests (book_repository rating glyph, plugin_scan PUA, text_safe, tokens
+# numeric entities) fail on a CLEAN upstream checkout too — those are
+# environmental, not regressions. Confirm by running the same suites against
+# upstream/master and comparing the failing set is identical.
 
 # 8. Bump version
 #    Edit _meta.lua: version = "X.Y.Z.N" (upstream base + .N fork revision)
@@ -113,12 +129,12 @@ Upstream vX.Y.Z merged with all fork fixes retained.
 (List key upstream features/fixes from their release notes)
 
 ### Validation:
-- 38 test suites pass, 0 failures
+- All test suites pass, 1 skipped (on-device only)
 ```
 
 ## Known bugs fixed in this fork (not in upstream)
 
-1. **`FileManager.instance` nil crash in `quote_of_day.lua`** — When the BookmarkBrowser is opened from the in-reader launcher, `FileManager.instance` can be nil. Fixed with `pcall(require, ...)` + nil guard. Same fix applied to `bookshelf_widget.lua` book-detail path.
+1. **`FileManager.instance` nil crash in `quote_of_day.lua`** — When the BookmarkBrowser is opened from the in-reader launcher, `FileManager.instance` can be nil. Fixed with `pcall(require, ...)` + nil guard. (The sibling guard once lived in `bookshelf_widget.lua`'s old `_openBookMenu` book-detail path; that function was removed in v3.8.4.1 when upstream reworked book long-press into the tabbed `_showBookDetail` flow, whose FM touches are already nil-guarded — see the "Fixes that upstream already has" table.)
 2. **Orphaned comment block in `main.lua`** — Merge artifact from `_wireFastFileBrowserTab` doc colliding with `_setupReaderButtons` docs. Cleaned.
 
 ## Project structure
@@ -151,7 +167,7 @@ bookshelf.koplugin/
 ├── fonts/                 # Bundled open-license fonts
 ├── locale/                # Translations (.po/.pot for 9 languages)
 ├── assets/                # Logo images
-├── tests/                 # 38 test suites + runner (run.sh)
+├── tests/                 # 45 test suites + runner (run.sh)
 ├── tools/                 # gen_pinyin_table.py
 └── AGENTS.md              # This file
 ```
@@ -162,7 +178,7 @@ bookshelf.koplugin/
 cd tests && bash run.sh
 ```
 
-- 38 test suites covering: author names, book repository, fonts, language, selection, chip editor, color, cover progress, DPAD cursor, hardcover, hardcover match, hero defaults, hero regions, pinyin, settings store, sort engine, stale sweep, tab model, text segments, tokens, start menu model, start menu modules, plugin scan, icon library, menu host, module breaker, module contract, module kit, fullscreen modules, hero modules, footer geometry, action exec, meta, micromodule store, text safe, dialog focus
+- 45 test suites covering (as of v3.8.4.1): author names, book repository, fonts, language, selection, chip editor, color, cover progress, DPAD cursor, hardcover, hardcover match, hero defaults, hero regions, pinyin, settings store, sort engine, stale sweep, tab model, text segments, tokens, start menu model, start menu modules, plugin scan, icon library, menu host, module breaker, module contract, module kit, fullscreen modules, hero modules, footer geometry, action exec, meta, micromodule store, text safe, dialog focus
 - `_test_tall_screen.lua` is **skipped** — needs on-device widget measurements
 - All tests must pass before pushing
 
