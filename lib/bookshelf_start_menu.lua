@@ -207,6 +207,52 @@ function StartMenu.open(bw, bottom_inset, burger_dimen, context)
         context       = (context == "reader") and "reader" or "library",
         _repaint_under = under,
     }
+    -- Open animation: capture the background, paint the panel into the buffer,
+    -- then reveal it bottom-up over its region (the menu is bottom-anchored, so
+    -- it reads as "opening upward"). E-ink only -- on LCD the per-strip
+    -- refreshes coalesce and nothing shows, so we fall through to the instant
+    -- show; likewise on any error.
+    local _sr = menu._dirty_region
+    if Device.hasEinkScreen and Device:hasEinkScreen() and _sr and Screen.refreshUI then
+        local shown = pcall(function()
+            local rx, ry, rw, rh = _sr.x, _sr.y, _sr.w, _sr.h
+            local old_bb = Screen.bb:copy()
+            menu:paintTo(Screen.bb, 0, 0)
+            local new_bb = Screen.bb:copy()
+            local STEPS, prev_dh = 8, 0
+            for i = 1, STEPS do
+                local dh = math.floor(rh * i / STEPS)
+                if rh - dh > 0 then
+                    Screen.bb:blitFrom(old_bb, rx, ry, rx, ry, rw, rh - dh)
+                end
+                Screen.bb:blitFrom(new_bb, rx, ry + rh - dh, rx, ry + rh - dh, rw, dh)
+                if i < STEPS then
+                    local strip_h = dh - prev_dh
+                    if strip_h > 0 then
+                        Screen:refreshUI(rx, ry + rh - dh, rw, strip_h)
+                        UIManager:yieldToEPDC(20000)
+                    end
+                else
+                    Screen:refreshUI(rx, ry, rw, rh)
+                end
+                prev_dh = dh
+            end
+            new_bb:free()
+            menu._bg_snapshot = old_bb  -- kept for the close wipe-down
+        end)
+        if shown then
+            -- Register the widget (stack + Show event) but suppress the initial
+            -- repaint: the wipe already painted AND flushed the panel. show()
+            -- always setDirty's, and a dirty widget with no enqueued refresh
+            -- makes _repaint fall back to a full-screen refresh -- so clear the
+            -- dirty flag it just set. The menu repaints normally on first tap.
+            UIManager:show(menu)
+            if UIManager._dirty then UIManager._dirty[menu] = nil end
+            StartMenu._live = menu
+            return
+        end
+    end
+    -- Non-eink / animation-failed: normal instant show.
     UIManager:show(menu, "ui", menu._dirty_region)
     StartMenu._live = menu -- test/introspection hook; cleared in onCloseWidget
 end
@@ -1319,7 +1365,48 @@ function StartMenu:_toggleFlyout(folder_id)
 end
 
 function StartMenu:_close()
-    UIManager:close(self, "ui", self._dirty_region)
+    -- Close animation: reverse of the open reveal. The background (stashed at
+    -- open) reappears from the top of the panel region downward, so the panel
+    -- reads as wiping
+    -- down out of view. Then close for real (repaints the live background).
+    local bg = self._bg_snapshot
+    local r  = self._dirty_region
+    local wiped = false
+    if bg and r and Device.hasEinkScreen and Device:hasEinkScreen() and Screen.refreshUI then
+        wiped = pcall(function()
+            local rx, ry, rw, rh = r.x, r.y, r.w, r.h
+            local panel_bb = Screen.bb:copy()   -- current: background + panel
+            local STEPS, prev_dh = 8, 0
+            for i = 1, STEPS do
+                local dh = math.floor(rh * i / STEPS)  -- background revealed top-down
+                Screen.bb:blitFrom(bg, rx, ry, rx, ry, rw, dh)
+                if rh - dh > 0 then
+                    Screen.bb:blitFrom(panel_bb, rx, ry + dh, rx, ry + dh, rw, rh - dh)
+                end
+                if i < STEPS then
+                    local strip_h = dh - prev_dh
+                    if strip_h > 0 then
+                        Screen:refreshUI(rx, ry + prev_dh, rw, strip_h)
+                        UIManager:yieldToEPDC(20000)
+                    end
+                else
+                    Screen:refreshUI(rx, ry, rw, rh)   -- final frame = the background
+                end
+                prev_dh = dh
+            end
+            panel_bb:free()
+        end)
+    end
+    if bg then bg:free(); self._bg_snapshot = nil end
+    if wiped then
+        -- The wipe already painted + refreshed the post-close frame (the
+        -- background). `invisible` makes UIManager:close skip its redundant
+        -- underlying repaint + refresh; it still unregisters + fires CloseWidget.
+        self.invisible = true
+        UIManager:close(self)
+    else
+        UIManager:close(self, "ui", self._dirty_region)
+    end
 end
 
 -- Clear the open-in-progress marker once the first paint has actually
@@ -1338,6 +1425,7 @@ end
 
 function StartMenu:onCloseWidget()
     if StartMenu._live == self then StartMenu._live = nil end
+    if self._bg_snapshot then self._bg_snapshot:free(); self._bg_snapshot = nil end  -- free if close was skipped
     if self[1] and self[1].free then self[1]:free() end
 end
 
