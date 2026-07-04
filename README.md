@@ -59,6 +59,8 @@ Each chip remembers its own **filters** (reading status, genre, language, format
 
 The same menu (**menu -> Bookshelf chips…**) also has **Chip bar font size** for adjusting how big the chips render across the top of the screen.
 
+When you have more chips than fit across the screen, the bar splits into pages: tap the **>** / **<** chevrons at the end of the row, or swipe left/right on the bar, to move between them (the active chip's page shows first). On e-ink the change plays as a wipe -- see [Animations](#animations).
+
 ### Searching
 
 Tap the search icon at the right of the chip bar. Search looks across authors, series, genres, collections, and book titles in one go, and groups the results by category. Tapping a result drills into it; back-swipe to return to whichever shelf you were on.
@@ -257,6 +259,18 @@ Open **menu -> Settings -> Edit shelf size…** for a live overlay that resizes 
 - **Book size** -- how large the covers render, which also sets how many fit per row.
 
 The layout auto-fits your screen and orientation, so the same settings adapt between portrait and landscape. Changes preview in real time behind the overlay; **Accept** keeps them, **Cancel** reverts.
+
+---
+
+## Animations
+
+On e-ink, Bookshelf can play a brief page-wipe animation on transitions so they read as motion rather than an abrupt refresh. A single setting, **menu -> Settings -> Advanced settings -> Animation speed**, controls all of them:
+
+- **Shelf page turns** -- the new page sweeps in from the side.
+- **Chip bar paging** -- the chip row wipes across as you move between chip pages.
+- **The start menu** -- reveals upward as it opens and wipes back down as it closes.
+
+Choose **Off**, **Fast**, **Medium**, or **Slow** -- slower is smoother but takes a little longer on older panels. The effect is e-ink only: on LCD/OLED screens the refreshes complete instantly, so nothing is shown and the setting has no visible effect there.
 
 ---
 
