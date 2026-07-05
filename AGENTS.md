@@ -38,6 +38,11 @@ These are applied on top of every upstream release. None of them exist upstream.
 
 ## Syncing with upstream
 
+> **Doing a sync/release? Follow [`UPSTREAM_SYNC.md`](UPSTREAM_SYNC.md)** — the
+> self-contained step-by-step playbook (fetch → merge/resolve → verify fixes →
+> test → version+CHANGELOG → push → release via the Actions workflow). The
+> summary below is kept for quick reference; the playbook is the source of truth.
+
 ### When to sync
 - Upstream releases accumulate (they move fast — multiple releases per week)
 - After a major upstream feature drop
