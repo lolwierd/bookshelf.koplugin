@@ -919,6 +919,16 @@ function Hardcover.setUseCover(filepath, enabled)
     return _updateLinkField(filepath, "use_cover", enabled and true or false)
 end
 
+-- Flag-only sibling of setUseCover: records the use_cover link field WITHOUT
+-- touching the sidecar (no backup, no file removal). The Cover picker manages
+-- the actual cover file itself and just needs Hardcover to stop auto-injecting
+-- its own cover on the next enrich -- setUseCover(false) would delete/restore
+-- files, which the picker has already handled. No-op (returns false) for an
+-- unlinked book.
+function Hardcover.markUseCover(filepath, enabled)
+    return _updateLinkField(filepath, "use_cover", enabled and true or false)
+end
+
 -- Parse BIM's cover_sizetag ("1072x1448") into width, height.
 local function _parseSizetag(tag)
     if type(tag) ~= "string" then return nil end
@@ -1465,6 +1475,34 @@ local function _imageInfo(row)
         return row.image.url, tonumber(row.image.width), tonumber(row.image.height)
     end
     return nil
+end
+
+-- getEditionCandidates(book_id) -> array<{edition_id,title,cover_url,width,height}>|nil, err
+-- Editions for a Hardcover book, each with its cover art -- the Cover picker's
+-- "Hardcover" online source. Encapsulates the picker context + findEditions +
+-- per-edition cached_image parsing so the API shape stays inside this module.
+-- Placed after _imageInfo so it can reuse it. Network-touching; call inside a
+-- runWhenOnline wrapper.
+function Hardcover.getEditionCandidates(book_id)
+    if not book_id then return nil, "Missing Hardcover book id" end
+    local modules, _settings, user_id, ctx_err = _openPickerContext()
+    if not modules then return nil, ctx_err end
+    local ok, editions = pcall(function() return modules.Api:findEditions(book_id, user_id) end)
+    if not ok or type(editions) ~= "table" then
+        return nil, "Could not fetch Hardcover editions"
+    end
+    local out = {}
+    for _i, ed in ipairs(editions) do
+        local url, w, h = _imageInfo(ed)
+        if type(url) == "string" and url ~= "" then
+            out[#out + 1] = {
+                edition_id = ed.id or ed.edition_id,
+                title = ed.title,
+                cover_url = url, width = w, height = h,
+            }
+        end
+    end
+    return out
 end
 
 local function _downloadImage(url, key, force)
