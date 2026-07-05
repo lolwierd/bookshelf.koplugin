@@ -7,3 +7,4 @@ docs/           export-ignore
 *.pot           export-ignore
 .gitattributes  export-ignore
 .gitignore      export-ignore
+AGENTS.md       export-ignore
