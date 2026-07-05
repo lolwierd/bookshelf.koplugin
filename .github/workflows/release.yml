@@ -1,0 +1,85 @@
+name: Release
+
+# Cut a GitHub release with the plugin zip attached and release notes taken from
+# CHANGELOG.md. Two ways to fire it:
+#   - Actions tab -> "Release" -> Run workflow, enter the version (e.g. 3.8.4.1).
+#   - Push a tag like v3.8.4.1 (the tag name is the version).
+# The zip is built with `git archive`, so .gitattributes export-ignore rules
+# decide what ships (tests/, tools/, docs/, .github/, *.pot, AGENTS.md, CHANGELOG
+# excluded). The in-app updater looks for that .zip on /releases/latest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Fork version to release, e.g. 3.8.4.1 (a leading v is optional)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ github.event.inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME}"
+          fi
+          v="${v#v}"                       # strip a leading v if present
+          echo "version=$v"    >> "$GITHUB_OUTPUT"
+          echo "tag=v$v"       >> "$GITHUB_OUTPUT"
+          echo "Releasing version=$v tag=v$v"
+
+      - name: Verify _meta.lua version matches the release
+        run: |
+          meta=$(grep -oE 'version = "[^"]+"' _meta.lua | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$meta" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::_meta.lua version ($meta) != release version (${{ steps.ver.outputs.version }}). Bump _meta.lua first."
+            exit 1
+          fi
+          echo "_meta.lua version OK: $meta"
+
+      - name: Build release zip
+        run: |
+          git archive --format=zip \
+            --prefix=bookshelf.koplugin/ \
+            --output=bookshelf.koplugin.zip HEAD
+          ls -la bookshelf.koplugin.zip
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          awk -v hdr="## [$v]" '
+            index($0, hdr) == 1 { flag = 1; next }
+            flag && /^## \[/    { flag = 0 }
+            flag                { print }
+          ' CHANGELOG.md | sed '/./,$!d' > RELEASE_BODY.md
+          if [ ! -s RELEASE_BODY.md ]; then
+            printf 'Fork build %s. See CHANGELOG.md for details.\n' "$v" > RELEASE_BODY.md
+            echo "::warning::No CHANGELOG.md section for $v; using a placeholder body."
+          fi
+          echo "----- release body -----"
+          cat RELEASE_BODY.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "${{ steps.ver.outputs.tag }} — Fork build"
+          body_path: RELEASE_BODY.md
+          files: bookshelf.koplugin.zip
+          fail_on_unmatched_files: true
