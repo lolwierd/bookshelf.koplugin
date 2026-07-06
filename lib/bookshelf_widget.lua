@@ -9974,6 +9974,7 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     local HorizontalSpan  = require("ui/widget/horizontalspan")
     local VerticalSpan    = require("ui/widget/verticalspan")
     local CenterContainer = require("ui/widget/container/centercontainer")
+    local FrameContainer  = require("ui/widget/container/framecontainer")
     local TextWidget      = require("ui/widget/textwidget")
     local CoverApply      = require("lib/bookshelf_cover_apply")
     local CoverGridCell   = require("lib/bookshelf_cover_grid_cell")
@@ -9986,6 +9987,15 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     -- _assemble (it's assigned only after ReviewsModal:new returns), so prefer
     -- show_parent -- always the current instance.
     modal = modal or show_parent
+
+    -- The body must fill the SAME region the other tabs do: full body height
+    -- (avail_h) and the same left/right content inset (_side_pad). avail_w is the
+    -- full modal width; other tabs inset their content by _side_pad. Matching it
+    -- keeps the modal frame the same size across tabs -- otherwise a shorter/
+    -- wider Cover body shrinks + recentres the whole modal and leaves the prior
+    -- tab's pixels around it (the reported painting glitch).
+    local side_pad  = (show_parent and show_parent._side_pad) or Screen:scaleBySize(28)
+    local content_w = avail_w - 2 * side_pad
 
     if not state.local_candidates then
         state.local_candidates = CoverApply.localCandidates(book)
@@ -10012,15 +10022,15 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
         device_btn, HorizontalSpan:new{ width = Screen:scaleBySize(10) }, online_btn,
     }
     local toolbar_row = CenterContainer:new{
-        dimen = Geom:new{ w = avail_w, h = toolbar:getSize().h }, toolbar,
+        dimen = Geom:new{ w = content_w, h = toolbar:getSize().h }, toolbar,
     }
     local toolbar_h = toolbar_row:getSize().h
 
     -- Grid geometry: 2-4 columns by width; rows to fill the height.
     local gap      = Screen:scaleBySize(10)
     local min_cell = Screen:scaleBySize(120)
-    local n_cols   = math.max(2, math.min(4, math.floor((avail_w + gap) / (min_cell + gap))))
-    local cell_w   = math.floor((avail_w - gap * (n_cols - 1)) / n_cols)
+    local n_cols   = math.max(2, math.min(4, math.floor((content_w + gap) / (min_cell + gap))))
+    local cell_w   = math.floor((content_w - gap * (n_cols - 1)) / n_cols)
 
     local caption_font = math.max(10, math.min((modal and modal.font_size) or 13, 15))
     local cap_h  = CoverGridCell.captionHeight(caption_font)
@@ -10046,11 +10056,11 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     local focus_tables = {}
     if total == 0 then
         col[#col + 1] = CenterContainer:new{
-            dimen = Geom:new{ w = avail_w, h = math.max(cell_h, Screen:scaleBySize(80)) },
+            dimen = Geom:new{ w = content_w, h = math.max(cell_h, Screen:scaleBySize(80)) },
             TextWidget:new{
                 text = _("No covers stored yet. Use Search online or Choose from device."),
                 face = BFont:getFace("cfont", 15),
-                max_width = avail_w - Screen:scaleBySize(40),
+                max_width = content_w - Screen:scaleBySize(20),
             },
         }
     else
@@ -10092,12 +10102,33 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
             end,
         }
         col[#col + 1] = CenterContainer:new{
-            dimen = Geom:new{ w = avail_w, h = nav:getSize().h }, nav,
+            dimen = Geom:new{ w = content_w, h = nav:getSize().h }, nav,
         }
     end
 
-    col.focus_tables = focus_tables
-    return col
+    -- Pad the column to the full body height so the modal frame matches the
+    -- other tabs (they size their scroller to avail_h). Then inset horizontally
+    -- by side_pad. The white background erases the whole region on every
+    -- (re)assemble, so switching to/from this tab leaves no stale pixels.
+    -- Sum children directly rather than calling col:getSize() mid-build --
+    -- VerticalGroup caches its size/offsets on first getSize(), so measuring the
+    -- group before appending the spacer would freeze the short height and ignore
+    -- the pad (the VerticalGroup getSize caching gotcha).
+    local used_h = 0
+    for _i, ch in ipairs(col) do
+        used_h = used_h + (ch.getSize and ch:getSize().h or 0)
+    end
+    if used_h < avail_h then
+        col[#col + 1] = VerticalSpan:new{ width = avail_h - used_h }
+    end
+    local framed = FrameContainer:new{
+        bordersize = 0, margin = 0, padding = 0,
+        padding_left = side_pad, padding_right = side_pad,
+        background = Blitbuffer.COLOR_WHITE,
+        col,
+    }
+    framed.focus_tables = focus_tables
+    return framed
 end
 
 -- Apply a tapped candidate as the book's cover (or revert to embedded), then
