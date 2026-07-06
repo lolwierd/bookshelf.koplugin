@@ -218,13 +218,23 @@ function CoverSources.searchOnline(book)
         if Trapper and Trapper.info then pcall(function() Trapper:info(msg) end) end
     end
 
+    -- Apple + Google are the reliable high-resolution sources; run them first.
+    -- (Google's anonymous API is also frequently rate-limited, so it may return
+    -- nothing on a given day -- Apple then carries the high-res case.)
+    info(_("Searching Apple Books\xE2\x80\xA6"));   pcall(_apple, book, out)
     info(_("Searching Google Books\xE2\x80\xA6"));  pcall(_google, book, out)
     info(_("Searching Open Library\xE2\x80\xA6"));  pcall(_openLibrary, book, out)
-    info(_("Searching Apple Books\xE2\x80\xA6"));   pcall(_apple, book, out)
     info(_("Searching Hardcover\xE2\x80\xA6"));     pcall(_hardcover, book, out)
 
     if Trapper and Trapper.clear then pcall(function() Trapper:clear() end) end
-    return CoverSources.dedup(out)
+    -- Rank by resolution (pixel area) so the highest-res covers lead the grid;
+    -- low-res results (small Open Library / Hardcover images) fall to the back
+    -- rather than dominating the first page.
+    local ranked = CoverSources.dedup(out)
+    table.sort(ranked, function(a, b)
+        return ((a.width or 0) * (a.height or 0)) > ((b.width or 0) * (b.height or 0))
+    end)
+    return ranked
 end
 
 return CoverSources
