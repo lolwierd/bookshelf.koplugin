@@ -54,9 +54,32 @@ local function _isbn(book)
     return nil
 end
 
+-- Full-content MD5 of a file, for byte-identical dedup. Lazy-required + pcall'd
+-- so the standalone tests (no ffi/sha2) fall back to the size heuristic.
+local _md5
+local function _md5fn()
+    if _md5 == nil then
+        local ok, sha2 = pcall(require, "ffi/sha2")
+        _md5 = (ok and sha2 and sha2.md5) or false
+    end
+    return _md5 or nil
+end
+local function _fileHash(path)
+    local fn = _md5fn()
+    if not fn then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read("*a")
+    f:close()
+    if not data then return nil end
+    local ok, h = pcall(fn, data)
+    return ok and h or nil
+end
+
 -- Download `url` into the per-book cache dir, decode for dimensions, stat for
--- size. Returns a partial candidate {local_path,width,height,filesize} or nil
--- (download failed / undecodable -> dropped by the caller).
+-- size, hash the bytes. Returns a partial candidate
+-- {local_path,width,height,filesize,hash} or nil (download failed / undecodable
+-- -> dropped by the caller).
 local function _materialise(url, book_fp, label, seq)
     if type(url) ~= "string" or url == "" then return nil end
     local ext = url:match("%.([pP][nN][gG])[%?%#]?$") and "png" or "jpg"
@@ -69,7 +92,10 @@ local function _materialise(url, book_fp, label, seq)
         logger.warn("[bookshelf cover] undecodable online cover", url)
         return nil
     end
-    return { local_path = dest, width = w, height = h, filesize = CoverApply.fileSize(dest) }
+    return {
+        local_path = dest, width = w, height = h,
+        filesize = CoverApply.fileSize(dest), hash = _fileHash(dest),
+    }
 end
 
 -- Pick the highest-resolution URL from a Google imageLinks object. A real large
@@ -328,12 +354,14 @@ local function _wikidata(book, out)
     end
 end
 
--- Drop candidates whose (width,height,filesize) already appeared: the same
--- cover surfaced by two sources shows once.
+-- Drop byte-identical duplicates: the same cover surfaced by two sources (or by
+-- Hardcover's book + edition passes) shows once. Keyed on the content hash when
+-- available, falling back to the (width,height,filesize) triple.
 function CoverSources.dedup(list)
     local seen, out = {}, {}
     for _i, c in ipairs(list) do
-        local key = table.concat({ c.width or "?", c.height or "?", c.filesize or "?" }, "\1")
+        local key = c.hash
+            or table.concat({ c.width or "?", c.height or "?", c.filesize or "?" }, "\1")
         if not seen[key] then
             seen[key] = true
             out[#out + 1] = c
