@@ -1021,6 +1021,28 @@ function Hardcover.getEmbeddedIdentifiers(book)
     return nil
 end
 
+-- Best embedded ISBN for a book (prefer ISBN-13), digits only (trailing X kept
+-- for ISBN-10), or nil. Pure -- reuses getEmbeddedIdentifiers (reads the EPUB's
+-- OPF), so it works with the external Hardcover plugin absent. Used by the Cover
+-- picker's online search for exact-edition matching.
+function Hardcover.getEmbeddedIsbn(book)
+    local ids = Hardcover.getEmbeddedIdentifiers(book)
+    if type(ids) ~= "string" or ids == "" then return nil end
+    local lower = ids:lower()
+    local function clean(s) return (s:gsub("[^%dxX]", ""):upper()) end
+    local i13 = lower:match("isbn13:%s*([%d%s%-]+)")
+    if i13 then
+        i13 = clean(i13)
+        if #i13 == 13 then return i13 end
+    end
+    local i = lower:match("isbn[%w%-]*:%s*([%dxX%s%-]+)")
+    if i then
+        i = clean(i)
+        if #i == 13 or #i == 10 then return i end
+    end
+    return nil
+end
+
 local function _parseHardcoverIdentifiers(modules, identifiers)
     if type(identifiers) ~= "string" or identifiers == "" then return nil end
     local parsed = {}

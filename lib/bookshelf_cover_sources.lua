@@ -41,6 +41,19 @@ local function _query(book)
     return table.concat(parts, " ")
 end
 
+-- Best embedded ISBN for the book (digits, ISBN-13 preferred) or nil. Reuses the
+-- Hardcover module's pure OPF identifier reader -- works even when the external
+-- Hardcover plugin is absent. ISBN-first querying hits the exact edition, which
+-- gives a more accurate and usually higher-resolution cover than title+author.
+local function _isbn(book)
+    local ok, HC = pcall(require, "lib/bookshelf_hardcover")
+    if ok and HC and HC.getEmbeddedIsbn then
+        local ok2, isbn = pcall(HC.getEmbeddedIsbn, book)
+        if ok2 and type(isbn) == "string" and isbn ~= "" then return isbn end
+    end
+    return nil
+end
+
 -- Download `url` into the per-book cache dir, decode for dimensions, stat for
 -- size. Returns a partial candidate {local_path,width,height,filesize} or nil
 -- (download failed / undecodable -> dropped by the caller).
@@ -59,97 +72,127 @@ local function _materialise(url, book_fp, label, seq)
     return { local_path = dest, width = w, height = h, filesize = CoverApply.fileSize(dest) }
 end
 
--- Google Books. The list endpoint usually only returns thumbnail/smallThumbnail
--- (~128px). Use a real larger key when present; otherwise take the thumbnail's
--- content URL, drop the zoom cap + page-curl overlay, and request a specific
--- large width via the content server's `fife` param (~1200px) -- markedly higher
--- resolution without a per-item detail round-trip.
+-- Pick the highest-resolution URL from a Google imageLinks object. A real large
+-- key wins; otherwise take the thumbnail's content URL, drop the zoom cap +
+-- page-curl overlay, and request a large width via the content server's `fife`
+-- param (~1200px) -- markedly higher resolution without a detail round-trip.
+local function _googlePick(il)
+    local best = il.extraLarge or il.large or il.medium
+    if best then
+        return (best:gsub("^http:", "https:"):gsub("&edge=curl", ""))
+    end
+    best = il.small or il.thumbnail or il.smallThumbnail
+    if best then
+        best = best:gsub("^http:", "https:"):gsub("&edge=curl", ""):gsub("&zoom=%d", "")
+        if best:find("books%.google") or best:find("googleusercontent") then
+            best = best .. (best:find("%?") and "&" or "?") .. "fife=w1200"
+        end
+        return best
+    end
+    return nil
+end
+
+-- Google Books, ISBN-first (exact edition) then title+author.
 local function _google(book, out)
+    local urls = {}
+    local isbn = _isbn(book)
+    if isbn then
+        urls[#urls + 1] = "https://www.googleapis.com/books/v1/volumes?q=isbn:"
+            .. _enc(isbn) .. "&country=US"
+    end
     local q = _query(book)
-    if q == "" then return end
-    local url = "https://www.googleapis.com/books/v1/volumes?q=" .. _enc(q)
-        .. "&maxResults=8&country=US"
-    local data = CoverFetch.getJson(url)
-    if not data or type(data.items) ~= "table" then return end
+    if q ~= "" then
+        urls[#urls + 1] = "https://www.googleapis.com/books/v1/volumes?q=" .. _enc(q)
+            .. "&maxResults=8&country=US"
+    end
     local n = 0
-    for i, item in ipairs(data.items) do
+    for u, url in ipairs(urls) do
         if n >= MAX_PER_SOURCE then break end
-        local vi = item.volumeInfo
-        local il = vi and vi.imageLinks
-        if type(il) == "table" then
-            local best = il.extraLarge or il.large or il.medium
-            if best then
-                best = best:gsub("^http:", "https:"):gsub("&edge=curl", "")
-            else
-                best = il.small or il.thumbnail or il.smallThumbnail
+        local data = CoverFetch.getJson(url)
+        if data and type(data.items) == "table" then
+            for i, item in ipairs(data.items) do
+                if n >= MAX_PER_SOURCE then break end
+                local il = item.volumeInfo and item.volumeInfo.imageLinks
+                local best = type(il) == "table" and _googlePick(il) or nil
                 if best then
-                    best = best:gsub("^http:", "https:"):gsub("&edge=curl", "")
-                               :gsub("&zoom=%d", "")
-                    if best:find("books%.google") or best:find("googleusercontent") then
-                        best = best .. (best:find("%?") and "&" or "?") .. "fife=w1200"
+                    local m = _materialise(best, book.filepath, "google", u .. "_" .. i)
+                    if m then
+                        m.kind = "google_books"; m.source_label = _("Google Books")
+                        m.url = best; m.is_active = false
+                        out[#out + 1] = m; n = n + 1
                     end
                 end
             end
-            if best then
-                local m = _materialise(best, book.filepath, "google", i)
-                if m then
-                    m.kind = "google_books"; m.source_label = _("Google Books")
-                    m.url = best; m.is_active = false
-                    out[#out + 1] = m; n = n + 1
+        end
+    end
+end
+
+-- Open Library, ISBN-first (direct exact-edition cover) then a title search
+-- resolving cover IDs (the ID path is not rate-limited unlike ISBN/OLID).
+local function _openLibrary(book, out)
+    local n = 0
+    local isbn = _isbn(book)
+    if isbn then
+        -- default=false so a missing cover 404s instead of returning a blank.
+        local cu = "https://covers.openlibrary.org/b/isbn/" .. _enc(isbn) .. "-L.jpg?default=false"
+        local m = _materialise(cu, book.filepath, "openlib_isbn", isbn)
+        if m then
+            m.kind = "open_library"; m.source_label = _("Open Library")
+            m.url = cu; m.is_active = false
+            out[#out + 1] = m; n = n + 1
+        end
+    end
+    local q = _query(book)
+    if q ~= "" and n < MAX_PER_SOURCE then
+        local url = "https://openlibrary.org/search.json?q=" .. _enc(q)
+            .. "&limit=8&fields=cover_i,title"
+        local data = CoverFetch.getJson(url)
+        if data and type(data.docs) == "table" then
+            for _i, doc in ipairs(data.docs) do
+                if n >= MAX_PER_SOURCE then break end
+                if doc.cover_i then
+                    local cu = "https://covers.openlibrary.org/b/id/" .. tostring(doc.cover_i) .. "-L.jpg"
+                    local m = _materialise(cu, book.filepath, "openlib", doc.cover_i)
+                    if m then
+                        m.kind = "open_library"; m.source_label = _("Open Library")
+                        m.url = cu; m.is_active = false
+                        out[#out + 1] = m; n = n + 1
+                    end
                 end
             end
         end
     end
 end
 
--- Open Library. Search for cover IDs, then fetch by cover ID (the -L size, and
--- the ID path is not rate-limited unlike ISBN/OLID lookups).
-local function _openLibrary(book, out)
-    local q = _query(book)
-    if q == "" then return end
-    local url = "https://openlibrary.org/search.json?q=" .. _enc(q)
-        .. "&limit=8&fields=cover_i,title"
-    local data = CoverFetch.getJson(url)
-    if not data or type(data.docs) ~= "table" then return end
-    local n = 0
-    for _i, doc in ipairs(data.docs) do
-        if n >= MAX_PER_SOURCE then break end
-        if doc.cover_i then
-            local cu = "https://covers.openlibrary.org/b/id/" .. tostring(doc.cover_i) .. "-L.jpg"
-            local m = _materialise(cu, book.filepath, "openlib", doc.cover_i)
-            if m then
-                m.kind = "open_library"; m.source_label = _("Open Library")
-                m.url = cu; m.is_active = false
-                out[#out + 1] = m; n = n + 1
-            end
-        end
-    end
-end
-
--- Apple Books via the iTunes Search API. artworkUrl100's "100x100bb" segment
--- rewrites to a much larger size. NOTE: Apple's iTunes Search API terms restrict
--- caching/redistribution of artwork; this fetch is interactive, user-initiated
--- and per-device only (the user picks one cover for their own book), not bulk
--- harvesting.
+-- Apple Books via the iTunes Search API, ISBN term first then title+author.
+-- artworkUrl100's size segment rewrites to a large edge; Apple caps to the
+-- source's true size, so this yields the highest available. NOTE: Apple's terms
+-- restrict caching/redistribution of artwork; this fetch is interactive,
+-- user-initiated and per-device (the user picks one cover), not bulk harvesting.
 local function _apple(book, out)
+    local terms = {}
+    local isbn = _isbn(book)
+    if isbn then terms[#terms + 1] = isbn end
     local q = _query(book)
-    if q == "" then return end
-    local url = "https://itunes.apple.com/search?media=ebook&term=" .. _enc(q) .. "&limit=8"
-    local data = CoverFetch.getJson(url)
-    if not data or type(data.results) ~= "table" then return end
+    if q ~= "" then terms[#terms + 1] = q end
     local n = 0
-    for i, r in ipairs(data.results) do
+    for u, term in ipairs(terms) do
         if n >= MAX_PER_SOURCE then break end
-        local art = r.artworkUrl100
-        if type(art) == "string" then
-            -- Rewrite the size segment up to a large edge; Apple caps to the
-            -- source image's true size, so this yields the highest available.
-            local hi = art:gsub("/%d+x%d+bb", "/1200x1200bb")
-            local m = _materialise(hi, book.filepath, "apple", i)
-            if m then
-                m.kind = "apple"; m.source_label = _("Apple Books")
-                m.url = hi; m.is_active = false
-                out[#out + 1] = m; n = n + 1
+        local url = "https://itunes.apple.com/search?media=ebook&term=" .. _enc(term) .. "&limit=8"
+        local data = CoverFetch.getJson(url)
+        if data and type(data.results) == "table" then
+            for i, r in ipairs(data.results) do
+                if n >= MAX_PER_SOURCE then break end
+                local art = r.artworkUrl100
+                if type(art) == "string" then
+                    local hi = art:gsub("/%d+x%d+bb", "/1200x1200bb")
+                    local m = _materialise(hi, book.filepath, "apple", u .. "_" .. i)
+                    if m then
+                        m.kind = "apple"; m.source_label = _("Apple Books")
+                        m.url = hi; m.is_active = false
+                        out[#out + 1] = m; n = n + 1
+                    end
+                end
             end
         end
     end
@@ -190,6 +233,83 @@ local function _hardcover(book, out)
     end
 end
 
+-- Wikidata "instance of" ids that count as a book/work (so an unrelated entity
+-- with the same title -- a film, a place -- is rejected). literary work, book,
+-- written work, novel, poem, novella, version/edition/translation.
+local WIKI_BOOK_TYPES = {
+    Q7725634 = true, Q571 = true, Q47461344 = true, Q8261 = true,
+    Q5185279 = true, Q149989 = true, Q3331189 = true,
+}
+
+local function _wdClaimId(claim)
+    local v = claim and claim.mainsnak and claim.mainsnak.datavalue
+        and claim.mainsnak.datavalue.value
+    return type(v) == "table" and v.id or nil
+end
+local function _wdClaimStr(claim)
+    local v = claim and claim.mainsnak and claim.mainsnak.datavalue
+        and claim.mainsnak.datavalue.value
+    return type(v) == "string" and v or nil
+end
+
+-- Encode a Commons filename for a Special:FilePath URL path: only the few
+-- characters that would break the URL (space, ?, #, &, +, %). Dots, hyphens,
+-- parentheses and the like are left literal, which Commons handles.
+local function _filePathEnc(s)
+    return (tostring(s):gsub("[ %?#&+%%]", function(ch)
+        return string.format("%%%02X", ch:byte())
+    end))
+end
+
+-- Wikidata via the MediaWiki API (fast, unlike WDQS which times out): search by
+-- title, batch-fetch claims, take the first entity that is a book AND has an
+-- image (P18), download its Commons file scaled to ~1200px. Best for
+-- classics/public-domain works, where covers are often absent from the retail
+-- APIs. A portrait guard rejects a stray non-cover image on a mismatched entity.
+local function _wikidata(book, out)
+    -- Title ONLY: wbsearchentities matches entity labels, so appending the author
+    -- (as the retail full-text searches want) finds nothing. Disambiguation is
+    -- handled by the book-type filter + search rank below.
+    local title = (type(book.title) == "string" and book.title ~= "")
+        and book.title or _query(book)
+    if title == "" then return end
+    local s = CoverFetch.getJson("https://www.wikidata.org/w/api.php?action=wbsearchentities&search="
+        .. _enc(title) .. "&language=en&type=item&limit=7&format=json")
+    if not s or type(s.search) ~= "table" or #s.search == 0 then return end
+    local ids = {}
+    for i, cand in ipairs(s.search) do
+        if i > 5 then break end
+        ids[#ids + 1] = cand.id
+    end
+    if #ids == 0 then return end
+    local ent = CoverFetch.getJson("https://www.wikidata.org/w/api.php?action=wbgetentities&ids="
+        .. _enc(table.concat(ids, "|")) .. "&props=claims&format=json")
+    if not ent or type(ent.entities) ~= "table" then return end
+    for _i, id in ipairs(ids) do  -- preserve search-rank order
+        local e = ent.entities[id]
+        local claims = e and e.claims
+        if type(claims) == "table" and type(claims.P18) == "table" and claims.P18[1] then
+            local is_book = false
+            for _j, c in ipairs(claims.P31 or {}) do
+                if WIKI_BOOK_TYPES[_wdClaimId(c)] then is_book = true; break end
+            end
+            local file = is_book and _wdClaimStr(claims.P18[1]) or nil
+            if file then
+                local url = "https://commons.wikimedia.org/wiki/Special:FilePath/"
+                    .. _filePathEnc(file) .. "?width=1200"
+                local m = _materialise(url, book.filepath, "wikidata", id)
+                -- Covers are portrait; reject a clearly-landscape image.
+                if m and m.width and m.height and m.height >= m.width then
+                    m.kind = "wikidata"; m.source_label = _("Wikidata")
+                    m.url = url; m.is_active = false
+                    out[#out + 1] = m
+                    return  -- one good Wikidata cover is enough
+                end
+            end
+        end
+    end
+end
+
 -- Drop candidates whose (width,height,filesize) already appeared: the same
 -- cover surfaced by two sources shows once.
 function CoverSources.dedup(list)
@@ -224,6 +344,7 @@ function CoverSources.searchOnline(book)
     info(_("Searching Apple Books\xE2\x80\xA6"));   pcall(_apple, book, out)
     info(_("Searching Google Books\xE2\x80\xA6"));  pcall(_google, book, out)
     info(_("Searching Open Library\xE2\x80\xA6"));  pcall(_openLibrary, book, out)
+    info(_("Searching Wikidata\xE2\x80\xA6"));      pcall(_wikidata, book, out)
     info(_("Searching Hardcover\xE2\x80\xA6"));     pcall(_hardcover, book, out)
 
     if Trapper and Trapper.clear then pcall(function() Trapper:clear() end) end
