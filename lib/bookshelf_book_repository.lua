@@ -3160,7 +3160,13 @@ function Repo.getSeriesGroups(limit, offset, sort_priority_override, filter, opt
                 lang         = book.lang,
                 latest       = read_time[book.filepath] or c.mtime or 0,
                 latest_added = c.mtime or 0,
-                book_count   = 1,
+                -- Sort-only field (hydration replaces this shape with a real
+                -- Book record). 0, not 1: under a book-count sort a standalone
+                -- isn't a series at all, so it ranks below a 1-book series
+                -- rather than tying with it in arbitrary order. Degraded
+                -- 1-book stacks (hide_single + "both") keep count 1 -- they
+                -- ARE a series, just rendered as a single.
+                book_count   = 0,
             }
         end
     end

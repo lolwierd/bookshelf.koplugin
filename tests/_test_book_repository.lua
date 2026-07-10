@@ -2544,6 +2544,19 @@ test("getSeriesGroups: hide_single + 'both' degrades 1-book stacks to singles (#
     _G._test_settings.bookshelf_hide_single_book_stacks = nil
 end)
 
+test("getSeriesGroups: count sort ranks 1-book stacks above standalones (#160)", function()
+    seriesMixFixture()
+    -- "book_count" legacy sort key = count descending. A standalone isn't a
+    -- series at all, so it must rank BELOW a 1-book series, not tie with it.
+    local items, total = Repo.getSeriesGroups(10, 0, "book_count",
+        { series_membership = "both" })
+    assert(total == 3, "expected 3 items, got " .. tostring(total))
+    assert(items[1].series_name == "Foundation", "2-book stack first")
+    assert(items[2].series_name == "Dune", "1-book stack second")
+    assert(items[3].books == nil and items[3].title == "Standalone",
+        "standalone last, got " .. tostring(items[3].title or items[3].series_name))
+end)
+
 test("getSeriesGroups: other dimensions still filter standalones under 'both' (#160)", function()
     seriesMixFixture()
     -- Mark the standalone finished; everything else has no sidecar (unread).
