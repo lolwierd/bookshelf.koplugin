@@ -736,6 +736,10 @@ function Settings:_coverDisplaySubItems()
                 end,
             }
         end)(),
+        -- Fade finished books like the on-hold faded cover (#138). Opt-in
+        -- (default off) and independent of the badge style above, mirroring
+        -- the #121 split of badge vs fade for on-hold books.
+        toggleRow("finished_fade_enabled", _("Fade finished books"), false, true),
         -- Show series #: three-state. "always" (default), "in_series"
         -- (only inside a single-series view), or "never". Legacy boolean
         -- values are still honoured: true reads as "always", false as
