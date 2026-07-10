@@ -739,7 +739,21 @@ function Bookshelf:show()
         return
     end
     _diag_branch = "cold-create"
-    local BookshelfWidget = require("lib/bookshelf_widget")
+    -- Guard the cold-create require: bookshelf_widget pulls in the whole
+    -- widget module tree at load time, so a single missing/corrupt lib file
+    -- (e.g. after a partial update unpack) throws here. Without this guard the
+    -- error propagates through the event dispatcher and panics all of KOReader
+    -- (the "Don't Panic" bomb screen) rather than failing to just the shelf.
+    local ok_widget, BookshelfWidget = pcall(require, "lib/bookshelf_widget")
+    if not ok_widget then
+        logger.err("[bookshelf] cold-create failed to load bookshelf_widget: "
+            .. tostring(BookshelfWidget))
+        local InfoMessage = require("ui/widget/infomessage")
+        UIManager:show(InfoMessage:new{
+            text = _("Bookshelf couldn't open. Some of its files may be missing or corrupted after an update. Try reinstalling the plugin."),
+        })
+        return
+    end
     local _t_pre_new = _gettime()
     self._widget = BookshelfWidget:new{}
     local _t_post_new = _gettime()
