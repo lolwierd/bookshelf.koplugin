@@ -286,8 +286,10 @@ function Edit.show(menu, entry)
     -- Show-in scope: which context the entry appears in -- the library home
     -- screen, the in-reader launcher, or both. Stored as entry.scope
     -- ("library" | "reader"); nil means "both" (the default, so existing menus
-    -- are unaffected). Folders carry it too, gating the whole group.
-    if not is_divider then
+    -- are unaffected). Folders carry it too, gating the whole group. Dividers
+    -- carry it like any other entry (#256) -- a separator that only makes
+    -- sense in one view shouldn't leave a stray line in the other.
+    do
         -- Menu-action shortcuts get an "Auto" scope (nil): shown wherever the
         -- menu item exists, governed by the availability filter. They also get
         -- an explicit "both" to force showing in both views regardless. Other
