@@ -372,6 +372,14 @@ function BookshelfWidget:init()
         self.key_events = self.key_events or {}
         self.key_events.NextPage = { { Device.input.group.PgFwd } }
         self.key_events.PrevPage = { { Device.input.group.PgBack } }
+        -- Device Back inside a chip drilldown pops one breadcrumb level
+        -- (#239), matching the "Back in file browser: parent folder"
+        -- expectation. Without this the key falls through to the
+        -- FileChooser underneath, which walks the REAL file browser up to
+        -- its parent -- and bookshelf mirrors that as a folder view of
+        -- whatever lies above the library. At top level the handler
+        -- declines the event, keeping the historical fall-through.
+        self.key_events.BSDrillBack = { { Device.input.group.Back } }
     end
     if Device:hasDPad() then
         self.key_events = self.key_events or {}
@@ -7419,6 +7427,18 @@ end
 -- gesture coordinates) and dispatch straight to pagination.
 function BookshelfWidget:onNextPage() return self:_paginateNext() end
 function BookshelfWidget:onPrevPage() return self:_paginatePrev() end
+
+-- Device Back key: pop one drilldown level when drilled in (#239).
+-- Returning false at top level lets the event keep falling through to
+-- whatever KOReader would do without us (unchanged behaviour).
+function BookshelfWidget:onBSDrillBack()
+    local n = self._drilldown_path and #self._drilldown_path or 0
+    if n > 0 then
+        self:_drillBackTo(n - 1)
+        return true
+    end
+    return false
+end
 
 function BookshelfWidget:onBookshelfNextChip()
     if self._chip_bar_hidden then return true end
