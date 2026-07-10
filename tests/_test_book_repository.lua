@@ -2462,6 +2462,44 @@ test("filterValueCounts: rating faceting buckets correctly under a genre filter"
         "expected Romance book to be excluded, got counts[3]=" .. tostring(counts["3"]))
 end)
 
+test("getFolderBookPaths: finds books nested deeper than the home walk depth (#202)", function()
+    -- Novels/Genre/Subgenre/Author/Book.epub sits 4 dirs below home; the
+    -- home-rooted walk (depth 3) never reaches it, so the status-filter
+    -- predicate saw the Novels folder as empty and dropped it. The fallback
+    -- walks the asked-about folder itself with the same depth budget.
+    Repo.invalidateWalkCache()
+    local tree = {
+        ["/home"]                              = { ".", "..", "Novels" },
+        ["/home/Novels"]                       = { ".", "..", "Genre" },
+        ["/home/Novels/Genre"]                 = { ".", "..", "Subgenre" },
+        ["/home/Novels/Genre/Subgenre"]        = { ".", "..", "Author" },
+        ["/home/Novels/Genre/Subgenre/Author"] = { ".", "..", "Book.epub" },
+    }
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = tree[path] or {}
+        local i = 0
+        return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(fp, key)
+        local mode = tree[fp] and "directory" or "file"
+        if key == "modification" then return 0
+        elseif key == "mode" then return mode end
+    end
+    _G._test_settings = { home_dir = "/home", bookshelf_latest_walk_depth = 3 }
+    _G._test_bim_data = {
+        ["/home/Novels/Genre/Subgenre/Author/Book.epub"] = { title = "Deep Book" },
+    }
+
+    local paths = Repo.getFolderBookPaths("/home/Novels")
+    assert(#paths == 1, "expected the deep book via the folder-rooted fallback, got " .. #paths)
+    assert(paths[1] == "/home/Novels/Genre/Subgenre/Author/Book.epub")
+
+    -- Every drill level re-anchors the depth budget, mirroring how browsing
+    -- reveals one more level per drill.
+    local sub = Repo.getFolderBookPaths("/home/Novels/Genre")
+    assert(#sub == 1, "expected the deep book from the Genre level too, got " .. #sub)
+end)
+
 -- ============================================================================
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

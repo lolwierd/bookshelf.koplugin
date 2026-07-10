@@ -2000,6 +2000,20 @@ function Repo.getFolderBookPaths(path)
             paths[#paths + 1] = fp
         end
     end
+    -- Deep-nesting fallback (#202): the home-rooted walk is bounded by
+    -- latest_walk_depth, so a folder whose books all sit deeper than that
+    -- prefix-matches nothing -- even though drilling into it shows books
+    -- (browsing scans one level per drill). When the prefix filter comes
+    -- up empty, walk the asked-about folder ITSELF with the same depth
+    -- budget: cost scales with that subtree only, each drill level
+    -- re-anchors the budget (matching what browsing reveals), and a truly
+    -- empty folder confirms cheaply. Memoised below either way; the cache
+    -- clears in lockstep with the walk cache.
+    if #paths == 0 then
+        local found = {}
+        walkBooks(path, depth, found)
+        for i = 1, #found do paths[#paths + 1] = found[i].fp end
+    end
     _folder_book_paths_cache[path] = { paths = paths }
     -- Return a copy so caller mutations don't poison the cache.
     local out = {}
