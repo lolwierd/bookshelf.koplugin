@@ -23,20 +23,22 @@ local PageWipe = {}
 -- physical e-ink refresh). "off" is handled by the caller (no call).
 PageWipe.STEPS = { fast = 5, medium = 8, slow = 12 }
 
+-- Per-surface animation settings (#259) and their defaults. The start menu
+-- reveals a taller region than a page wipe, so it defaults one notch
+-- snappier. The settings menu rows read the same defaults.
+PageWipe.DEFAULTS = {
+    shelf_page_animation = "medium",  -- shelf page turns + chip-bar paging
+    start_menu_animation = "fast",    -- start menu open/close reveal
+}
+
 -- Resolve an animation preference to a step count, or nil when animation
--- should not run (not an e-ink screen, or the setting is "off"). With no
--- pref_key this reads the base "shelf_page_animation" setting (shelf
--- pagination + chip-bar paging). A caller-supplied pref_key (the start
--- menu passes "start_menu_animation", #259) is read first and FALLS BACK
--- to the base setting when unset -- so existing setups behave unchanged
--- until the user overrides that surface. On LCD the per-strip refreshes
--- coalesce so nothing shows -- hence the e-ink gate.
+-- should not run (not an e-ink screen, or the setting is "off"). pref_key
+-- picks the surface; nil means the base shelf/chip-bar setting. On LCD the
+-- per-strip refreshes coalesce so nothing shows -- hence the e-ink gate.
 function PageWipe.resolveSteps(pref_key)
     if not (Device.hasEinkScreen and Device:hasEinkScreen()) then return nil end
-    local mode = pref_key and BookshelfSettings.read(pref_key) or nil
-    if mode == nil then
-        mode = BookshelfSettings.read("shelf_page_animation") or "medium"
-    end
+    local key  = pref_key or "shelf_page_animation"
+    local mode = BookshelfSettings.read(key) or PageWipe.DEFAULTS[key] or "medium"
     return PageWipe.STEPS[mode]  -- nil for "off" / unknown
 end
 
