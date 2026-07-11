@@ -78,6 +78,30 @@ function GestureZones.tryReaderZones(ev, rui)
     end, nil)
 end
 
+-- matchesReaderMenuZone(ev, rui) -> boolean
+-- Probe only: would this gesture hit one of the reader's stock menu-open
+-- zones? No handler is fired. Used by the parked shelf to detect a
+-- menu-intent gesture and convert it (finish the close, then open the
+-- real FM menu) instead of surfacing the reader menu.
+function GestureZones.matchesReaderMenuZone(ev, rui)
+    if not rui then return false end
+    local zone_lists = { rui._ordered_touch_zones }
+    for _i, child in ipairs(rui) do
+        if type(child) == "table" and child._ordered_touch_zones then
+            zone_lists[#zone_lists + 1] = child._ordered_touch_zones
+        end
+    end
+    for _i, zones in ipairs(zone_lists) do
+        for _j, tzone in ipairs(zones) do
+            local id = tzone.def and tzone.def.id
+            if id and id:find("^readermenu_") and tzone.gs_range:match(ev) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- forwardToFM(event, self_widget) -> boolean
 -- Forward a non-gesture event (Dispatcher actions like IncreaseFlIntensity,
 -- ToggleNightMode bound to a gesture) to FM's registered modules, since

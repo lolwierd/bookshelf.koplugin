@@ -9,6 +9,12 @@ local helpers = dofile("tests/_helpers.lua")
 local t = helpers.runner()
 
 -- Controllable stubs -------------------------------------------------------
+-- Fake clock: the module resolves its timer through socket.gettime, so
+-- stubbing socket before dofile gives the tests full control of "now"
+-- (drives the input-idle trigger).
+local fake_now = 1000
+package.loaded["socket"] = { gettime = function() return fake_now end }
+
 local hot_park_enabled = true
 local ticks = {}
 local dirty_calls = {}
@@ -204,29 +210,40 @@ t.test("unpark on a non-parked session is a false no-op", function()
     assert(Park.unpark({}) == false)
 end)
 
-print("--- deferred finish-close ---")
+print("--- opportunistic finish (idle probe) ---")
 
-t.test("park schedules a finish that real-closes to FM behind the shelf", function()
-    reset()
+-- Shared fixture: parked reader under the shelf, probe armed.
+local function parkFixture()
     local rui = makeRui("/books/a.epub")
-    local closed, fm_file = false, nil
+    rui.close_calls = 0
     rui.onClose = function()
         assert(Park.isFinishingClose(), "finishing flag must be up during onClose")
-        closed = true
+        rui.close_calls = rui.close_calls + 1
     end
-    rui.showFileManager = function(_self, f) fm_file = f end
+    rui.showFileManager = function(_self, f) rui.fm_file = f end
     ReaderUI.instance = rui
     local plugin = makePlugin(rui)
-    local shelf_widget = {}
+    local shelf_widget = { _stopStatusTimer = function() end }
     plugin._widget = shelf_widget
     UIManager._window_stack = { { widget = rui }, { widget = shelf_widget } }
     assert(Park.park(plugin) == true)
-    assert(#scheduled == 1, "park must schedule the deferred finish")
     drainTicks() -- park's own refresh tick
     plugin.raised, plugin.shown = false, false
-    fireScheduled()
-    assert(closed, "reader must real-close on the deferred finish")
-    assert(fm_file == "/books/a.epub")
+    return rui, plugin, shelf_widget
+end
+
+t.test("probe reschedules while input is recent, closes once idle", function()
+    reset()
+    local rui, plugin = parkFixture()
+    assert(#scheduled == 1, "park must arm the idle probe")
+    fake_now = fake_now + 5
+    fireScheduled() -- only 5s idle: not yet
+    assert(rui.close_calls == 0, "must not close while recently active")
+    assert(#scheduled == 1, "probe must re-arm")
+    fake_now = fake_now + 31
+    fireScheduled() -- 36s idle: close
+    assert(rui.close_calls == 1, "reader must real-close once idle")
+    assert(rui.fm_file == "/books/a.epub")
     assert(plugin.raised and plugin.shown,
         "finish must re-raise and warm-show the shelf over the fresh FM")
     assert(Park.isParked() == false)
@@ -234,52 +251,66 @@ t.test("park schedules a finish that real-closes to FM behind the shelf", functi
     assert(Park.isFinishingClose() == false, "flag must clear on the next tick")
 end)
 
-t.test("unpark inside the linger window cancels the finish", function()
+t.test("noteInput resets the idle clock", function()
     reset()
-    local rui = makeRui("/books/a.epub")
-    local closed = false
-    rui.onClose = function() closed = true end
-    ReaderUI.instance = rui
-    local shelf = { _stopStatusTimer = function() end }
-    UIManager._window_stack = { { widget = rui }, { widget = shelf } }
-    assert(Park.park(makePlugin(rui)) == true)
-    assert(Park.unpark(shelf) == true)
-    assert(#scheduled == 0, "unpark must unschedule the finish")
+    local rui = parkFixture()
+    fake_now = fake_now + 31
+    Park.noteInput() -- user touched something just now
     fireScheduled()
-    assert(closed == false, "no real close after an unpark")
+    assert(rui.close_calls == 0, "fresh input must hold the close off")
+    assert(#scheduled == 1, "probe re-armed")
 end)
 
-t.test("finish defers while something covers the shelf", function()
+t.test("probe defers while something covers the shelf", function()
     reset()
-    local rui = makeRui("/books/a.epub")
-    local closed = false
-    rui.onClose = function() closed = true end
-    ReaderUI.instance = rui
-    local plugin = makePlugin(rui)
-    local shelf_widget = {}
-    plugin._widget = shelf_widget
-    local popup = {}
-    UIManager._window_stack = {
-        { widget = rui }, { widget = shelf_widget }, { widget = popup },
-    }
-    assert(Park.park(plugin) == true)
-    drainTicks()
-    fireScheduled() -- popup on top: must NOT close, must reschedule
-    assert(closed == false, "must not finish under a live popup")
+    local rui = parkFixture()
+    table.insert(UIManager._window_stack, { widget = {} }) -- popup on top
+    fake_now = fake_now + 60
+    fireScheduled()
+    assert(rui.close_calls == 0, "must not finish under a live popup")
     assert(Park.isParked() == true, "still parked while deferred")
-    assert(#scheduled == 1, "finish must be rescheduled")
+    assert(#scheduled == 1, "probe must re-arm")
     table.remove(UIManager._window_stack) -- popup dismissed
     fireScheduled()
-    assert(closed == true, "finish runs once the shelf is topmost again")
+    assert(rui.close_calls == 1, "finish runs once the shelf is topmost again")
 end)
 
-t.test("a real close inside the window cancels the finish", function()
+t.test("unpark cancels the probe", function()
     reset()
-    local rui = makeRui("/books/a.epub")
-    ReaderUI.instance = rui
-    assert(Park.park(makePlugin(rui)) == true)
+    local rui, _plugin, shelf = parkFixture()
+    assert(Park.unpark(shelf) == true)
+    assert(#scheduled == 0, "unpark must unschedule the probe")
+    fake_now = fake_now + 60
+    fireScheduled()
+    assert(rui.close_calls == 0, "no real close after an unpark")
+end)
+
+t.test("a real close cancels the probe", function()
+    reset()
+    parkFixture()
     Park.noteRealClose()
-    assert(#scheduled == 0, "noteRealClose must unschedule the finish")
+    assert(#scheduled == 0, "noteRealClose must unschedule the probe")
+end)
+
+print("--- Park.finishToMenu ---")
+
+t.test("menu tap while parked converts: close, then FM menu", function()
+    reset()
+    local rui = parkFixture()
+    local menu_opened = false
+    package.loaded["apps/filemanager/filemanager"] = {
+        instance = { menu = { onShowMenu = function() menu_opened = true end } },
+    }
+    assert(Park.finishToMenu() == true)
+    assert(rui.close_calls == 1, "menu conversion must real-close the book")
+    assert(menu_opened, "the fresh FM menu must open after the finish")
+    assert(Park.isParked() == false)
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("finishToMenu is a false no-op when not parked", function()
+    reset()
+    assert(Park.finishToMenu() == false)
 end)
 
 print("--- Park.closeShelfToFileManager ---")

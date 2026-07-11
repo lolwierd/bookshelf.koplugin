@@ -2644,11 +2644,13 @@ function Settings:_advancedSubItems()
         {
             text = _("Instant book close (beta)"),
             help_text = _("Show Bookshelf immediately when leaving a "
-                .. "book, and finish closing the book in the background "
-                .. "a moment later. Going straight back into the same "
-                .. "book within that moment is instant. Turn this off "
-                .. "to close books fully before Bookshelf appears, as "
-                .. "before."),
+                .. "book. The book finishes closing at the next quiet "
+                .. "moment - opening another book, half a minute of "
+                .. "inactivity, or leaving Bookshelf - so browsing "
+                .. "never has to wait for it. Until then, going "
+                .. "straight back into the same book is instant. Turn "
+                .. "this off to close books fully before Bookshelf "
+                .. "appears, as before."),
             checked_func = function()
                 return BookshelfSettings.nilOrTrue("hot_park")
             end,

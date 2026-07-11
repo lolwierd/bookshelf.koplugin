@@ -461,11 +461,18 @@ function BookshelfWidget:handleEvent(event)
         local ev = event.args[1]
         if fm then return GestureZones.tryFMZones(ev, fm) end
         -- Hot parking: no FileManager exists while a reader is parked
-        -- beneath the shelf - the reader hosts the system menu and user
-        -- gestures instead (allowlisted walk; page-turn zones excluded).
+        -- beneath the shelf. A menu-intent gesture (the reader's top-strip
+        -- menu zones) converts on the spot: finish the deferred close and
+        -- open the real FM menu, so the user never sees book actions on
+        -- the home screen. Everything else forwards to the reader host's
+        -- allowlisted zones (user gestures; page-turn zones excluded).
         local Park = require("lib/bookshelf_reader_park")
         if Park.isParked() then
             local rui = require("apps/reader/readerui").instance
+            if GestureZones.matchesReaderMenuZone(ev, rui) then
+                Park.finishToMenu()
+                return true
+            end
             return GestureZones.tryReaderZones(ev, rui)
         end
         return false
