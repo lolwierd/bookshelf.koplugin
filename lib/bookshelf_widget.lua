@@ -4583,50 +4583,71 @@ function BookshelfWidget:_paintOpeningEffect(fp)
     if not bb then return end
     -- Night mode inverts the framebuffer at refresh, so paint the logical
     -- colours swapped there: the page block must DISPLAY white and the
-    -- hairline frame dark in both modes.
+    -- hairline frame dark in both modes. The background restore is plain
+    -- WHITE in both modes - it inverts to the night page background.
     local night = G_reader_settings:isTrue("night_mode")
     local page_color = night and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
     local ink_color  = night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
-    -- Trapezoid parameters: width squeezes to 95% (anchored on the left
-    -- edge, the spine); the right edge grows up to +6% of the height,
-    -- split above/below, so the free edge reads as lifting OUT of the
-    -- screen. Approximated with vertical bands, each scaled to its own
-    -- height - narrow enough steps to pass for a straight diagonal.
+    -- Capture region: the card plus (a) the drop-shadow column/row (4dp,
+    -- mirrors SHADOW_OFFSET in bookshelf_spine_widget - the shadow travels
+    -- with the squeezing cover and lands between cover and pages, reading
+    -- as the lifted cover shading the page block) and (b) on grid covers,
+    -- vertical headroom for the badge glyphs that overhang the card
+    -- (favourite heart ~35% above, bookmark dangle ~50% below; both are
+    -- left-anchored so there is no horizontal overhang). The hero clears
+    -- show_progress and suppresses badges, so it gets no vertical
+    -- expansion - expanding above it would capture the chip strip.
     local SQUEEZE = 0.95
     local LIFT    = 0.06
-    local new_w = math.floor(rect.w * SQUEEZE)
-    local pad   = math.ceil(rect.h * LIFT / 2) + 2
+    local shadow  = Screen:scaleBySize(4)
+    local badge_pad = spine.show_progress
+        and (math.ceil(rect.w * 0.14) + shadow) or 0
+    local pad_top    = badge_pad
+    local pad_bottom = math.max(badge_pad, shadow)
+    local ex = rect.x
+    local ey = rect.y - pad_top
+    local ew = rect.w + shadow
+    local eh = rect.h + pad_top + pad_bottom
+    local new_ew = math.floor(ew * SQUEEZE)
+    local lift_pad = math.ceil(eh * LIFT / 2) + 2
     local ok = pcall(function()
-        local src_bb = Blitbuffer.new(rect.w, rect.h, bb:getType())
-        src_bb:blitFrom(bb, 0, 0, rect.x, rect.y, rect.w, rect.h)
-        -- Page block where the cover pulled away, with a hairline frame
-        -- closing its top/right/bottom edges - without it the revealed
-        -- strip floats borderless against the page background (the "gap"
-        -- next to the hero's drop shadow).
-        local strip_w = rect.w - new_w
-        bb:paintRect(rect.x + new_w, rect.y, strip_w, rect.h, page_color)
-        local hair = math.max(1, Screen:scaleBySize(1))
-        bb:paintRect(rect.x + new_w, rect.y, strip_w, hair, ink_color)
-        bb:paintRect(rect.x + new_w, rect.y + rect.h - hair, strip_w, hair, ink_color)
-        bb:paintRect(rect.x + rect.w - hair, rect.y, hair, rect.h, ink_color)
+        local src_bb = Blitbuffer.new(ew, eh, bb:getType())
+        src_bb:blitFrom(bb, 0, 0, ex, ey, ew, eh)
+        -- Restore page background over everything the squeeze vacates on
+        -- the right (the old shadow column included).
+        bb:paintRect(ex + new_ew, ey, ew - new_ew, eh, Blitbuffer.COLOR_WHITE)
+        -- Page block: from the squeezed image's right edge to the card's
+        -- original right edge, card height, with a hairline frame closing
+        -- its top/right/bottom - without it the revealed strip floats
+        -- borderless against the page background.
+        local strip_x = ex + new_ew
+        local strip_w = rect.x + rect.w - strip_x
+        if strip_w > 0 then
+            bb:paintRect(strip_x, rect.y, strip_w, rect.h, page_color)
+            local hair = math.max(1, Screen:scaleBySize(1))
+            bb:paintRect(strip_x, rect.y, strip_w, hair, ink_color)
+            bb:paintRect(strip_x, rect.y + rect.h - hair, strip_w, hair, ink_color)
+            bb:paintRect(rect.x + rect.w - hair, rect.y, hair, rect.h, ink_color)
+        end
         -- Banded skew: band k of the source maps to a dest band whose
-        -- height grows toward the right edge, centred vertically.
-        local n_bands = math.max(8, math.min(24, math.floor(new_w / 12)))
+        -- height grows toward the right edge, centred vertically, so the
+        -- free edge reads as lifting OUT of the screen.
+        local n_bands = math.max(8, math.min(24, math.floor(new_ew / 12)))
         local prev_sx, prev_dx = 0, 0
         for k = 1, n_bands do
-            local sx = math.floor(rect.w * k / n_bands)
-            local dx = math.floor(new_w * k / n_bands)
+            local sx = math.floor(ew * k / n_bands)
+            local dx = math.floor(new_ew * k / n_bands)
             local bw_src = sx - prev_sx
             local bw_dst = dx - prev_dx
             if bw_src > 0 and bw_dst > 0 then
                 local grow = LIFT * ((k - 0.5) / n_bands)
-                local bh   = rect.h + 2 * math.floor(rect.h * grow / 2)
-                local band = Blitbuffer.new(bw_src, rect.h, bb:getType())
-                band:blitFrom(src_bb, 0, 0, prev_sx, 0, bw_src, rect.h)
+                local bh   = eh + 2 * math.floor(eh * grow / 2)
+                local band = Blitbuffer.new(bw_src, eh, bb:getType())
+                band:blitFrom(src_bb, 0, 0, prev_sx, 0, bw_src, eh)
                 local scaled = band:scale(bw_dst, bh)
                 bb:blitFrom(scaled,
-                    rect.x + prev_dx,
-                    rect.y - math.floor((bh - rect.h) / 2),
+                    ex + prev_dx,
+                    ey - math.floor((bh - eh) / 2),
                     0, 0, bw_dst, bh)
                 band:free()
                 scaled:free()
@@ -4639,11 +4660,11 @@ function BookshelfWidget:_paintOpeningEffect(fp)
         logger.dbg("[bookshelf] opening effect failed; skipping")
         return
     end
-    -- Push the affected region (card + the lift overdraw above/below) to
-    -- the panel now - the document open that follows blocks the UI loop,
-    -- so a queued refresh would never land.
+    -- Push the affected region (capture + the lift overdraw above/below)
+    -- to the panel now - the document open that follows blocks the UI
+    -- loop, so a queued refresh would never land.
     pcall(function()
-        Screen:refreshUI(rect.x, rect.y - pad, rect.w, rect.h + 2 * pad)
+        Screen:refreshUI(ex, ey - lift_pad, ew, eh + 2 * lift_pad)
     end)
 end
 

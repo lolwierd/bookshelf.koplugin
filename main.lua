@@ -107,15 +107,18 @@ local _suppress_close_document_show = false
 -- and opened a book from the raw FileManager stay in the FileManager on
 -- close, while a cold boot still lands on Bookshelf (issue #110).
 local _did_initial_takeover = false
--- One-shot: set by onCloseDocument when a book opened from the RAW FileManager
--- (shelf not parked, _isShowing() false) is closing back to the home view.
--- KOReader's showFileManager on that close fires a Show event, and onShow would
--- otherwise use it to hijack the FileManager back into Bookshelf -- breaking the
--- same #110 "stay in the FileManager" intent that onCloseDocument honours. The
--- next onShow consumes and clears this, so cold-boot / gesture takeovers (no
--- preceding close) are unaffected. A short timed clear is a backstop for a close
--- that, for whatever reason, opens no FileManager.
-local _skip_next_onshow_takeover = false
+-- One-shot POSITIVE gate for onShow's takeover. A Show event alone does not
+-- prove Bookshelf is the destination: another home UI (SimpleUI et al) may be
+-- about to claim the freshly shown FileManager, and its close pipeline can be
+-- slow enough (>2s observed on PW5) that any timed "skip the next takeover"
+-- flag expires before the Show arrives -- expiry then HIJACKED the home
+-- (SimpleUI regression). Inverting the gate makes expiry fail safe: takeover
+-- happens only when a path that KNOWS bookshelf is the destination announced
+-- it (init's cold boot; onCloseDocument closing a book that BOOKSHELF opened),
+-- and a stale flag can at worst cause a missed takeover (a brief FM flash),
+-- never a wrong one. Timed clears are backstops for announcements that never
+-- get consumed (a boot/close that opens no FileManager).
+local _expect_onshow_takeover = false
 
 -- One-shot, set by onCloseDocument: while a book is closing, KOReader's file
 -- manager fires PathChanged echoes as it restores the folder around the
@@ -318,6 +321,10 @@ function Bookshelf:init()
         -- could see different state.
         local FileManager = require("apps/filemanager/filemanager")
         local fm_instance = FileManager.instance
+        -- Announce the boot takeover so onShow's positive gate lets the
+        -- synchronous Show catch beat the first FM paint.
+        _expect_onshow_takeover = true
+        UIManager:scheduleIn(10, function() _expect_onshow_takeover = false end)
         UIManager:nextTick(function() self:_takeOver(fm_instance) end)
     end
 end
@@ -1434,13 +1441,14 @@ function Bookshelf:onShow()
     if G_reader_settings:readSetting("start_with") ~= "bookshelf" then return end
     if self.ui and self.ui.document then return end
     if _live_widget and UIManager:isWidgetShown(_live_widget) then return end
-    if _skip_next_onshow_takeover then
-        -- A book opened from the raw FileManager just closed (set in
-        -- onCloseDocument). Honour #110: stay in the FileManager rather than
-        -- hijacking it back to the shelf. One-shot.
-        _skip_next_onshow_takeover = false
+    if not _expect_onshow_takeover then
+        -- Nobody announced bookshelf as this Show's destination (see the
+        -- gate's declaration comment): stand down. Covers #110 (books
+        -- opened from the raw FileManager close back to it) and the
+        -- SimpleUI case (their home claims the FM after this event).
         return
     end
+    _expect_onshow_takeover = false
     -- CoverBrowser disabled: every code path that touches BIM crashes.
     -- Bail silently here (init showed the notification once); just let
     -- FM stay visible. (#49.)
@@ -1615,14 +1623,10 @@ function Bookshelf:onCloseDocument()
         return
     end
     if not showing then
-        -- The book was opened from the RAW FileManager (the shelf was not parked
-        -- underneath) and is now closing back to the home view. KOReader will
-        -- showFileManager for this close; without this, the resulting Show event
-        -- makes onShow hijack the FileManager straight back into Bookshelf. Honour
-        -- the #110 intent — stay in the FileManager — by telling the next onShow
-        -- to stand down. Cleared on consumption, with a timed backstop.
-        _skip_next_onshow_takeover = true
-        UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
+        -- The book was opened from the RAW FileManager (the shelf was not
+        -- parked underneath) and is closing back to the home view. No
+        -- takeover announcement is made, so onShow's positive gate keeps
+        -- the FileManager in charge (#110 intent).
         return
     end
     -- Hot parking: an explicit "Close Bookshelf" / File-browser exit from
@@ -1631,8 +1635,6 @@ function Bookshelf:onCloseDocument()
     -- skip the re-show and stand the next onShow takeover down, same #110
     -- idiom as the not-showing branch above.
     if require("lib/bookshelf_reader_park").consumeClosingToFM() then
-        _skip_next_onshow_takeover = true
-        UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
         return
     end
     -- Hot parking: the deferred finish-close is running (the parked book
@@ -1658,14 +1660,14 @@ function Bookshelf:onCloseDocument()
     local opened_here = _live_widget and _live_widget._opened_book
     if _live_widget then _live_widget._opened_book = false end
     if not opened_here then
-        _skip_next_onshow_takeover = true
-        UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
         return
     end
     -- Normal path (close-document not via _safeShow, e.g. exit-to-FM
-    -- from KOReader's own menu): schedule show so bookshelf reappears
-    -- on the next tick. self:show()'s refresh path handles the repaint
-    -- without exposing FileManager.
+    -- from KOReader's own menu): announce the takeover (so onShow's
+    -- synchronous catch can beat the FM paint) and schedule show so
+    -- bookshelf reappears on the next tick even if no Show fires.
+    _expect_onshow_takeover = true
+    UIManager:scheduleIn(5, function() _expect_onshow_takeover = false end)
     UIManager:nextTick(function()
         self:show()
     end)
