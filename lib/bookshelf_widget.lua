@@ -4579,6 +4579,14 @@ function BookshelfWidget:_paintOpeningEffect(fp)
     local card = spine._cover_card
     local rect = card and card.dimen
     if not (rect and rect.x and rect.w and rect.w > 8 and rect.h > 8) then return end
+    BookshelfWidget.flexCoverOpen(rect)
+end
+
+-- flexCoverOpen(rect) — the shared cover-opening flex painter, callable
+-- without a widget instance (the book-detail popup flexes its header
+-- cover through this too). rect is the cover's painted screen rect.
+function BookshelfWidget.flexCoverOpen(rect)
+    if not (rect and rect.x and rect.w and rect.w > 8 and rect.h > 8) then return end
     local bb = Screen.bb
     if not bb then return end
     -- Night mode inverts the framebuffer at refresh, so paint the logical
@@ -8594,6 +8602,9 @@ function BookshelfWidget:_buildBookMenuHeader(book, override_width, pill_specs, 
     -- Expose the persistent cover bb (rich header only) so the caller frees it
     -- once the cached header is discarded.
     result._owned_cover_bb = owned_cover_bb
+    -- Expose the cover thumb frame (stamps its painted dimen) so the detail
+    -- popup can flex it open as tap feedback on its Open button.
+    result._cover_thumb = thumb_widget and thumb_widget[1] or nil
     return result
 end
 
