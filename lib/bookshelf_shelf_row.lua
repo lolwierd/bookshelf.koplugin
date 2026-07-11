@@ -118,10 +118,15 @@ function ShelfRow.new(opts)
     --   * Stretch cap: allow at most 5% vertical overshoot (slot_h grows
     --     past natural, making covers slightly taller than 2:3). Beyond
     --     that the row keeps natural slot_h and leaves vertical slack.
-    -- True-aspect layout applies to the COLLAPSED grid only. Expanded mode
-    -- (labels below covers) keeps the uniform box until its own slice.
+    -- True-aspect layout applies to both modes. ta_grid is the COLLAPSED
+    -- treatment (variable-height spines bottom-anchored via the row's
+    -- align="bottom" + a cap-height spacer). Expanded mode (ta_grid false but
+    -- true_aspect true) keeps fixed slot_h boxes -- so the row stays uniform
+    -- and taps still cover cover+title -- and bottom-anchors the cover WITHIN
+    -- each slot by top-padding its stack, so cover bottoms (and the titles
+    -- below them) align across the row.
     local true_aspect = BookshelfSettings.isTrue("true_cover_aspect")
-                        and not (opts.show_titles or false)
+    local ta_grid     = true_aspect and not (opts.show_titles or false)
     local SHRINK_FLOOR  = 0.70
     local STRETCH_CAP   = 1.05
     local natural_slot_h = slot_h
@@ -243,12 +248,14 @@ function ShelfRow.new(opts)
         return title_fallback
     end
     local cover_h = slot_h - title_block_h
-    -- True-aspect: bottom-align so variable-height covers sit on a common
-    -- shelf line, and pin the row to the full cap height with a zero-width
-    -- spacer so the row (hence pagination) stays put no matter which covers
-    -- land in it. Off = the historical centre-aligned uniform-box row.
-    local row     = HorizontalGroup:new{ align = true_aspect and "bottom" or "center" }
-    if true_aspect then
+    -- Collapsed true-aspect: bottom-align so variable-height covers sit on a
+    -- common shelf line, and pin the row to the full cap height with a
+    -- zero-width spacer so the row (hence pagination) stays put no matter which
+    -- covers land in it. Expanded mode keeps uniform fixed-height slot boxes
+    -- (bottom-anchoring happens inside each slot), so it stays centre-aligned.
+    -- Off = the historical centre-aligned uniform-box row.
+    local row     = HorizontalGroup:new{ align = ta_grid and "bottom" or "center" }
+    if ta_grid then
         row[#row + 1] = Widget:new{ dimen = Geom:new{ w = 0, h = slot_h } }
     end
 
@@ -538,8 +545,10 @@ function ShelfRow.new(opts)
             local book_cur  = opts.selected_filepath and item.filepath
                               and item.filepath == opts.selected_filepath or false
             -- True-aspect: size THIS cover's box so its inner image lands at
-            -- the book's own aspect ratio, capped at the row height. The
-            -- bottom-align on the row then drops it onto the shelf line.
+            -- the book's own aspect ratio, capped at the cover area height.
+            -- Collapsed: the row's align="bottom" drops it onto the shelf line.
+            -- Expanded: a top-pad span inside the slot stack (below) does the
+            -- same, so cover bottoms -- and the titles under them -- align.
             local spine_h = cover_h
             if true_aspect then
                 spine_h = SpineWidget.trueAspectBoxHeight(slot_w, item, cover_h)
@@ -578,10 +587,15 @@ function ShelfRow.new(opts)
                 -- single VerticalSpan, so covers don't grow when the
                 -- user toggles into None.
                 local slot_dimen = Geom:new{ w = slot_w, h = slot_h }
-                local stack = VerticalGroup:new{
-                    align = "center",
-                    spine,
-                }
+                local stack = VerticalGroup:new{ align = "center" }
+                -- True-aspect: push a shorter cover DOWN within the cover area
+                -- so its bottom meets the common shelf line (and its title,
+                -- appended below, aligns with the others). The three parts
+                -- (headroom + cover + title strip) still sum to slot_h.
+                if true_aspect and spine_h < cover_h then
+                    stack[#stack + 1] = VerticalSpan:new{ width = cover_h - spine_h }
+                end
+                stack[#stack + 1] = spine
                 if draw_label then
                     local title_text = _labelFor(item)
                     -- TextWidget (single-line) auto-truncates with ellipsis at

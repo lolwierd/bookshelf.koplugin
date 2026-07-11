@@ -1076,7 +1076,13 @@ function BookshelfWidget:_rebuild()
             local title_face_size = math.floor(14 * label_scale / 100 + 0.5)
             title_block_h = Size.padding.default + math.floor(title_face_size * 1.3)
         end
-        local capped_shelf_h = math.floor(slot_h_natural * 1.05) + title_block_h
+        -- The 1.05 lets uniform covers stretch 5% past 2:3 to soak up slack.
+        -- With true-aspect on, covers never stretch (they render at their own
+        -- ratio up to the 1.65 cap), so cap at exactly the reserved row height
+        -- -- extra slack stays below the grid instead of as dead headroom
+        -- above every bottom-anchored cover.
+        local cap_mult = BookshelfSettings.isTrue("true_cover_aspect") and 1.0 or 1.05
+        local capped_shelf_h = math.floor(slot_h_natural * cap_mult) + title_block_h
         if shelf_h > capped_shelf_h then shelf_h = capped_shelf_h end
         hero_h = strip_minimum
     else
