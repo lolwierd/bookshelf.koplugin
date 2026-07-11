@@ -1192,13 +1192,28 @@ end
 -- a right-edge brightness swipe) and then return false (the body scrollers
 -- keep whatever's left -- they're children, so they saw it first anyway).
 function ReviewsModal:onSwipe(_arg, ges)
-    if self._tabs and #self._tabs > 1 then
-        local dir = ges and ges.direction
-        local n = #self._tabs
-        if dir == "west" then
-            self:_switchTab(self._active_tab % n + 1); return true
-        elseif dir == "east" then
-            self:_switchTab((self._active_tab - 2) % n + 1); return true
+    local dir = ges and ges.direction
+    if dir == "west" or dir == "east" then
+        -- If the active body has its own horizontal pagination (the Cover
+        -- grid), page within it first; only spill over to tab-cycling once
+        -- you're already at that end. This makes swipe behave like every other
+        -- paginated surface in the app while keeping tab-swipe reachable.
+        local pager = self._tab_body and self._tab_body._pager
+        if pager and pager.goto_page then
+            if dir == "west" and pager.page < pager.total_pages then
+                pager.goto_page(pager.page + 1); return true
+            elseif dir == "east" and pager.page > 1 then
+                pager.goto_page(pager.page - 1); return true
+            end
+            -- at an end: fall through to tab cycling
+        end
+        if self._tabs and #self._tabs > 1 then
+            local n = #self._tabs
+            if dir == "west" then
+                self:_switchTab(self._active_tab % n + 1); return true
+            else
+                self:_switchTab((self._active_tab - 2) % n + 1); return true
+            end
         end
     end
     if self:_tryPassthrough(ges) then return true end
@@ -1230,9 +1245,12 @@ function ReviewsModal:_paintOpenFeedback()
         bb:invertRect(d.x, d.y, d.w, d.h)
         pcall(function() Screen:refreshUI(d.x, d.y, d.w, d.h) end)
     end
+    -- The cover flex is the same cosmetic "opening effect" the shelf uses;
+    -- honour its opt-out (default on). The Open-button invert above stays as
+    -- plain press feedback regardless.
     local cover = self._header_cover
     local r = cover and cover.dimen
-    if r and r.x and r.w and r.w > 8 then
+    if r and r.x and r.w and r.w > 8 and Store.nilOrTrue("open_cover_effect") then
         pcall(function()
             require("lib/bookshelf_widget").flexCoverOpen(r)
         end)

@@ -4595,7 +4595,12 @@ end
 function BookshelfWidget:_paintOpeningEffect(fp)
     if not fp then return end
     local spine = SpineWidget.last_tapped
+    -- Consume the rendezvous flag even when the effect is off, so a stale
+    -- last_tapped can't corrupt a later paint (see the reviews-modal note).
     SpineWidget.last_tapped = nil
+    -- Opt-out: the cover-opening flex is purely cosmetic. When disabled, open
+    -- plainly with no flex frame.
+    if not BookshelfSettings.nilOrTrue("open_cover_effect") then return end
     if not (spine and spine.book and spine.book.filepath == fp) then return end
     local card = spine._cover_card
     local rect = card and card.dimen
@@ -10162,24 +10167,50 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             local chip_h = probe:getSize().h + 2 * Screen:scaleBySize(5)
             local chip_gap = Screen:scaleBySize(12)
             local row_gap  = Screen:scaleBySize(10)
-            local rows_vg = VerticalGroup:new{ align = "left" }
-            for ri, row in ipairs(plugin_rows) do
-                local hg = HorizontalGroup:new{ align = "center" }
-                local focus_row = {}
-                for ci, spec in ipairs(row) do
-                    if ci > 1 then hg[#hg + 1] = HorizontalSpan:new{ width = chip_gap } end
-                    local label = (spec.text_func and spec.text_func()) or spec.text or ""
-                    local chip = ChipButton.build{
-                        text = label, face = edit_face,
-                        height = chip_h, on_tap = spec.callback,
-                    }
-                    hg[#hg + 1] = chip
-                    focus_row[#focus_row + 1] = chip
-                end
-                focus_tables[#focus_tables + 1] = focusRow({ focus_row })
-                if ri > 1 then rows_vg[#rows_vg + 1] = VerticalSpan:new{ width = row_gap } end
-                rows_vg[#rows_vg + 1] = hg
+            -- Flatten every registration's row into one list, then lay the
+            -- chips out as a wrapping horizontal flow. Plugins each register a
+            -- single-button "row", so the old row-per-line layout stacked them
+            -- vertically once more than one plugin contributed; wrapping keeps
+            -- them inline (like the pill groups), only breaking to a new line
+            -- when the next chip wouldn't fit the content width.
+            local avail = content_w - 2 * inset
+            local specs = {}
+            for _ri, row in ipairs(plugin_rows) do
+                for _ci, spec in ipairs(row) do specs[#specs + 1] = spec end
             end
+            local rows_vg = VerticalGroup:new{ align = "left" }
+            local line, line_w, line_focus
+            local function newLine()
+                line = HorizontalGroup:new{ align = "center" }; line_w = 0; line_focus = {}
+            end
+            local function commitLine()
+                if line and #line_focus > 0 then
+                    if #rows_vg > 0 then
+                        rows_vg[#rows_vg + 1] = VerticalSpan:new{ width = row_gap }
+                    end
+                    rows_vg[#rows_vg + 1] = line
+                    focus_tables[#focus_tables + 1] = focusRow({ line_focus })
+                end
+            end
+            newLine()
+            for _si, spec in ipairs(specs) do
+                local label = (spec.text_func and spec.text_func()) or spec.text or ""
+                local chip = ChipButton.build{
+                    text = label, face = edit_face, height = chip_h, on_tap = spec.callback,
+                }
+                local cw = chip:getSize().w
+                if #line_focus > 0 and (line_w + chip_gap + cw) > avail then
+                    commitLine(); newLine()
+                end
+                if #line_focus > 0 then
+                    line[#line + 1] = HorizontalSpan:new{ width = chip_gap }
+                    line_w = line_w + chip_gap
+                end
+                line[#line + 1] = chip
+                line_w = line_w + cw
+                line_focus[#line_focus + 1] = chip
+            end
+            commitLine()
             vg[#vg + 1] = padded(rows_vg, Screen:scaleBySize(10), Screen:scaleBySize(20))
         end
 
@@ -10364,7 +10395,7 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     local HorizontalSpan  = require("ui/widget/horizontalspan")
     local VerticalSpan    = require("ui/widget/verticalspan")
     local CenterContainer = require("ui/widget/container/centercontainer")
-    local RightContainer  = require("ui/widget/container/rightcontainer")
+    local LeftContainer   = require("ui/widget/container/leftcontainer")
     local FrameContainer  = require("ui/widget/container/framecontainer")
     local TextWidget      = require("ui/widget/textwidget")
     local CoverApply      = require("lib/bookshelf_cover_apply")
@@ -10413,10 +10444,20 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     end
     local total = #candidates
 
-    -- Toolbar (text-only chips), pinned top-right and inset by _side_pad -- the
-    -- same right edge + padding as the Tags tab's Edit button.
-    local btn_h    = Screen:scaleBySize(40)
-    local btn_face = BFont:getFace("cfont", 15)
+    -- Toolbar (text-only chips), left-aligned and inset by _side_pad -- the
+    -- same left edge + padding as the tab content below.
+    -- Match the Edit/Tags-tab chip buttons exactly: cfont at the modal's base
+    -- size, sized to the same "pill height" (base text + small pad + thin
+    -- border top/bottom) as makeEditButton, rather than the old chunky fixed
+    -- 40px / 15pt look.
+    local base     = (modal and modal.font_size) or 18
+    local btn_face = BFont:getFace("cfont", base)
+    local btn_h
+    do
+        local pf = BFont:getFace("cfont", base, { bold = true })
+        btn_h = TextWidget:new{ text = "Hg", face = pf }:getSize().h
+            + 2 * Size.padding.small + 2 * Size.border.thin
+    end
     local device_btn = ChipButton.build{
         text = _("Choose from device"), face = btn_face, height = btn_h,
         on_tap = function() bw:_pickBookCoverFromDevice(book, modal, state) end,
@@ -10429,7 +10470,7 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
         align = "center",
         device_btn, HorizontalSpan:new{ width = Screen:scaleBySize(10) }, online_btn,
     }
-    local toolbar_row = RightContainer:new{
+    local toolbar_row = LeftContainer:new{
         dimen = Geom:new{ w = content_w, h = toolbar:getSize().h }, toolbar,
     }
     local toolbar_h = toolbar_row:getSize().h
@@ -10448,7 +10489,11 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
 
     local top_pad     = Screen:scaleBySize(12)   -- gap below the tab bar / above toolbar
     local tb_gap      = Screen:scaleBySize(12)    -- gap below the toolbar
-    local nav_reserve = Screen:scaleBySize(44)
+    -- Space reserved below the grid for the pagination row plus a standard gap
+    -- beneath it (matching the pagination spacing used elsewhere) so the page
+    -- nav sits just off the modal's Close/Open footer, not jammed against it.
+    local nav_bottom_pad = Size.padding.fullscreen
+    local nav_reserve = Screen:scaleBySize(44) + nav_bottom_pad
     local grid_avail_h = math.max(1, avail_h - top_pad - toolbar_h - tb_gap - nav_reserve)
     -- Pack as many rows as fit while each cover stays at least ~1.05x its width
     -- tall (still portrait), so the grid FILLS the body instead of one tall row
@@ -10534,7 +10579,6 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
     end
 
     if total_pages > 1 then
-        col[#col + 1] = VerticalSpan:new{ width = Screen:scaleBySize(8) }
         local nav = Pagination.buildNav{
             page = state.page, total_pages = total_pages, show_parent = show_parent,
             on_goto = function(target)
@@ -10542,9 +10586,19 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
                 if modal and modal.rebuildTab then modal:rebuildTab() end
             end,
         }
+        local nav_h = nav:getSize().h
+        -- Bottom-anchor the nav: push any leftover grid slack ABOVE it so it
+        -- always sits exactly nav_bottom_pad above the footer, instead of the
+        -- trailing fill piling up below it when the covers don't fill the
+        -- height (which was making the gap balloon).
+        local used = 0
+        for _i, ch in ipairs(col) do used = used + (ch.getSize and ch:getSize().h or 0) end
+        local slack = avail_h - used - nav_h - nav_bottom_pad
+        if slack > 0 then col[#col + 1] = VerticalSpan:new{ width = slack } end
         col[#col + 1] = CenterContainer:new{
-            dimen = Geom:new{ w = content_w, h = nav:getSize().h }, nav,
+            dimen = Geom:new{ w = content_w, h = nav_h }, nav,
         }
+        col[#col + 1] = VerticalSpan:new{ width = nav_bottom_pad }
     end
 
     -- Pad the column to the full body height so the modal frame matches the
@@ -10569,6 +10623,19 @@ function BookshelfWidget:_buildBookCoverTab(book, show_parent, avail_w, avail_h,
         col,
     }
     framed.focus_tables = focus_tables
+    -- Expose the grid's pagination so the modal's horizontal swipe pages the
+    -- covers first and only cycles tabs once you're off the end (see
+    -- ReviewsModal:onSwipe). Absent when there's a single page.
+    if total_pages > 1 then
+        framed._pager = {
+            page = state.page,
+            total_pages = total_pages,
+            goto_page = function(target)
+                state.page = target
+                if modal and modal.rebuildTab then modal:rebuildTab() end
+            end,
+        }
+    end
     return framed
 end
 
@@ -11439,8 +11506,16 @@ function BookshelfWidget:_showBookDetail(book, opts)
         tabs[tags_idx] = tags_tab
     end
 
-    -- Cover tab: pick the book's cover from local sources / the device / an
-    -- online search. Sits after Tags, before Edit. Native, paginated grid.
+    -- Edit next: the actions tab is reached for less often than Description/
+    -- Reviews/Tags, so it sits toward the end of the strip rather than hogging
+    -- the first (default-focus) slot.
+    edit_idx = #tabs + 1
+    tabs[edit_idx] = edit_tab
+
+    -- Cover tab LAST: pick the book's cover from local sources / the device /
+    -- an online search. Native, paginated grid. Being last keeps its own
+    -- left/right swipe pagination out of the way of the tab-cycling swipe until
+    -- you page off the end (see ReviewsModal:onSwipe).
     cover_idx = #tabs + 1
     tabs[cover_idx] = {
         id = "cover", label = _("Cover"),
@@ -11449,12 +11524,6 @@ function BookshelfWidget:_showBookDetail(book, opts)
                                            cover_tab_state, modal)
         end,
     }
-
-    -- Edit last: the actions tab is reached for less often than Description/
-    -- Reviews/Tags, so it sits at the end of the strip rather than hogging
-    -- the first (default-focus) slot.
-    edit_idx = #tabs + 1
-    tabs[edit_idx] = edit_tab
 
     if #tabs == 0 then return end  -- no pills, no description, no reviews
 

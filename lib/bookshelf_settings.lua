@@ -2684,6 +2684,21 @@ function Settings:_advancedSubItems()
             .. "look choppy on some screens, particularly while reading. "
             .. "E-ink only.")),
         {
+            text = _("Cover opening effect"),
+            help_text = _("When you open a book, briefly flex its cover open "
+                .. "before the page appears. Purely cosmetic; turn it off for "
+                .. "an instant, plain open. On by default."),
+            checked_func = function()
+                return BookshelfSettings.nilOrTrue("open_cover_effect")
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local on = BookshelfSettings.nilOrTrue("open_cover_effect")
+                BookshelfSettings.save("open_cover_effect", not on)
+                BookshelfSettings.flush()
+            end,
+        },
+        {
             text = _("Closing book notification"),
             help_text = _("Show a 'Closing book…' message in the centre "
                 .. "of the screen while a book is being closed back to "
