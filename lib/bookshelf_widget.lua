@@ -4578,15 +4578,15 @@ function BookshelfWidget:_paintOpeningEffect(fp)
     local ok = pcall(function()
         local src_bb = Blitbuffer.new(rect.w, rect.h, bb:getType())
         src_bb:blitFrom(bb, 0, 0, rect.x, rect.y, rect.w, rect.h)
+        -- Horizontal-only squeeze: full height, width to 95%, anchored on
+        -- the left edge (the spine). Foreshortening in one axis is what a
+        -- cover rotating open actually looks like; the page-white strip
+        -- appears along the right edge only.
         local new_w = math.floor(rect.w * 0.95)
-        local new_h = math.floor(rect.h * 0.95)
-        local scaled = src_bb:scale(new_w, new_h)
-        -- Page white where the cover pulled away; the squeezed card is
-        -- anchored on the left edge (the spine) and vertically centred,
-        -- so the reveal reads as a tilt around the spine.
-        bb:paintRect(rect.x, rect.y, rect.w, rect.h, Blitbuffer.COLOR_WHITE)
-        bb:blitFrom(scaled, rect.x, rect.y + math.floor((rect.h - new_h) / 2),
-            0, 0, new_w, new_h)
+        local scaled = src_bb:scale(new_w, rect.h)
+        bb:paintRect(rect.x + new_w, rect.y, rect.w - new_w, rect.h,
+            Blitbuffer.COLOR_WHITE)
+        bb:blitFrom(scaled, rect.x, rect.y, 0, 0, new_w, rect.h)
         src_bb:free()
         scaled:free()
     end)
