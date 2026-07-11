@@ -1008,7 +1008,7 @@ function BookshelfWidget:_rebuild()
     -- vertically compressed rather than dropping the bottom row.
     local book_gap       = self:_bookGap(PAD)
     local slot_w_natural = math.floor((content_w - book_gap * (n_cols - 1)) / n_cols)
-    local slot_h_natural = math.floor(slot_w_natural * 1.5)
+    local slot_h_natural = math.floor(slot_w_natural * self:_coverAspect())
 
     -- Vertical layout (outer-top to outer-bottom):
     --   outer_top_PAD + hero + hero_chip_pad
@@ -1112,6 +1112,11 @@ function BookshelfWidget:_rebuild()
         hero_cover_h = hero_cover_h_natural
     else
         hero_cover_h = math.max(1, hero_h)
+        -- Cover WIDTH stays 2:3-derived so an ordinary cover fills the region at
+        -- full size (matching the shelf, where 2:3 covers keep their size). True
+        -- aspect is applied inside HeroCard: it keeps this width for covers that
+        -- fit, and narrows ONLY genuinely tall (>1.5) books enough to fit the
+        -- region height undistorted. So nothing shrinks or squashes needlessly.
         hero_cover_w = math.max(1, math.floor(hero_cover_h / 1.5))
         -- hero_cover_w is derived from the VERTICAL hero_h, so on a tall/narrow
         -- screen it can come out WIDER than content_w. HeroCard then computes
@@ -1736,7 +1741,7 @@ function BookshelfWidget:_rebuild()
     -- metadata. Cover-spec dims = single shelf slot (book_gap so the
     -- extracted cover matches the rendered, slightly-larger small-size slot).
     local slot_w  = math.floor((content_w - book_gap * (n_cols - 1)) / n_cols)
-    local slot_h  = math.floor(slot_w * 1.5)
+    local slot_h  = math.floor(slot_w * self:_coverAspect())
     self:_kickOffMissingMetaExtraction(items, slot_w, slot_h, hero_cover_w, hero_cover_h)
 
     -- ── Assemble ──────────────────────────────────────────────────────────────
@@ -4273,7 +4278,7 @@ function BookshelfWidget:_swapShelvesInPlace()
     -- consumers get a single cached cover sized for the bigger of the two.
     local n_slots = self:_nCols()
     local slot_w  = math.floor((d.content_w - (d.book_gap or d.PAD) * (n_slots - 1)) / n_slots)
-    local slot_h  = math.floor(slot_w * 1.5)
+    local slot_h  = math.floor(slot_w * self:_coverAspect())
     self:_kickOffMissingMetaExtraction(items, slot_w, slot_h, d.hero_cover_w, d.hero_cover_h)
 
     -- Swap each shelf row in place. Rows sit at shelf_top_idx, +2, +4, ...
@@ -6592,6 +6597,17 @@ end
 -- method: _rebuild / _maxRows / _swapShelvesInPlace are defined earlier in
 -- the file and reach it via the metatable, which a module-local declared
 -- here wouldn't allow.
+-- _coverAspect() — natural cover-height ratio for shelf-row height budgeting
+-- and pagination row counts. 2:3 (1.5) normally; the 1.65 cap when "True cover
+-- aspect ratio" is on, so the grid reserves enough vertical space for the
+-- tallest untrimmed cover. Covers then render at their own aspect (fixed
+-- width, variable height), bottom-anchored, up to that cap (see ShelfRow).
+-- Every collapsed-grid site that derives a row height from slot width must use
+-- this so the render, the vertical budget, and the row-count math stay in lockstep.
+function BookshelfWidget:_coverAspect()
+    return BookshelfSettings.isTrue("true_cover_aspect") and 1.65 or 1.5
+end
+
 function BookshelfWidget:_bookGap(pad)
     if _readCoverSize() == "small" then
         return math.max(1, math.floor(pad * 0.75))
@@ -6615,7 +6631,7 @@ function BookshelfWidget:_maxRows()
     -- cost an expanded row.
     local slot_w = math.floor((content_w - PAD * (n_cols - 1)) / n_cols)
     if slot_w < 1 then return 1 end
-    local slot_h = math.floor(slot_w * 1.5)
+    local slot_h = math.floor(slot_w * self:_coverAspect())
     local row_h  = slot_h + PAD  -- shelf body + after-row PAD
     -- Chrome above + below the shelves. Mirrors the expanded-mode layout
     -- sum in _rebuild (outer top PAD + status strip + hero→chips gap +
@@ -6638,7 +6654,7 @@ function BookshelfWidget:_maxShelfRows()
     if n_cols < 1 then return 1 end
     local slot_w = math.floor((content_w - PAD * (n_cols - 1)) / n_cols)
     if slot_w < 1 then return 1 end
-    local slot_h = math.floor(slot_w * 1.5)
+    local slot_h = math.floor(slot_w * self:_coverAspect())
     local hero_chip_pad = Size.padding.large
     local usable = self.height - PAD - hero_chip_pad - chip_h - PAD - footer_h
     local row_unit = math.floor(slot_h * SHELF_PACK_FLOOR) + PAD
@@ -6667,7 +6683,7 @@ function BookshelfWidget:_baseShelves()
     if n_cols < 1 then return 1 end
     local slot_w = math.floor((content_w - PAD * (n_cols - 1)) / n_cols)
     if slot_w < 1 then return 1 end
-    local slot_h = math.floor(slot_w * 1.5)
+    local slot_h = math.floor(slot_w * self:_coverAspect())
     local hero_chip_pad = Size.padding.large
     local usable = self.height - PAD - hero_chip_pad - chip_h - PAD - footer_h
     local hero_target  = math.floor(usable * (HERO_HEIGHT_FRAC.regular or 0.30))
@@ -7055,7 +7071,7 @@ function BookshelfWidget:_currentSlotDims()
     if not n or n < 1 then return nil end
     local sw = math.floor((d.content_w - (d.book_gap or d.PAD or 0) * (n - 1)) / n)
     if sw < 1 then return nil end
-    return sw, math.floor(sw * 1.5)
+    return sw, math.floor(sw * self:_coverAspect())
 end
 
 -- Append up to one page of {fp,w,h} cover jobs for `chip_key` at `cursor`

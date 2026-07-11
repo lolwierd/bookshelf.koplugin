@@ -1680,4 +1680,55 @@ SpineWidget.BorderOverlay   = BorderOverlay
 SpineWidget.SELECTED_BORDER = SELECTED_BORDER
 SpineWidget.CARD_RADIUS     = CARD_RADIUS
 
+-- Per-axis chrome overhead between the widget box (self.width/self.height)
+-- and the actual cover IMAGE: the drop-shadow offset plus the 1dp card
+-- border on both sides. Exposed so the true-aspect shelf grid can size a
+-- cover box whose inner image lands at an exact aspect ratio:
+--   img_w = slot_w - COVER_CHROME ;  box_h = round(img_w * aspect) + COVER_CHROME
+SpineWidget.COVER_CHROME = SHADOW_OFFSET + 2 * CARD_BORDER
+
+-- True-aspect ceiling: 2:3 + ~10% overshoot. ~98% of real covers render
+-- untrimmed under it; taller freaks clamp here so they can't blow past the row.
+SpineWidget.COVER_ASPECT_CAP = 1.65
+
+-- SpineWidget.bookAspect(book) -- height/width ratio from BIM's cover_sizetag
+-- ("WxH", the ORIGINAL cover pixel size present on every record at layout
+-- time, not the lazy cover_bb). Clamped to the cap, with a sanity floor for
+-- degenerate metadata; falls back to 2:3 when the tag is missing/unparseable.
+-- Shared by the true-aspect shelf grid and hero so their aspect maths agree.
+function SpineWidget.bookAspect(book)
+    local tag = book and book.cover_sizetag
+    if type(tag) == "string" then
+        local w, h = tag:match("^(%d+)x(%d+)")
+        w, h = tonumber(w), tonumber(h)
+        if w and h and w > 0 and h > 0 then
+            local a = h / w
+            if a > SpineWidget.COVER_ASPECT_CAP then a = SpineWidget.COVER_ASPECT_CAP end
+            if a < 0.5 then a = 0.5 end
+            return a
+        end
+    end
+    return 1.5
+end
+
+-- SpineWidget.trueAspectBoxHeight(box_w, book, max_h) -- the widget-box HEIGHT
+-- (self.height) that makes THIS book's inner cover image land at its own
+-- aspect for a given box width, clamped to max_h. Centralises the
+-- img_w/COVER_CHROME arithmetic so callers don't re-derive it.
+function SpineWidget.trueAspectBoxHeight(box_w, book, max_h)
+    local iw = box_w - SpineWidget.COVER_CHROME
+    local h  = math.floor(iw * SpineWidget.bookAspect(book) + 0.5) + SpineWidget.COVER_CHROME
+    if max_h and h > max_h then h = max_h end
+    return h
+end
+
+-- SpineWidget.trueAspectBoxWidth(box_h, book) -- inverse of the above: the box
+-- WIDTH that makes the inner image land at the book's aspect for a target box
+-- height. Used by the hero to narrow a too-tall cover so it fits the fixed
+-- region height without distortion (rather than shrinking every cover).
+function SpineWidget.trueAspectBoxWidth(box_h, book)
+    local ih = box_h - SpineWidget.COVER_CHROME
+    return math.floor(ih / SpineWidget.bookAspect(book) + 0.5) + SpineWidget.COVER_CHROME
+end
+
 return SpineWidget

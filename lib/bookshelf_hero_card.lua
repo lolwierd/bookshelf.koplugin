@@ -1090,10 +1090,36 @@ function HeroCard:_renderFull()
     -- stays unchanged (the hero layout was sized for cover_w x cover_h).
     local SHADOW_OFFSET = Screen:scaleBySize(4)
 
+    -- True-aspect: render the hero cover at the book's OWN aspect, TOP-anchored
+    -- within the fixed-height region, WITHOUT shrinking ordinary covers.
+    --   * A cover that fits the region at full width keeps full width; if it's
+    --     shorter than the region it top-anchors with headroom below (the right
+    --     column holds the region height, so the chip bar never moves).
+    --   * A genuinely tall (>1.5) cover would overflow the region at full width,
+    --     so it (and only it) is narrowed just enough to fit the height,
+    --     undistorted. Ordinary 2:3 covers stay full-size, matching the shelf.
+    -- Off = the historical full-height 2:3 box.
+    local sw_w = self.cover_w - SHADOW_OFFSET
+    local sw_h = cover_h - SHADOW_OFFSET
+    if BookshelfSettings.isTrue("true_cover_aspect") then
+        local fit_h = SpineWidget.trueAspectBoxHeight(sw_w, self.book)
+        if fit_h <= sw_h then
+            sw_h = fit_h                                            -- fits: keep width, top-anchor
+        else
+            sw_w = SpineWidget.trueAspectBoxWidth(sw_h, self.book)  -- too tall: narrow to fit height
+        end
+    end
+    -- Cover footprint width (SpineWidget + the SHADOW_OFFSET left padding of its
+    -- wrapper). When true-aspect narrows a tall cover this shrinks, so recompute
+    -- the right column from it rather than the full reserved cover_w -- the text
+    -- gains the freed width instead of a gap (and right_w only ever grows, so
+    -- the #87 max_width<=0 guard is never at risk).
+    local cover_footprint_w = sw_w + SHADOW_OFFSET
+
     local cover = SpineWidget:new{
         book        = self.book,
-        width       = self.cover_w - SHADOW_OFFSET,
-        height      = cover_h - SHADOW_OFFSET,
+        width       = sw_w,
+        height      = sw_h,
         on_tap      = self.on_tap,
         on_hold     = self.on_hold,
         is_selected      = self.is_selected,
@@ -1126,7 +1152,7 @@ function HeroCard:_renderFull()
     -- can never hand the right-column TextWidgets a max_width <= 0, which
     -- aborts makeLine natively. The real fix caps cover_w upstream in
     -- bookshelf_widget._rebuild; this just guarantees the abort is impossible.
-    local right_w = math.max(1, self.width - self.cover_w - text_padding)
+    local right_w = math.max(1, self.width - cover_footprint_w - text_padding)
 
     local regions = Regions.read()
     local right = self:_buildRightColumn(

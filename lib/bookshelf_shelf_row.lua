@@ -43,6 +43,20 @@ end
 
 local ShelfRow = {}
 
+-- True-aspect covers (opt-in "true_cover_aspect" setting). Normally covers are
+-- forced to a uniform 2:3 (1.5) box. When the setting is on, the collapsed grid
+-- reserves the 1.65 cap per row and each cover renders at its OWN aspect
+-- (fixed width, variable height), bottom-anchored so covers sit on the shelf
+-- line. Aspect + cap live on SpineWidget (SpineWidget.bookAspect /
+-- COVER_ASPECT_CAP / trueAspectBoxHeight) so the grid and hero agree.
+
+-- Row-height ratio used for slot sizing. 1.5 normally; the 1.65 cap when
+-- true-aspect is on (so the tallest untrimmed cover still fits its row).
+local function _natAspect()
+    return BookshelfSettings.isTrue("true_cover_aspect")
+        and SpineWidget.COVER_ASPECT_CAP or 1.5
+end
+
 -- _renderDottedRule(width, thickness)
 -- Returns a Widget subclass instance that paints a dotted horizontal rule via
 -- bb:fillRect. Dot spacing is 3dp (1dp dot, 2dp gap). Uses COLOR_BLACK.
@@ -84,7 +98,10 @@ function ShelfRow.new(opts)
     local gap     = opts.gap or Size.padding.fullscreen * 2
     local slot_w  = math.floor((opts.width - gap * (n_slots - 1)) / n_slots)
     -- Standard 2:3 book-cover aspect (slot_w * 1.5) so covers look like books.
-    local slot_h  = math.floor(slot_w * 1.5)
+    -- With true-aspect covers on, NAT_ASPECT is the 1.65 cap: the row box is
+    -- reserved at the cap and individual covers render shorter within it.
+    local NAT_ASPECT = _natAspect()
+    local slot_h  = math.floor(slot_w * NAT_ASPECT)
     -- Honour the parent's budgeted row height (opts.height) when supplied.
     --   - If budget is SMALLER than natural: shrink the slot to fit AND
     --     recompute slot_w so the cover stays 2:3. (Tight layouts like
@@ -101,17 +118,28 @@ function ShelfRow.new(opts)
     --   * Stretch cap: allow at most 5% vertical overshoot (slot_h grows
     --     past natural, making covers slightly taller than 2:3). Beyond
     --     that the row keeps natural slot_h and leaves vertical slack.
+    -- True-aspect layout applies to the COLLAPSED grid only. Expanded mode
+    -- (labels below covers) keeps the uniform box until its own slice.
+    local true_aspect = BookshelfSettings.isTrue("true_cover_aspect")
+                        and not (opts.show_titles or false)
     local SHRINK_FLOOR  = 0.70
     local STRETCH_CAP   = 1.05
     local natural_slot_h = slot_h
-    if opts.height then
+    if true_aspect then
+        -- slot_w is FIXED (fixed-width covers are the whole point), so the
+        -- shrink/stretch dance below -- which recomputes slot_w -- must not
+        -- run. The row box simply takes the parent's budgeted height (already
+        -- sized to the 1.65 cap); each cover renders at its own aspect within
+        -- it, bottom-anchored.
+        if opts.height then slot_h = opts.height end
+    elseif opts.height then
         if slot_h > opts.height then
             -- Budget tighter than natural: shrink both axes to preserve
             -- 2:3, but not below the shrink floor.
             local target_h = math.max(opts.height,
                 math.floor(natural_slot_h * SHRINK_FLOOR))
             slot_h = target_h
-            slot_w = math.floor(slot_h / 1.5)
+            slot_w = math.floor(slot_h / NAT_ASPECT)
         elseif slot_h < opts.height then
             -- Budget looser than natural: stretch slot_h vertically up to
             -- the cap. Beyond that, hold at the cap and let the row's
@@ -215,7 +243,14 @@ function ShelfRow.new(opts)
         return title_fallback
     end
     local cover_h = slot_h - title_block_h
-    local row     = HorizontalGroup:new{}
+    -- True-aspect: bottom-align so variable-height covers sit on a common
+    -- shelf line, and pin the row to the full cap height with a zero-width
+    -- spacer so the row (hence pagination) stays put no matter which covers
+    -- land in it. Off = the historical centre-aligned uniform-box row.
+    local row     = HorizontalGroup:new{ align = true_aspect and "bottom" or "center" }
+    if true_aspect then
+        row[#row + 1] = Widget:new{ dimen = Geom:new{ w = 0, h = slot_h } }
+    end
 
     -- Wrap on_book_tap so the SpineWidget direct-bind path (line ~210) also
     -- stamps a tap timestamp and forwards it as the second arg, matching the
@@ -502,10 +537,17 @@ function ShelfRow.new(opts)
                               and opts.selection:contains(item.filepath) or false
             local book_cur  = opts.selected_filepath and item.filepath
                               and item.filepath == opts.selected_filepath or false
+            -- True-aspect: size THIS cover's box so its inner image lands at
+            -- the book's own aspect ratio, capped at the row height. The
+            -- bottom-align on the row then drops it onto the shelf line.
+            local spine_h = cover_h
+            if true_aspect then
+                spine_h = SpineWidget.trueAspectBoxHeight(slot_w, item, cover_h)
+            end
             local spine = SpineWidget:new{
                 book             = item,
                 width            = slot_w,
-                height           = cover_h,
+                height           = spine_h,
                 -- When titles are visible, the InputContainer wrapper below
                 -- handles taps for the whole slot (cover + title) so the
                 -- title area is also tappable; pass nil here so SpineWidget
