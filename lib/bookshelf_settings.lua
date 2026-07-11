@@ -619,6 +619,28 @@ function Settings:_coverDisplaySubItems()
         }
     end
     return {
+        -- Layout-affecting toggle, kept at the top and separated from the
+        -- "what to show on a cover" rows below.
+        {
+            text = _("True cover aspect ratio"),
+            help_text = _("Show each cover at its real shape instead of a "
+                .. "uniform book rectangle. Covers keep the same width but "
+                .. "vary in height: on the shelf they sit along the bottom "
+                .. "shelf line, and in the hero area they align to the top. "
+                .. "Wide or square covers stop being cropped or stretched. "
+                .. "Off by default (uniform grid)."),
+            checked_func = function()
+                return BookshelfSettings.isTrue("true_cover_aspect")
+            end,
+            keep_menu_open = true,
+            callback = function()
+                BookshelfSettings.save("true_cover_aspect",
+                    not BookshelfSettings.isTrue("true_cover_aspect"))
+                BookshelfSettings.flush()
+                markDirty()
+            end,
+            separator = true,
+        },
         toggleRow("progress_bookmark_enabled",
                   _("Show reading bookmarks"), false),
         -- On-hold display: four-state. "both" (default; pause badge +
@@ -1401,30 +1423,7 @@ function Settings:_settingsSubItems()
             return self:_expandedShelfSubItems()
         end,
     }
-    items[#items + 1] = {
-        text = _("True cover aspect ratio"),
-        help_text = _("Show each cover at its real shape instead of a "
-            .. "uniform book rectangle. Covers keep the same width but "
-            .. "vary in height: on the shelf they sit along the bottom "
-            .. "shelf line, and in the hero area they align to the top. "
-            .. "Wide or square covers stop being cropped or stretched. "
-            .. "Off by default (uniform grid)."),
-        checked_func = function()
-            return BookshelfSettings.isTrue("true_cover_aspect")
-        end,
-        keep_menu_open = true,
-        callback = function()
-            local on = BookshelfSettings.isTrue("true_cover_aspect")
-            BookshelfSettings.save("true_cover_aspect", not on)
-            BookshelfSettings.flush()
-            -- Layout-affecting: rebuild the live shelf so the change shows
-            -- immediately rather than only on next open.
-            if self._bw and self._bw._rebuild then
-                self._bw:_rebuild()
-                UIManager:setDirty(self._bw, "ui")
-            end
-        end,
-    }
+    -- ("True cover aspect ratio" lives in the Cover display submenu.)
     -- Micro-module placement: three INDEPENDENT surfaces (start menu / hero /
     -- full-screen button), each a checkbox, so any combination can run at once.
     -- Promoted here from Advanced so it sits directly above "Hero area starts
