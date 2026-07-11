@@ -14,6 +14,7 @@ local ticks = {}
 local dirty_calls = {}
 
 local closed_widgets = {}
+local scheduled = {}
 local UIManager = {
     _window_stack = {},
     nextTick = function(_self, fn) ticks[#ticks + 1] = fn end,
@@ -21,9 +22,24 @@ local UIManager = {
     show = function() end,
     close = function(_self, w) closed_widgets[#closed_widgets + 1] = w end,
     forceRePaint = function() end,
+    scheduleIn = function(_self, _s, fn) scheduled[#scheduled + 1] = fn end,
+    unschedule = function(_self, fn)
+        for i = #scheduled, 1, -1 do
+            if scheduled[i] == fn then table.remove(scheduled, i) end
+        end
+    end,
 }
 local function drainTicks()
     while #ticks > 0 do (table.remove(ticks, 1))() end
+end
+-- Snapshot semantics: fires what is scheduled NOW; anything a fired
+-- closure re-schedules stays queued for the next call (the deferral test
+-- relies on this - a drain-until-empty loop would spin forever on the
+-- finish's retry).
+local function fireScheduled()
+    local batch = scheduled
+    scheduled = {}
+    for _i, fn in ipairs(batch) do fn() end
 end
 
 local ReaderUI = { instance = nil }
@@ -80,6 +96,7 @@ local function reset()
     dirty_calls = {}
     repo_calls = {}
     closed_widgets = {}
+    scheduled = {}
     hot_park_enabled = true
     ReaderUI.instance = nil
     Park.noteRealClose()
@@ -185,6 +202,84 @@ end)
 t.test("unpark on a non-parked session is a false no-op", function()
     reset()
     assert(Park.unpark({}) == false)
+end)
+
+print("--- deferred finish-close ---")
+
+t.test("park schedules a finish that real-closes to FM behind the shelf", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    local closed, fm_file = false, nil
+    rui.onClose = function()
+        assert(Park.isFinishingClose(), "finishing flag must be up during onClose")
+        closed = true
+    end
+    rui.showFileManager = function(_self, f) fm_file = f end
+    ReaderUI.instance = rui
+    local plugin = makePlugin(rui)
+    local shelf_widget = {}
+    plugin._widget = shelf_widget
+    UIManager._window_stack = { { widget = rui }, { widget = shelf_widget } }
+    assert(Park.park(plugin) == true)
+    assert(#scheduled == 1, "park must schedule the deferred finish")
+    drainTicks() -- park's own refresh tick
+    plugin.raised, plugin.shown = false, false
+    fireScheduled()
+    assert(closed, "reader must real-close on the deferred finish")
+    assert(fm_file == "/books/a.epub")
+    assert(plugin.raised and plugin.shown,
+        "finish must re-raise and warm-show the shelf over the fresh FM")
+    assert(Park.isParked() == false)
+    drainTicks()
+    assert(Park.isFinishingClose() == false, "flag must clear on the next tick")
+end)
+
+t.test("unpark inside the linger window cancels the finish", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    local closed = false
+    rui.onClose = function() closed = true end
+    ReaderUI.instance = rui
+    local shelf = { _stopStatusTimer = function() end }
+    UIManager._window_stack = { { widget = rui }, { widget = shelf } }
+    assert(Park.park(makePlugin(rui)) == true)
+    assert(Park.unpark(shelf) == true)
+    assert(#scheduled == 0, "unpark must unschedule the finish")
+    fireScheduled()
+    assert(closed == false, "no real close after an unpark")
+end)
+
+t.test("finish defers while something covers the shelf", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    local closed = false
+    rui.onClose = function() closed = true end
+    ReaderUI.instance = rui
+    local plugin = makePlugin(rui)
+    local shelf_widget = {}
+    plugin._widget = shelf_widget
+    local popup = {}
+    UIManager._window_stack = {
+        { widget = rui }, { widget = shelf_widget }, { widget = popup },
+    }
+    assert(Park.park(plugin) == true)
+    drainTicks()
+    fireScheduled() -- popup on top: must NOT close, must reschedule
+    assert(closed == false, "must not finish under a live popup")
+    assert(Park.isParked() == true, "still parked while deferred")
+    assert(#scheduled == 1, "finish must be rescheduled")
+    table.remove(UIManager._window_stack) -- popup dismissed
+    fireScheduled()
+    assert(closed == true, "finish runs once the shelf is topmost again")
+end)
+
+t.test("a real close inside the window cancels the finish", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    ReaderUI.instance = rui
+    assert(Park.park(makePlugin(rui)) == true)
+    Park.noteRealClose()
+    assert(#scheduled == 0, "noteRealClose must unschedule the finish")
 end)
 
 print("--- Park.closeShelfToFileManager ---")

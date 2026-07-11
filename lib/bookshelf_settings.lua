@@ -2642,15 +2642,13 @@ function Settings:_advancedSubItems()
             .. "look choppy on some screens, particularly while reading. "
             .. "E-ink only.")),
         {
-            text = _("Instant book close and reopen (beta)"),
-            help_text = _("Keep the book loaded when returning to "
-                .. "Bookshelf instead of fully closing it. Returning to "
-                .. "the shelf is instant, and reopening the same book is "
-                .. "instant too - the book only fully closes when you "
-                .. "open a different one. While a book is kept loaded, "
-                .. "the sleep screen and reading statistics behave as if "
-                .. "you were still reading. Turn this off to fully close "
-                .. "books when leaving them, as before."),
+            text = _("Instant book close (beta)"),
+            help_text = _("Show Bookshelf immediately when leaving a "
+                .. "book, and finish closing the book in the background "
+                .. "a moment later. Going straight back into the same "
+                .. "book within that moment is instant. Turn this off "
+                .. "to close books fully before Bookshelf appears, as "
+                .. "before."),
             checked_func = function()
                 return BookshelfSettings.nilOrTrue("hot_park")
             end,

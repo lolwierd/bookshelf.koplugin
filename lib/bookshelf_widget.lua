@@ -4532,23 +4532,23 @@ function BookshelfWidget:_refreshSpineInPlace(fp)
 end
 
 -- _paintOpeningBadge(fp) — transient "opening this book" feedback painted
--- straight onto the framebuffer over the tapped book's cover: the cover
--- lightens and a round badge with an open-book glyph appears. Replaces
--- KOReader's centre-screen "Opening file" box (suppressed via showReader's
--- seamless flag). No widget is created — the reader's first paint covers
--- it, which is exactly the lifetime we want.
+-- straight onto the framebuffer: a round open-book badge centred on the
+-- tapped cover. Replaces KOReader's centre-screen "Opening file" box
+-- (suppressed via showReader's seamless flag). No widget is created — the
+-- reader's first paint covers it, which is exactly the lifetime we want.
 --
 -- E-ink cannot animate during the blocking document open (the UI loop is
 -- busy inside openDocument), so this is a static badge, not a live
 -- spinner. Painted directly to Screen.bb + refreshUI, same idiom as the
 -- page-wipe module.
 --
--- When the book's spine isn't on the current page (hero open for an
--- off-page book, search/detail-popup opens), falls back to a small
--- centred badge — never wrong, just less contextual.
+-- Badge only when the tapped book's cover is actually on screen (shelf
+-- spine or the hero cover). A book opened from search / the detail popup
+-- has no visible cover — no badge is better than one floating in space.
 function BookshelfWidget:_paintOpeningBadge(fp)
+    if not fp then return end
     local rect
-    if fp and self._inner_vgroup and self._shelf_dims then
+    if self._inner_vgroup and self._shelf_dims then
         local d = self._shelf_dims
         for r = 1, (d.n_shelves or 2) do
             local hg = self._inner_vgroup[d.shelf_top_idx + 2 * (r - 1)]
@@ -4561,17 +4561,18 @@ function BookshelfWidget:_paintOpeningBadge(fp)
             end
         end
     end
+    if not rect and self._hero_parent then
+        -- The hero cover is a SpineWidget too (HeroCard's cover_fill path),
+        -- but nests deeper than the shelf rows' 3-level walk cap — start
+        -- the walk at a negative depth to buy the extra levels.
+        local _p, _idx, spine = _descendFindSpine(self._hero_parent, fp, -3)
+        if spine and spine.dimen then rect = spine.dimen:copy() end
+    end
+    if not rect then return end
     local bb = Screen.bb
     if not bb then return end
-    local cx, cy
-    if rect then
-        bb:lightenRect(rect.x, rect.y, rect.w, rect.h, 0.4)
-        cx = rect.x + math.floor(rect.w / 2)
-        cy = rect.y + math.floor(rect.h / 2)
-    else
-        cx = math.floor(Screen:getWidth() / 2)
-        cy = math.floor(Screen:getHeight() / 2)
-    end
+    local cx = rect.x + math.floor(rect.w / 2)
+    local cy = rect.y + math.floor(rect.h / 2)
     local radius = Screen:scaleBySize(28)
     -- Filled white disc + thin black ring, then the glyph centred on it.
     bb:paintCircle(cx, cy, radius, Blitbuffer.COLOR_WHITE)
@@ -4590,13 +4591,13 @@ function BookshelfWidget:_paintOpeningBadge(fp)
     if not ok_glyph then
         logger.dbg("[bookshelf] opening-badge glyph render failed; disc only")
     end
-    -- Push just the affected region to the panel now — the document open
-    -- that follows blocks the UI loop, so no queued refresh would land.
-    local rx = rect and rect.x or (cx - radius)
-    local ry = rect and rect.y or (cy - radius)
-    local rw = rect and rect.w or (2 * radius)
-    local rh = rect and rect.h or (2 * radius)
-    pcall(function() Screen:refreshUI(rx, ry, rw, rh) end)
+    -- Push just the disc region to the panel now — the document open that
+    -- follows blocks the UI loop, so a queued refresh would never land.
+    local m = Screen:scaleBySize(4)
+    pcall(function()
+        Screen:refreshUI(cx - radius - m, cy - radius - m,
+            2 * (radius + m), 2 * (radius + m))
+    end)
 end
 
 -- softRefresh — lightweight return-to-bookshelf update. Splits the work

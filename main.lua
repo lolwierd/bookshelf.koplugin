@@ -1391,6 +1391,11 @@ function Bookshelf:_takeOver(fm_instance)
     if _suppress_close_document_show then
         return
     end
+    -- Same skip for the hot-parking finish-close: its own _raiseInPlace +
+    -- show() pair already handles the fresh FM (see _fireFinish).
+    if require("lib/bookshelf_reader_park").isFinishingClose() then
+        return
+    end
     -- Leave FileManager loaded *underneath* Bookshelf — don't close it. Two
     -- reasons:
     --   1. KOReader's standard menu (FileManagerMenu top-zone tap/swipe) is
@@ -1621,6 +1626,13 @@ function Bookshelf:onCloseDocument()
     if require("lib/bookshelf_reader_park").consumeClosingToFM() then
         _skip_next_onshow_takeover = true
         UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
+        return
+    end
+    -- Hot parking: the deferred finish-close is running (the parked book
+    -- really closing behind the opaque shelf). It raises and shows the
+    -- shelf itself after showFileManager - our re-show here would stack a
+    -- duplicate softRefresh/EPDC commit (#35 double flash).
+    if require("lib/bookshelf_reader_park").isFinishingClose() then
         return
     end
     -- _safeShow already scheduled its own show() after the close+showFM

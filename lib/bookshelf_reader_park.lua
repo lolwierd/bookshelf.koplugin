@@ -1,16 +1,17 @@
 -- lib/bookshelf_reader_park.lua
 --
 -- Hot reader parking: leaving a book for the shelf does NOT close the
--- document. The BookshelfWidget overlay is spliced above the live ReaderUI
--- in UIManager's window stack; the reader stays loaded ("parked")
--- underneath. Returning to the same book is the reverse splice - no
--- document load, no FileManager involvement at all. Opening a DIFFERENT
--- book rides KOReader's normal ShowingReader teardown of the parked
--- instance (a real close, paying the deferred DocCache serialize at a
--- moment the user expects a load). Any KOReader-initiated close (History
--- switch, end-of-book action, exit) also real-closes; Bookshelf's
--- onCloseDocument calls noteRealClose() so this module's state can never
--- outlive the instance it points at.
+-- document immediately. The BookshelfWidget overlay is spliced above the
+-- live ReaderUI in UIManager's window stack (instant, no FM rebirth in
+-- the visible path), the reader lingers "parked" underneath for
+-- PARK_LINGER_S, then a deferred finish really closes it behind the
+-- opaque shelf and lets the FileManager re-instantiate - restoring the
+-- FM menu and every legacy home-screen semantic. Within the linger
+-- window a same-book reopen is the reverse splice (instant) and cancels
+-- the finish. Any KOReader-initiated close (History switch, end-of-book
+-- action, exit) real-closes as normal; Bookshelf's onCloseDocument calls
+-- noteRealClose() so this module's state can never outlive the instance
+-- it points at.
 --
 -- State is in-memory only, by design (runtime flags don't survive crashes,
 -- so never persist them): _parked is re-validated against
@@ -30,6 +31,17 @@ local _parked = nil
 -- reader. Bookshelf:onCloseDocument consumes it to skip its re-show (the
 -- destination is the raw FileManager, not the shelf).
 local _closing_to_fm = false
+-- How long a reader stays parked before the deferred finish-close runs.
+-- Within this window a same-book reopen is an instant splice; after it,
+-- the book has really closed and the FileManager is restored underneath
+-- the shelf, so the system menu is the FM menu again (users found the
+-- reader menu hosting for the home screen confusing).
+local PARK_LINGER_S = 2
+-- The scheduled finish-close closure (for unschedule), and the flag that
+-- marks the finish in progress — Bookshelf:onCloseDocument and _takeOver
+-- check it to skip their own re-shows while we run the close sequence.
+local _pending_finish = nil
+local _finishing_close = false
 
 function Park.enabled()
     return BookshelfSettings.nilOrTrue("hot_park")
@@ -56,10 +68,70 @@ function Park.parkedFile()
     return _parked.document and _parked.document.file or nil
 end
 
+local function _cancelPendingFinish()
+    if _pending_finish then
+        UIManager:unschedule(_pending_finish)
+        _pending_finish = nil
+    end
+end
+
 -- Called from Bookshelf:onCloseDocument - any real close invalidates
 -- parking state, whether or not the closing reader was the parked one.
 function Park.noteRealClose()
     _parked = nil
+    _cancelPendingFinish()
+end
+
+-- True while the deferred finish-close sequence is running. Checked by
+-- Bookshelf:onCloseDocument (skip the nextTick re-show; the finish raises
+-- and shows the shelf itself) and Bookshelf:_takeOver (the fresh FM-side
+-- plugin init must not stack an extra show/softRefresh - the #35 double
+-- EPDC flash).
+function Park.isFinishingClose()
+    return _finishing_close
+end
+
+-- The deferred tail of parking: really close the parked reader behind the
+-- opaque shelf and let the FileManager re-instantiate underneath. From
+-- here on the stack looks exactly like a pre-parking book close (shelf
+-- over live FM), so the system menu is the FM menu and every legacy
+-- behaviour applies. This is _safeShow's close sequence minus the
+-- "Closing book…" message - the shelf is already up, painted, and stays
+-- on top throughout.
+local function _fireFinish(plugin, rui)
+    _pending_finish = nil
+    if _parked ~= rui then return end -- unparked or real-closed meanwhile
+    if _readerInstance() ~= rui then
+        _parked = nil
+        return
+    end
+    -- Something is open ABOVE the shelf (start menu, a popup, a keyboard):
+    -- finishing now would raise the fresh FM and the shelf over it,
+    -- burying a live dialog. Retry after another linger interval; unpark
+    -- or a real close cancels the retry like the original schedule.
+    local stack = UIManager._window_stack
+    local top = stack and stack[#stack] and stack[#stack].widget
+    if top ~= plugin._widget then
+        _pending_finish = function() _fireFinish(plugin, rui) end
+        UIManager:scheduleIn(PARK_LINGER_S, _pending_finish)
+        return
+    end
+    _parked = nil
+    local file = rui.document and rui.document.file
+    _finishing_close = true
+    pcall(function() rui:onClose(false) end)
+    if rui.showFileManager then
+        pcall(function() rui:showFileManager(file) end)
+    end
+    -- showFileManager raised the fresh FM ABOVE the shelf; splice the
+    -- shelf back on top, then the warm show() restores rotation and
+    -- refreshes shelf data (same pairing _safeShow uses).
+    pcall(function() plugin:_raiseInPlace() end)
+    pcall(function() plugin:show() end)
+    -- Keep the flag through the NEXT tick so the FM-side _takeOver
+    -- (scheduled by the fresh plugin init inside showFileManager) sees it
+    -- and stands down - same idiom as _suppress_close_document_show.
+    UIManager:nextTick(function() _finishing_close = false end)
 end
 
 -- One-shot consume for onCloseDocument: true exactly once per
@@ -122,6 +194,13 @@ function Park.park(plugin)
         -- live reader.
         plugin:show()
     end)
+    -- Schedule the deferred finish-close: after the linger window the
+    -- book really closes behind the opaque shelf and the FileManager
+    -- returns underneath (FM menu restored). A same-book reopen inside
+    -- the window cancels this and splices back instantly.
+    _cancelPendingFinish()
+    _pending_finish = function() _fireFinish(plugin, rui) end
+    UIManager:scheduleIn(PARK_LINGER_S, _pending_finish)
     return true
 end
 
@@ -135,6 +214,7 @@ function Park.unpark(live_widget, after_open_callback)
     if not Park.isParked() then return false end
     local rui = _parked
     _parked = nil
+    _cancelPendingFinish()
     local stack = UIManager._window_stack
     if not stack then return false end
     local idx
@@ -179,6 +259,7 @@ function Park.closeShelfToFileManager(live_widget)
     if not Park.isParked() then return false end
     local rui = _parked
     _parked = nil
+    _cancelPendingFinish()
     local file = rui.document and rui.document.file
     -- Same feedback affordance (and opt-out setting) as the fallback
     -- close path: the onClose below blocks for the sidecar/DocCache work.
