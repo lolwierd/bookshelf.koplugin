@@ -785,16 +785,18 @@ function SpineWidget:_renderShadowedCard(inner)
                 + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
             local y_offset = card_h
                 + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
-            children[#children + 1] = FrameContainer:new{
+            local glyph_frame = FrameContainer:new{
                 bordersize   = 0,
                 padding      = 0,
                 padding_top  = y_offset - halo_w,
                 padding_left = _glyphLeftInset() - halo_w,
                 outlined,
             }
-            -- The dangle overhangs the card bottom; the opening effect's
-            -- ring erase must spare the glyph column (left ~45%).
-            self._glyph_overhang_bottom = true
+            children[#children + 1] = glyph_frame
+            -- Overhangs the card bottom: the opening effect repaints it on
+            -- top of the ring erase + flex (frame stamps its painted rect).
+            self._overhang_glyph_widgets = self._overhang_glyph_widgets or {}
+            table.insert(self._overhang_glyph_widgets, glyph_frame)
         end
     end
 
@@ -874,15 +876,17 @@ function SpineWidget:_renderShadowedCard(inner)
                 + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
             local y_offset = card_h
                 + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
-            children[#children + 1] = FrameContainer:new{
+            local glyph_frame = FrameContainer:new{
                 bordersize   = 0,
                 padding      = 0,
                 padding_top  = y_offset - halo_w,
                 padding_left = _glyphLeftInset() - halo_w,
                 outlined,
             }
-            -- Same dangle overhang note as the in-progress glyph above.
-            self._glyph_overhang_bottom = true
+            children[#children + 1] = glyph_frame
+            -- Same overhang-repaint note as the in-progress glyph above.
+            self._overhang_glyph_widgets = self._overhang_glyph_widgets or {}
+            table.insert(self._overhang_glyph_widgets, glyph_frame)
         end
     end
 
@@ -1192,11 +1196,19 @@ function SpineWidget:_renderShadowedCard(inner)
                 local center_shift =
                     math.floor((_badgeSize(_glyphSize(card_w)) - glyph_h) / 2)
                 local x_offset = _glyphLeftInset() - halo_w + center_shift
-                outlined.overlap_offset = { x_offset, y_offset }
-                children[#children + 1] = outlined
-                -- Overhangs the card TOP; the opening effect's ring erase
-                -- must spare the glyph column (left ~45%).
-                self._glyph_overhang_top = true
+                -- Zero-chrome wrapper purely so the painted rect gets
+                -- stamped (the halo/shadow group's synthetic dimen carries
+                -- no position): the opening effect repaints the glyph on
+                -- top of the ring erase + flex.
+                local fav_wrap = FrameContainer:new{
+                    bordersize = 0,
+                    padding    = 0,
+                    outlined,
+                }
+                fav_wrap.overlap_offset = { x_offset, y_offset }
+                children[#children + 1] = fav_wrap
+                self._overhang_glyph_widgets = self._overhang_glyph_widgets or {}
+                table.insert(self._overhang_glyph_widgets, fav_wrap)
             end
         end
     end

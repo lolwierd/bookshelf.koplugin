@@ -4590,24 +4590,11 @@ function BookshelfWidget:_paintOpeningEffect(fp)
     if ringed and Screen.bb then
         local bb = Screen.bb
         local W = Blitbuffer.COLOR_WHITE
-        -- Badge glyphs overhang the card into the top/bottom bands, in the
-        -- LEFT ~45% only (glyph-size gate in bookshelf_spine_widget). Spare
-        -- that column when the spine says a glyph is there - erasing it
-        -- beheaded the heart / bookmark dangle - and erase the full band
-        -- otherwise. The corner blocks and vertical strips never hold
-        -- glyphs, so they always go.
-        local keep_x = rect.x + math.floor(rect.w * 0.45)
-        local band_r = rect.x + rect.w + ring_t
-        local function band(y0, spare)
-            if spare then
-                bb:paintRect(rect.x - ring_t, y0, ring_t, ring_t, W)
-                bb:paintRect(keep_x, y0, band_r - keep_x, ring_t, W)
-            else
-                bb:paintRect(rect.x - ring_t, y0, rect.w + 2 * ring_t, ring_t, W)
-            end
-        end
-        band(rect.y - ring_t, spine._glyph_overhang_top)
-        band(rect.y + rect.h, spine._glyph_overhang_bottom)
+        -- Full-band erase; badge glyphs that overhang into the bands are
+        -- REPAINTED after the flex (their widgets are stashed with painted
+        -- rects), so nothing gets beheaded and no ring stub remains.
+        bb:paintRect(rect.x - ring_t, rect.y - ring_t, rect.w + 2 * ring_t, ring_t, W)
+        bb:paintRect(rect.x - ring_t, rect.y + rect.h, rect.w + 2 * ring_t, ring_t, W)
         bb:paintRect(rect.x - ring_t, rect.y, ring_t, rect.h, W)
         bb:paintRect(rect.x + rect.w, rect.y, ring_t, rect.h, W)
         -- The selected cover's corner MASK is painted BLACK to blend with
@@ -4636,6 +4623,25 @@ function BookshelfWidget:_paintOpeningEffect(fp)
         end
     end
     BookshelfWidget.flexCoverOpen(rect)
+    -- Repaint the overhanging badge glyphs (heart above, bookmark dangle
+    -- below) at their original painted positions, on top of the ring erase
+    -- and the flexed cover - the glyphs stay whole and unmoved while the
+    -- cover opens beneath them.
+    local bb = Screen.bb
+    if bb and spine._overhang_glyph_widgets then
+        for _i, gw in ipairs(spine._overhang_glyph_widgets) do
+            local gd = gw.dimen
+            if gd and gd.x and gd.w and gd.w > 0 then
+                pcall(function() gw:paintTo(bb, gd.x, gd.y) end)
+                -- Small margin: the halo/shadow paint a few px beyond the
+                -- group's synthetic dimen.
+                local m = Screen:scaleBySize(4)
+                pcall(function()
+                    Screen:refreshUI(gd.x - m, gd.y - m, gd.w + 2 * m, gd.h + 2 * m)
+                end)
+            end
+        end
+    end
     if ringed then
         -- flexCoverOpen refreshed only the flex region; push the erased
         -- ring band (which extends left/above/below it) too.
