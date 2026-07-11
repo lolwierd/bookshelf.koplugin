@@ -2879,6 +2879,12 @@ function BookshelfWidget:_launchReader(open_path, after_open_callback)
         if Park.unpark(self, after_open_callback) then return end
     end
     self._pre_read_rotation = Screen:getRotationMode()
+    -- Mark that BOOKSHELF launched this book. onCloseDocument's re-show is
+    -- gated on this, not on mere stack presence: another home UI (SimpleUI
+    -- etc.) can bury the shelf without closing it, and a book opened from
+    -- THERE must close back to there, not to us. "You return to whatever
+    -- opened the book."
+    self._opened_book = true
     -- Drop the memoised hero record: reading changes progress, so the
     -- close-rebuild must re-read fresh state, not the pre-read snapshot (#103).
     self._hero_current_memo = nil
@@ -4575,28 +4581,70 @@ function BookshelfWidget:_paintOpeningEffect(fp)
     if not (rect and rect.x and rect.w and rect.w > 8 and rect.h > 8) then return end
     local bb = Screen.bb
     if not bb then return end
+    -- Night mode inverts the framebuffer at refresh, so paint the logical
+    -- colours swapped there: the page block must DISPLAY white and the
+    -- hairline frame dark in both modes.
+    local night = G_reader_settings:isTrue("night_mode")
+    local page_color = night and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+    local ink_color  = night and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+    -- Trapezoid parameters: width squeezes to 95% (anchored on the left
+    -- edge, the spine); the right edge grows up to +6% of the height,
+    -- split above/below, so the free edge reads as lifting OUT of the
+    -- screen. Approximated with vertical bands, each scaled to its own
+    -- height - narrow enough steps to pass for a straight diagonal.
+    local SQUEEZE = 0.95
+    local LIFT    = 0.06
+    local new_w = math.floor(rect.w * SQUEEZE)
+    local pad   = math.ceil(rect.h * LIFT / 2) + 2
     local ok = pcall(function()
         local src_bb = Blitbuffer.new(rect.w, rect.h, bb:getType())
         src_bb:blitFrom(bb, 0, 0, rect.x, rect.y, rect.w, rect.h)
-        -- Horizontal-only squeeze: full height, width to 95%, anchored on
-        -- the left edge (the spine). Foreshortening in one axis is what a
-        -- cover rotating open actually looks like; the page-white strip
-        -- appears along the right edge only.
-        local new_w = math.floor(rect.w * 0.95)
-        local scaled = src_bb:scale(new_w, rect.h)
-        bb:paintRect(rect.x + new_w, rect.y, rect.w - new_w, rect.h,
-            Blitbuffer.COLOR_WHITE)
-        bb:blitFrom(scaled, rect.x, rect.y, 0, 0, new_w, rect.h)
+        -- Page block where the cover pulled away, with a hairline frame
+        -- closing its top/right/bottom edges - without it the revealed
+        -- strip floats borderless against the page background (the "gap"
+        -- next to the hero's drop shadow).
+        local strip_w = rect.w - new_w
+        bb:paintRect(rect.x + new_w, rect.y, strip_w, rect.h, page_color)
+        local hair = math.max(1, Screen:scaleBySize(1))
+        bb:paintRect(rect.x + new_w, rect.y, strip_w, hair, ink_color)
+        bb:paintRect(rect.x + new_w, rect.y + rect.h - hair, strip_w, hair, ink_color)
+        bb:paintRect(rect.x + rect.w - hair, rect.y, hair, rect.h, ink_color)
+        -- Banded skew: band k of the source maps to a dest band whose
+        -- height grows toward the right edge, centred vertically.
+        local n_bands = math.max(8, math.min(24, math.floor(new_w / 12)))
+        local prev_sx, prev_dx = 0, 0
+        for k = 1, n_bands do
+            local sx = math.floor(rect.w * k / n_bands)
+            local dx = math.floor(new_w * k / n_bands)
+            local bw_src = sx - prev_sx
+            local bw_dst = dx - prev_dx
+            if bw_src > 0 and bw_dst > 0 then
+                local grow = LIFT * ((k - 0.5) / n_bands)
+                local bh   = rect.h + 2 * math.floor(rect.h * grow / 2)
+                local band = Blitbuffer.new(bw_src, rect.h, bb:getType())
+                band:blitFrom(src_bb, 0, 0, prev_sx, 0, bw_src, rect.h)
+                local scaled = band:scale(bw_dst, bh)
+                bb:blitFrom(scaled,
+                    rect.x + prev_dx,
+                    rect.y - math.floor((bh - rect.h) / 2),
+                    0, 0, bw_dst, bh)
+                band:free()
+                scaled:free()
+            end
+            prev_sx, prev_dx = sx, dx
+        end
         src_bb:free()
-        scaled:free()
     end)
     if not ok then
         logger.dbg("[bookshelf] opening effect failed; skipping")
         return
     end
-    -- Push the card region to the panel now — the document open that
-    -- follows blocks the UI loop, so a queued refresh would never land.
-    pcall(function() Screen:refreshUI(rect.x, rect.y, rect.w, rect.h) end)
+    -- Push the affected region (card + the lift overdraw above/below) to
+    -- the panel now - the document open that follows blocks the UI loop,
+    -- so a queued refresh would never land.
+    pcall(function()
+        Screen:refreshUI(rect.x, rect.y - pad, rect.w, rect.h + 2 * pad)
+    end)
 end
 
 -- softRefresh — lightweight return-to-bookshelf update. Splits the work

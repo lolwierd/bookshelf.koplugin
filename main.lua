@@ -1650,6 +1650,18 @@ function Bookshelf:onCloseDocument()
     if _suppress_close_document_show then
         return
     end
+    -- "You return to whatever opened the book": the shelf can be ON the
+    -- stack yet buried under another home UI (SimpleUI et al bury rather
+    -- than close). Stack presence alone therefore over-claims - only
+    -- re-show when BOOKSHELF launched this book (_launchReader / unpark
+    -- set the flag; KOReader- or other-plugin-initiated opens never do).
+    local opened_here = _live_widget and _live_widget._opened_book
+    if _live_widget then _live_widget._opened_book = false end
+    if not opened_here then
+        _skip_next_onshow_takeover = true
+        UIManager:scheduleIn(2, function() _skip_next_onshow_takeover = false end)
+        return
+    end
     -- Normal path (close-document not via _safeShow, e.g. exit-to-FM
     -- from KOReader's own menu): schedule show so bookshelf reappears
     -- on the next tick. self:show()'s refresh path handles the repaint

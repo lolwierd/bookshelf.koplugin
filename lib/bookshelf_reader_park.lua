@@ -315,6 +315,9 @@ function Park.unpark(live_widget, after_open_callback)
         -- record must not survive into the next return (#103 parity with
         -- _launchReader).
         live_widget._hero_current_memo = nil
+        -- Same _launchReader parity: an unpark IS bookshelf opening the
+        -- book, so the eventual close returns to the shelf.
+        live_widget._opened_book = true
     end
     if idx ~= #stack then
         local entry = table.remove(stack, idx)
