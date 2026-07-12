@@ -2905,14 +2905,18 @@ function BookshelfWidget:_launchReader(open_path, after_open_callback)
     -- close-rebuild must re-read fresh state, not the pre-read snapshot (#103).
     self._hero_current_memo = nil
     self:_stopStatusTimer()
-    -- The opening-cover squeeze already painted at tap time (_openBook).
-    -- The seamless flag below makes KOReader's own "Opening file"
-    -- InfoMessage invisible (readerui.lua showReaderCoroutine) and swaps
-    -- the reader's arrival refresh from "full" to "ui" — onReaderReady
-    -- issues one full refresh to clear any shelf ghosting under the page.
-    self._seamless_open_full_pending = true
+    -- Seamless open is tied to the cover-opening effect. With the effect ON,
+    -- the flex squeeze (painted at tap time in _openBook) IS the feedback, so
+    -- go seamless: suppress KOReader's own "Opening file" InfoMessage
+    -- (readerui.lua showReaderCoroutine) and take the lighter "ui" arrival
+    -- refresh (onReaderReady issues one full refresh to clear ghosting). With
+    -- the effect OFF there's no flex, so DON'T suppress the message -- opening
+    -- a book with no feedback at all read as an unresponsive freeze (Reddit).
+    -- Let the native "Opening <file>" message show and take the normal arrival.
+    local seamless = BookshelfSettings.nilOrTrue("open_cover_effect")
+    self._seamless_open_full_pending = seamless or nil
     local ReaderUI = require("apps/reader/readerui")
-    ReaderUI:showReader(open_path, nil, true, nil, after_open_callback)
+    ReaderUI:showReader(open_path, nil, seamless, nil, after_open_callback)
 end
 
 -- Kobo books decrypt to a /tmp copy that can still be mid-write when
