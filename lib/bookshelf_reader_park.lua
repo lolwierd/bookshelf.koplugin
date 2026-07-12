@@ -232,6 +232,20 @@ function Park.park(plugin)
     if not Park.enabled() then return false end
     local rui = plugin and plugin.ui
     if not (rui and rui.document) then return false end
+    -- Orientation changed while reading (e.g. a book read in landscape)?
+    -- Decline to park and let the normal close run, so the shelf's pre-read
+    -- orientation is restored right away. Parking keeps the reader's rotation
+    -- (the restore in onShow is gated on not-parked to avoid corrupting the
+    -- parked layout), which left the shelf stuck sideways until the deferred
+    -- real close (issue #266). Only instant reopen for a differently-oriented
+    -- book is given up; same-orientation exits still park.
+    local pre = plugin._widget and plugin._widget._pre_read_rotation
+    if pre ~= nil then
+        local Screen = require("device").screen
+        if Screen and Screen.getRotationMode and Screen:getRotationMode() ~= pre then
+            return false
+        end
+    end
     -- Close the reader chrome first - the same prelude KOReader's own
     -- switchDocument uses. A menu or config panel left open would sit
     -- orphaned above the shelf after the splice.
