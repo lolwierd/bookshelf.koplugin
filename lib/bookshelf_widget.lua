@@ -10710,10 +10710,41 @@ function BookshelfWidget:_applyCoverCandidate(book, candidate, modal, state)
     end
     self:_refreshSingleBookCover(book.filepath, "cover-picker")
 
-    -- Carry the Cover-tab state (online results, page) across the reopen, but
-    -- drop the cached LOCAL list so the ring/current-cover entries rebuild
-    -- against the new sidecar state.
-    if type(state) == "table" then state.local_candidates = nil end
+    -- Keep the grid order stable across the reopen. Re-deriving the local list
+    -- inserts a new front-of-list "Current cover" (+ "Previous cover") and
+    -- drops the applied online result from its slot, so the whole grid
+    -- reshuffled on every apply. Instead, when the tapped candidate is one
+    -- that's already on screen, reuse the cached lists and just move the active
+    -- ring onto it -- dropping only entries whose file has since vanished (the
+    -- removed custom cover after a revert) so no blank tile lingers. The fresh
+    -- "Current cover"/"Previous cover" entries re-derive on the next open. An
+    -- off-grid apply (device file picker) isn't in the lists, so fall back to
+    -- re-deriving there or the new cover wouldn't appear at all.
+    if type(state) == "table" then
+        local function inList(list)
+            if type(list) == "table" then
+                for _i, c in ipairs(list) do if c == candidate then return true end end
+            end
+            return false
+        end
+        if inList(state.local_candidates) or inList(state.online_candidates) then
+            local function reflag(list)
+                if type(list) ~= "table" then return list end
+                local kept = {}
+                for _i, c in ipairs(list) do
+                    if c.kind == "embedded" or CoverApply.fileSize(c.local_path) then
+                        c.is_active = (c == candidate)
+                        kept[#kept + 1] = c
+                    end
+                end
+                return kept
+            end
+            state.local_candidates  = reflag(state.local_candidates)
+            state.online_candidates = reflag(state.online_candidates)
+        else
+            state.local_candidates = nil  -- off-grid pick: re-derive so it shows
+        end
+    end
     local bw = self
     local fresh = Repo.buildBookMeta(book.filepath, { want_cover = true }) or book
     if modal then UIManager:close(modal) end
