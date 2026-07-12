@@ -14,6 +14,40 @@ the trailing `.N` is the fork revision, reset whenever the upstream base changes
 
 _Nothing yet._
 
+## [3.10.2.1] - 2026-07-12
+
+Sync with upstream **v3.10.2** (98 commits since v3.8.4, spanning upstream
+releases v3.8.5–v3.8.10, v3.9.0, and v3.10.0–v3.10.2).
+
+### Upstream changes pulled in
+- New **Cover** tab for finding and applying local or online covers, with
+  ISBN-first matching, multiple sources, resolution ranking, deduplication, and
+  bounded caches.
+- Optional true-aspect cover rendering across the hero, collapsed, expanded,
+  and title shelf layouts.
+- Hot reader parking for faster book-to-shelf returns, including correct
+  gesture forwarding, exit routing, rotation restoration, and transition paint.
+- Configurable opening-cover and start-menu animations, plus chip-strip page
+  animation and colour e-ink refresh improvements.
+- New start-menu options for icon-only entries and scoped dividers; device Back
+  now climbs one chip drill-down level; new chip-strip paging gesture actions.
+- Fixes for newer KOReader updater compatibility, Exit KOReader gestures,
+  Hardcover review fetching and ratings, deep-folder status filters, hero-swipe
+  pagination, author parsing, series filtering/sorting, and PocketBook cover-tab
+  pagination.
+- Added Portuguese (Portugal) translation and refreshed existing translations.
+
+### Fork fixes retained
+- **Screensaver host fallback** for suspend while Bookshelf owns the home screen.
+- **`onRequestSuspend` handler** while Bookshelf is the topmost widget.
+- **Multiswipe sleep gesture** using reader-side suspend bindings.
+- **Updater fork URLs** so stable and developer updates remain on this fork.
+- Upstream's lifecycle-tied `_restoring_from_reader` active-chip protection.
+
+### Fork fix superseded by upstream
+- The `quote_of_day` `FileManager.instance` nil-guard is now present upstream;
+  the upstream implementation is retained.
+
 ## [3.8.4.1] - 2026-07-05
 
 Sync with upstream **v3.8.4** (124 commits since the previous base v3.5.3, spanning
@@ -86,7 +120,8 @@ exists for: active-chip preservation on return, the screensaver host fallback,
 direct `RequestSuspend` handling, the multiswipe sleep binding, and updater URLs
 pointed at the fork.
 
-[Unreleased]: https://github.com/lolwierd/bookshelf.koplugin/compare/v3.8.4.1...HEAD
+[Unreleased]: https://github.com/lolwierd/bookshelf.koplugin/compare/v3.10.2.1...HEAD
+[3.10.2.1]: https://github.com/lolwierd/bookshelf.koplugin/releases/tag/v3.10.2.1
 [3.8.4.1]: https://github.com/lolwierd/bookshelf.koplugin/releases/tag/v3.8.4.1
 [3.5.3.1]: https://github.com/lolwierd/bookshelf.koplugin/releases/tag/v3.5.3.1
 [3.2.2.1]: https://github.com/lolwierd/bookshelf.koplugin/releases/tag/v3.2.2.1

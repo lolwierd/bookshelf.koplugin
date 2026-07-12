@@ -36,9 +36,26 @@ function Exec.dispatch(entry, bw)
             local fm_mod = package.loaded["apps/filemanager/filemanager"]
             local fm  = fm_mod and fm_mod.instance
             local mod = fm and fm.bookshelf
-            if not (mod and type(mod.addToMainMenu) == "function") then return end
+            if not mod then
+                -- Hot parking: no FileManager exists while a reader is
+                -- parked under the shelf - the reader-context plugin
+                -- instance carries the same menu via buildMenuItems
+                -- (addToMainMenu itself bails in reader context so the
+                -- actual reading menu stays uncluttered).
+                local rui_mod = package.loaded["apps/reader/readerui"]
+                local rui = rui_mod and rui_mod.instance
+                mod = rui and rui.bookshelf
+            end
+            if not (mod and (type(mod.buildMenuItems) == "function"
+                             or type(mod.addToMainMenu) == "function")) then
+                return
+            end
             local probe = {}
-            mod:addToMainMenu(probe)
+            if type(mod.buildMenuItems) == "function" then
+                mod:buildMenuItems(probe)
+            else
+                mod:addToMainMenu(probe)
+            end
             local order = mod.MENU_ORDER
             if type(order) ~= "table" then
                 order = {}
@@ -70,7 +87,11 @@ function Exec.dispatch(entry, bw)
         end
     elseif type(entry.menu_path) == "table" then
         local MenuShortcut = require("lib/bookshelf_menu_shortcut")
-        MenuShortcut.replay(entry.menu_path)
+        if entry.menu_page then
+            MenuShortcut.replayPage(entry.menu_path, entry.label)
+        else
+            MenuShortcut.replay(entry.menu_path)
+        end
     elseif type(entry.action) == "table" then
         local ok, Dispatcher = pcall(require, "dispatcher")
         if ok then Dispatcher:execute(entry.action) end

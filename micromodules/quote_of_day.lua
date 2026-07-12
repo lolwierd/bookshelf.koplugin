@@ -133,7 +133,11 @@ return {
         -- (issue #183). Everywhere else the quote body reports its NATURAL height
         -- (no max_h / ellipsis clamp) so the hero fit engine (_renderFitted)
         -- shrinks the font until quote + attribution fit, instead of truncating.
-        local max_h = (preview and avail_h and avail_h > 0)
+        -- ctx.clamp is the fit engine's last resort (issue #249): the quote
+        -- still overflows at the smallest legible size, so ellipsise the QUOTE
+        -- to the remaining room -- the attribution is the part that must
+        -- never be lost to the cell's bottom clip.
+        local max_h = ((preview or ctx.clamp) and avail_h and avail_h > 0)
             and math.max(1, avail_h - attr:getSize().h) or nil
         local quote_box = Kit.fitText{ text = quote_text, size = 15, scale_pct = scale_pct,
             width = mw, max_h = max_h }
@@ -169,6 +173,9 @@ return {
             local ok_bb, BookmarkBrowser =
                 pcall(require, "ui/widget/bookmarkbrowser")
             if not (ok_bb and BookmarkBrowser) then return end
+            -- FileManager may be torn down when the quote is opened from an
+            -- in-reader launcher, leaving FileManager.instance nil. Bail rather
+            -- than hand BookmarkBrowser a nil parent UI.
             local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
             local parent_ui = (ok_fm and FileManager and FileManager.instance) or nil
             if not parent_ui then return end

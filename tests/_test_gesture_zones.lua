@@ -222,4 +222,150 @@ t.test("a forwarded event cannot tear FileManager down (#225)", function()
     assert(real_closed, "FM:onClose must be restored after the forward")
 end)
 
+-- Regression for #243: the explicit "Exit KOReader" / "Restart" Dispatcher
+-- actions arrive as onExit / onRestart and run FileManager:onClose to quit
+-- (DeviceListener:onExit -> FileManagerMenu:exitOrRestart -> self.ui:onClose).
+-- The #225 guard must NOT neutralise onClose for these, or the intentional
+-- Exit is silently swallowed while bookshelf is the top widget.
+for _, handler in ipairs({ "onExit", "onRestart" }) do
+    t.test("an explicit " .. handler .. " reaches FM with onClose intact (#243)", function()
+        local closed = false
+        local fm
+        fm = {
+            onClose = function() closed = true end,
+            handleEvent = function(self) self.onClose(); return true end,
+        }
+        package.loaded["apps/filemanager/filemanager"] = { instance = fm }
+        Zones.forwardToFM({ handler = handler }, {})
+        assert(closed, handler .. " must reach FM's real onClose (Exit/Restart must work)")
+    end)
+end
+
+-- Defense-in-depth: the #243 teardown bypass must NEVER apply to a
+-- gesture-carrying event (#225's trigger). Even an onExit that somehow rode in
+-- with a raw gesture arg stays guarded -- onClose is neutralised like any other
+-- gesture forward, so it can't reopen #225.
+t.test("a gesture-carrying onExit stays guarded, no teardown (#225/#243)", function()
+    local real_closed = false
+    local fm
+    fm = {
+        onClose = function() real_closed = true end,
+        handleEvent = function(self) self.onClose(); return true end,
+    }
+    package.loaded["apps/filemanager/filemanager"] = { instance = fm }
+    local ev = { handler = "onExit", args = { nil, { ges = "swipe", pos = {} } } }
+    Zones.forwardToFM(ev, {})
+    assert(not real_closed, "a gesture-carrying onExit must stay guarded (no teardown)")
+end)
+
+print("--- tryReaderZones ---")
+
+t.test("nil rui returns false", function()
+    assert(Zones.tryReaderZones({}, nil) == false)
+end)
+
+t.test("matches a readermenu_* zone and fires its handler", function()
+    local ev = { pos = { x = 5, y = 5 } }
+    local fired = false
+    local rui = {
+        _ordered_touch_zones = {
+            fakeZone("readermenu_tap", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                function() fired = true; return true end),
+        },
+    }
+    assert(Zones.tryReaderZones(ev, rui) == true)
+    assert(fired, "expected the readermenu zone's handler to fire")
+end)
+
+t.test("page-turn zones never fire through the reader forward", function()
+    local ev = { pos = { x = 5, y = 5 } }
+    local fired = false
+    local rui = {
+        _ordered_touch_zones = {
+            fakeZone("tap_forward", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                function() fired = true; return true end),
+            fakeZone("readerhighlight_tap", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                function() fired = true; return true end),
+            fakeZone("readerfooter_tap", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                function() fired = true; return true end),
+        },
+    }
+    assert(Zones.tryReaderZones(ev, rui) == false)
+    assert(not fired, "reader page-turn/highlight/footer zones must not fire")
+end)
+
+t.test("a user-configured Gestures-plugin id fires on the reader host", function()
+    local ev = { pos = { x = 5, y = 5 } }
+    local fired = false
+    local rui = {
+        gestures = { gestures = { my_corner_tap = true } },
+        _ordered_touch_zones = {
+            fakeZone("my_corner_tap", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                function() fired = true; return true end),
+        },
+    }
+    assert(Zones.tryReaderZones(ev, rui) == true)
+    assert(fired)
+end)
+
+t.test("reader child modules' zones are walked too", function()
+    local ev = { pos = { x = 5, y = 5 } }
+    local fired = false
+    local rui = {
+        _ordered_touch_zones = {},
+        [1] = {
+            _ordered_touch_zones = {
+                fakeZone("readermenu_swipe", { x = 0, y = 0, w = 10, h = 10 }, { ev },
+                    function() fired = true; return true end),
+            },
+        },
+    }
+    assert(Zones.tryReaderZones(ev, rui) == true)
+    assert(fired)
+end)
+
+print("--- forwardToReader ---")
+
+t.test("forwards a plain event to the reader host", function()
+    local handled = nil
+    local rui = { handleEvent = function(_self, e) handled = e.handler; return true end }
+    local event = { handler = "onIncreaseFlIntensity", args = {} }
+    assert(Zones.forwardToReader(event, {}, rui) == true)
+    assert(handled == "onIncreaseFlIntensity")
+end)
+
+t.test("never forwards lifecycle events to the reader", function()
+    local called = false
+    local rui = { handleEvent = function() called = true; return true end }
+    assert(Zones.forwardToReader({ handler = "onClose", args = {} }, {}, rui) == false)
+    assert(not called)
+end)
+
+t.test("neutralises reader onClose during a gesture-carrying forward", function()
+    local rui
+    rui = {
+        onClose = function() error("real onClose must not run") end,
+        handleEvent = function(_self, _e)
+            rui.onClose() -- incidental teardown attempt during dispatch
+            return true
+        end,
+    }
+    local event = { handler = "onSwipe", args = { { ges = "swipe" } } }
+    assert(Zones.forwardToReader(event, {}, rui) == true)
+    assert(type(rui.onClose) == "function")
+    local ok = pcall(rui.onClose)
+    assert(ok == false, "original onClose must be restored after dispatch")
+end)
+
+t.test("onExit reaches the reader with onClose intact", function()
+    local saw_real_onclose = false
+    local rui
+    rui = {
+        onClose = function() saw_real_onclose = true; return true end,
+        handleEvent = function(_self, _e) rui.onClose(); return true end,
+    }
+    assert(Zones.forwardToReader({ handler = "onExit", args = {} }, {}, rui) == true)
+    assert(saw_real_onclose, "intentional exit must run the real onClose")
+end)
+
 t.done()

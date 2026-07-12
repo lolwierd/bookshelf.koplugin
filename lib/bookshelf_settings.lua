@@ -619,6 +619,28 @@ function Settings:_coverDisplaySubItems()
         }
     end
     return {
+        -- Layout-affecting toggle, kept at the top and separated from the
+        -- "what to show on a cover" rows below.
+        {
+            text = _("True cover aspect ratio"),
+            help_text = _("Show each cover at its real shape instead of a "
+                .. "uniform book rectangle. Covers keep the same width but "
+                .. "vary in height: on the shelf they sit along the bottom "
+                .. "shelf line, and in the hero area they align to the top. "
+                .. "Wide or square covers stop being cropped or stretched. "
+                .. "Off by default (uniform grid)."),
+            checked_func = function()
+                return BookshelfSettings.isTrue("true_cover_aspect")
+            end,
+            keep_menu_open = true,
+            callback = function()
+                BookshelfSettings.save("true_cover_aspect",
+                    not BookshelfSettings.isTrue("true_cover_aspect"))
+                BookshelfSettings.flush()
+                markDirty()
+            end,
+            separator = true,
+        },
         toggleRow("progress_bookmark_enabled",
                   _("Show reading bookmarks"), false),
         -- On-hold display: four-state. "both" (default; pause badge +
@@ -736,6 +758,10 @@ function Settings:_coverDisplaySubItems()
                 end,
             }
         end)(),
+        -- Fade finished books like the on-hold faded cover (#138). Opt-in
+        -- (default off) and independent of the badge style above, mirroring
+        -- the #121 split of badge vs fade for on-hold books.
+        toggleRow("finished_fade_enabled", _("Fade finished books"), false, true),
         -- Show series #: three-state. "always" (default), "in_series"
         -- (only inside a single-series view), or "never". Legacy boolean
         -- values are still honoured: true reads as "always", false as
@@ -1397,6 +1423,7 @@ function Settings:_settingsSubItems()
             return self:_expandedShelfSubItems()
         end,
     }
+    -- ("True cover aspect ratio" lives in the Cover display submenu.)
     -- Micro-module placement: three INDEPENDENT surfaces (start menu / hero /
     -- full-screen button), each a checkbox, so any combination can run at once.
     -- Promoted here from Advanced so it sits directly above "Hero area starts
@@ -2324,6 +2351,25 @@ end
 function Settings:_performanceSubItems()
     return {
         {
+            text = _("Instant book close (beta)"),
+            help_text = _("Show Bookshelf immediately when leaving a "
+                .. "book. The book finishes closing at the next quiet "
+                .. "moment - opening another book, half a minute of "
+                .. "inactivity, or leaving Bookshelf - so browsing "
+                .. "never has to wait for it. Until then, going "
+                .. "straight back into the same book is instant. Turn "
+                .. "this off to close books fully before Bookshelf "
+                .. "appears, as before."),
+            checked_func = function()
+                return BookshelfSettings.nilOrTrue("hot_park")
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local enabled = BookshelfSettings.nilOrTrue("hot_park")
+                BookshelfSettings.save("hot_park", not enabled)
+            end,
+        },
+        {
             text = _("Pre-warm chip cache"),
             help_text = _("Warms each chip's data in the background shortly"
                 .. " after launch so switching chips is instant. On a large"
@@ -2383,6 +2429,48 @@ end
 
 function Settings:_advancedSubItems()
     local plugin = self._plugin
+    -- Shared builder for the two animation-speed rows (#259): the page-turn
+    -- wipe (shelf pagination + chip-bar paging) and the start-menu reveal.
+    -- Same Off/Fast/Medium/Slow choices, separate keys; defaults come from
+    -- PageWipe.DEFAULTS (the menu repaints a taller region, so it defaults
+    -- snappier than the page wipe).
+    local function animRow(title, key, help)
+        local PageWipe = require("lib/bookshelf_page_wipe")
+        local MODE_LABELS = { off    = _("Off"),
+                              fast   = _("Fast"),
+                              medium = _("Medium"),
+                              slow   = _("Slow") }
+        local default = PageWipe.DEFAULTS[key]
+        local function cur()
+            return BookshelfSettings.read(key) or default
+        end
+        return {
+            text_func = function()
+                return title .. ": " .. (MODE_LABELS[cur()] or MODE_LABELS[default])
+            end,
+            help_text = help,
+            keep_menu_open = true,
+            sub_item_table_func = function()
+                local function row(label, value)
+                    return {
+                        text = label,
+                        radio = true,
+                        checked_func = function() return cur() == value end,
+                        callback = function()
+                            BookshelfSettings.save(key, value)
+                            BookshelfSettings.flush()
+                        end,
+                    }
+                end
+                return {
+                    row(_("Off"),    "off"),
+                    row(_("Fast"),   "fast"),
+                    row(_("Medium"), "medium"),
+                    row(_("Slow"),   "slow"),
+                }
+            end,
+        }
+    end
     local items = {
         -- ── library & metadata ──
         {
@@ -2583,43 +2671,31 @@ function Settings:_advancedSubItems()
                 if self._bw then self._bw._tap_selected_fp = nil end
             end,
         },
+        animRow(_("Page turn animation"), "shelf_page_animation",
+            _("Animate shelf page turns and chip-bar paging with a wipe "
+            .. "effect. E-ink only (the effect relies on the panel's "
+            .. "refresh, so it does nothing on LCD screens). Fast / Medium "
+            .. "/ Slow trade snappiness for smoothness. Slow looks "
+            .. "smoothest but takes longer on older panels.")),
+        animRow(_("Start menu animation"), "start_menu_animation",
+            _("Animate the start menu opening and closing. Separate from "
+            .. "the page-turn wipe, so you can keep one and turn off the "
+            .. "other - the menu reveal repaints a taller area and can "
+            .. "look choppy on some screens, particularly while reading. "
+            .. "E-ink only.")),
         {
-            text_func = function()
-                local v = BookshelfSettings.read("shelf_page_animation") or "medium"
-                local label = ({ off    = _("Off"),
-                                 fast   = _("Fast"),
-                                 medium = _("Medium"),
-                                 slow   = _("Slow") })[v] or _("Medium")
-                return _("Page turn animation") .. ": " .. label
+            text = _("Cover opening effect"),
+            help_text = _("When you open a book, briefly flex its cover open "
+                .. "before the page appears. Purely cosmetic; turn it off for "
+                .. "an instant, plain open. On by default."),
+            checked_func = function()
+                return BookshelfSettings.nilOrTrue("open_cover_effect")
             end,
-            help_text = _("Animate shelf page turns with a page-wipe effect: "
-                .. "the new page sweeps in from the side. E-ink only (the "
-                .. "effect relies on the panel's refresh, so it does nothing "
-                .. "on LCD screens). Fast / Medium / Slow trade snappiness for "
-                .. "smoothness. Slow looks smoothest but takes longer on "
-                .. "older panels."),
             keep_menu_open = true,
-            sub_item_table_func = function()
-                local function row(label, value)
-                    return {
-                        text = label,
-                        radio = true,
-                        checked_func = function()
-                            local v = BookshelfSettings.read("shelf_page_animation") or "medium"
-                            return v == value
-                        end,
-                        callback = function()
-                            BookshelfSettings.save("shelf_page_animation", value)
-                            BookshelfSettings.flush()
-                        end,
-                    }
-                end
-                return {
-                    row(_("Off"),    "off"),
-                    row(_("Fast"),   "fast"),
-                    row(_("Medium"), "medium"),
-                    row(_("Slow"),   "slow"),
-                }
+            callback = function()
+                local on = BookshelfSettings.nilOrTrue("open_cover_effect")
+                BookshelfSettings.save("open_cover_effect", not on)
+                BookshelfSettings.flush()
             end,
         },
         {
