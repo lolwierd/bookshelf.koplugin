@@ -11598,6 +11598,14 @@ function BookshelfWidget:_showBookDetail(book, opts)
                 Repo.invalidateLightMeta()
                 self:_rebuild(); UIManager:setDirty(self, "ui")
             end
+            -- Empty the Cover tab's transient working dir (embedded-cover
+            -- PNGs + online search downloads + any older per-book cruft) so it
+            -- doesn't pile up in the settings folder (issue 267). Applied
+            -- covers live in the book's .sdr and are untouched. Fires only on a
+            -- real dismiss/Open, NOT on the apply flow's reopen (that goes
+            -- through UIManager:close -> onCloseWidget, which doesn't run
+            -- on_close), so the carried online candidates survive that trip.
+            pcall(function() require("lib/bookshelf_cover_apply").resetWorkingCache() end)
             if opts.on_close then opts.on_close() end
         end,
         -- "Open" footer button opens the book in the reader (the popup closes
