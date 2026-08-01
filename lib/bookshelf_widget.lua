@@ -82,6 +82,10 @@ local HERO_MIN_FRAC = 0.20
 -- column floor so covers don't get too tall.
 local COLUMNS_MIN, COLUMNS_MAX = 2, 6
 local ROWS_MIN = 1
+-- Idle delay before a draft regrid (shelf-size dialog / pinch-zoom) upgrades its
+-- soft/placeholder covers to correct-size decodes. Long enough to coalesce a
+-- burst of taps/pinches, short enough to feel immediate once you stop.
+local COVER_SETTLE_DELAY = 0.3
 -- Landscape/widescreen: a fixed column count makes covers too tall, so there
 -- the cover-size setting instead drives cover HEIGHT as a fraction of screen
 -- height; columns fall out of that (shorter cover -> narrower -> more fit).
@@ -165,6 +169,7 @@ function BookshelfWidget:init()
     self.width  = Screen:getWidth()
     self.height = Screen:getHeight()
     self.dimen  = Geom:new{ w = self.width, h = self.height }
+    self:_refreshDitherFlag()   -- colour-panel cover saturation, #289
     self.chip   = BookshelfSettings.read("active_chip") or "recent"
     -- Cursor-based pagination: _cursor is the 1-based index of the first
     -- visible book on the current view. Primary persisted state. self.page
@@ -720,6 +725,9 @@ function BookshelfWidget:_selectChip(key)
 end
 
 function BookshelfWidget:_rebuild()
+    -- Re-read the colour-dither hint so toggling "Colour panel dithering"
+    -- takes effect on the next refresh (#289).
+    self:_refreshDitherFlag()
     -- A structural rebuild (chip switch, drill, settings change) invalidates
     -- any in-flight next-page preload — it was queued for the old view.
     if self._cancelPreload then self:_cancelPreload() end
@@ -1175,6 +1183,11 @@ function BookshelfWidget:_rebuild()
     -- the existing tree without rebuilding chips/shelves/pagination — see
     -- the fast-path in _previewBook below.
     local hero
+    -- Cleared each rebuild; the micro / expanded builders below re-record their
+    -- status strip so the minute tick + device events can swap it in place
+    -- (#292). Left nil for the book-detail hero, which uses the right-column
+    -- swap path instead.
+    self._hero_status_strip = nil
     if self._expanded then
         -- Expanded (swipe-up) collapses the hero to the thin status strip and
         -- frees a shelf row — in BOTH modes. In micro mode this is the
@@ -1449,8 +1462,20 @@ function BookshelfWidget:_rebuild()
     -- chip switches, while still letting the chevron pagination display
     -- "Page X of Y" accurately for any reasonable user.
     local MAX_FETCH  = 400
-    local all_items, _total_hint = self:_fetchChipItems(MAX_FETCH)
-    all_items = all_items or {}
+    local all_items, _total_hint
+    if self._draft_regrid and self._draft_items_cache then
+        -- Draft regrid: only the grid geometry changed, not the book set, so
+        -- reuse the last full fetch and let the slicing below reflow it to the
+        -- new page size. Skips _fetchChipItems (the library/sort read). The
+        -- cache is repopulated by every normal (non-draft) rebuild, so it can't
+        -- go stale across a chip switch or library refresh.
+        all_items   = self._draft_items_cache.all_items
+        _total_hint = self._draft_items_cache.total_hint
+    else
+        all_items, _total_hint = self:_fetchChipItems(MAX_FETCH)
+        all_items = all_items or {}
+        self._draft_items_cache = { all_items = all_items, total_hint = _total_hint }
+    end
     local _perf_t2 = _gettime()
     logger.dbg(string.format("[bookshelf perf] _rebuild: fetch=%.0fms items=%d chip=%s",
         (_perf_t2 - _perf_t1) * 1000, _total_hint or #all_items, _perf_chip))
@@ -1934,6 +1959,7 @@ function BookshelfWidget:_rebuild()
         local Absorber = InputContainer:extend{}
         function Absorber:onTap()  return true end
         function Absorber:onHold() return true end
+        function Absorber:onDoubleTap() return true end
         local corner_w = math.floor(self.dimen.w * 0.125)
         local corner_h = Screen:scaleBySize(80)
         local left_dim  = Geom:new{
@@ -1953,6 +1979,7 @@ function BookshelfWidget:_rebuild()
             a.ges_events = {
                 Tap  = { GestureRange:new{ ges = "tap",  range = dim } },
                 Hold = { GestureRange:new{ ges = "hold", range = dim } },
+                DoubleTap = { GestureRange:new{ ges = "double_tap", range = dim } },
             }
             overlap_group[#overlap_group + 1] = a
         end
@@ -2823,6 +2850,25 @@ end
 
 -- ─── Navigation ───────────────────────────────────────────────────────────────
 
+-- _openOnDoubleTap(book) — direct-open used by the double_tap gesture on
+-- covers and the hero. A double tap is an unambiguous "open this book"
+-- intent, so it bypasses the single-tap preview/stage behaviour and the
+-- "Open with a double tap" two-tap dance — except in selection mode, where
+-- it toggles the book like a single tap. Only reachable when the user has
+-- KOReader's global double tap enabled (otherwise no double_tap is emitted);
+-- fixes #271, where the unhandled double_tap leaked to the parked reader.
+function BookshelfWidget:_openOnDoubleTap(book)
+    if not book or not book.filepath then return end
+    if self._selection:isActive() then
+        self._selection:toggle(book.filepath)
+        self:_refreshCoverFrame(book.filepath)
+        self:_refreshBucket()
+        return
+    end
+    self._tap_selected_fp = nil
+    self:_openBook(book)
+end
+
 -- _openBook(book, after_open_callback)  — open ReaderUI for the given book
 -- WITHOUT closing the home screen. The Reader is shown on top in UIManager's
 -- stack; when the Reader closes, Bookshelf is exposed automatically with no
@@ -3144,6 +3190,10 @@ function BookshelfWidget:_buildHero(content_w, hero_cover_w, hero_cover_h, hero_
             self._tap_selected_fp = nil
             self:_openBook(b)
         end,
+        -- A genuine double tap opens directly, skipping the stage-then-open
+        -- confirmation (#271). Inert unless the user enabled KOReader's
+        -- global double tap.
+        on_double_tap = function(b) self:_openOnDoubleTap(b) end,
         on_hold      = function(b)
             if self._selection:isActive() then
                 return true  -- suppress: no per-book menu in select mode
@@ -3245,6 +3295,7 @@ function BookshelfWidget:_buildMicroHero(content_w, hero_h, PAD)
     local status_row = HeroCard.buildStatusRow(current, self:_buildDeviceState(),
                                                content_w, true)
     if not status_row then
+        self._hero_status_strip = nil
         return HeroModules.build(self, content_w, hero_h, PAD, mopts)
     end
     local VerticalSpan = require("ui/widget/verticalspan")
@@ -3252,12 +3303,54 @@ function BookshelfWidget:_buildMicroHero(content_w, hero_h, PAD)
     -- slightly too much space above the grid.
     local gap     = math.max(1, math.floor((PAD or 0) / 2))
     local grid_h  = math.max(1, hero_h - status_row:getSize().h - gap)
-    return VerticalGroup:new{
+    local vg = VerticalGroup:new{
         align = "left",
         status_row,
         VerticalSpan:new{ width = gap },
         HeroModules.build(self, content_w, grid_h, PAD, mopts),
     }
+    -- Record the status row (index 1 of vg) so the minute tick and device-state
+    -- events can swap it in place (#292). In micro mode the hero card IS the
+    -- grid, so _gatedRepaint's hero-card path doesn't apply -- without this the
+    -- status line (time / battery / wifi) only refreshes on a full grid reload.
+    -- with_hairline matches the buildStatusRow arg so a swap re-renders it
+    -- identically (the expanded strip records the same shape without hairline).
+    self._hero_status_strip = { group = vg, idx = 1, content_w = content_w,
+                                with_hairline = true }
+    return vg
+end
+
+-- Rebuild the hero status strip (micro-module page header OR expanded strip) in
+-- place -- same swap-and-scope pattern as HeroModules._swapCell -- so its
+-- clock / battery / wifi line stays current without re-rolling the grid or
+-- rebuilding the whole strip (#292). Both surfaces record self._hero_status_strip
+-- so this one path serves both. Returns true on success.
+function BookshelfWidget:_swapHeroStatusStrip()
+    local rec = self._hero_status_strip
+    local vg  = rec and rec.group
+    local old = vg and vg[rec.idx]
+    if not old then return false end
+    local current = (self._preview_book and self._preview_book.filepath
+                     and Repo.buildBook(self._preview_book.filepath))
+                     or self._preview_book
+                     or self:_currentHeroBook()
+    -- Fresh device read (see the same invalidation in _gatedRepaint).
+    _device_state_expires_at = 0
+    local new_row = HeroCard.buildStatusRow(current, self:_buildDeviceState(),
+                                            rec.content_w, rec.with_hairline)
+    if not new_row then return false end
+    vg[rec.idx] = new_row
+    if vg.resetLayout then vg:resetLayout() end
+    if old.free then
+        UIManager:nextTick(function() pcall(function() old:free() end) end)
+    end
+    local scope = old.dimen and old.dimen:copy()
+    if scope then
+        UIManager:setDirty(self, function() return "ui", scope end)
+    else
+        UIManager:setDirty(self, "ui")
+    end
+    return true
 end
 
 -- _buildExpandedStrip(content_w, strip_h, PAD) — the thin replacement for
@@ -3303,7 +3396,13 @@ function BookshelfWidget:_buildExpandedStrip(content_w, strip_h, PAD)
     -- fill it.
     local slack = strip_h - content_h
     local outer = VerticalGroup:new{ align = "left" }
-    if status_row then outer[#outer + 1] = status_row end
+    if status_row then
+        outer[#outer + 1] = status_row
+        -- Record for the in-place status swap (#292), same as the micro page --
+        -- one path keeps both surfaces' clock/battery/wifi line current.
+        self._hero_status_strip = { group = outer, idx = 1, content_w = content_w,
+                                    with_hairline = false }
+    end
     if slack > 0 then
         outer[#outer + 1] = VerticalSpan:new{ width = slack }
     end
@@ -3426,6 +3525,10 @@ function BookshelfWidget:_buildShelfRows(items, content_w, shelf_h, PAD, n_rows)
                 bw:_previewBook(b, tap_t)
             end
         end,
+        -- Double tap on a shelf cover opens directly (#271), whether the
+        -- cover is a bare SpineWidget (collapsed) or wrapped in a titled
+        -- slot (expanded).
+        on_book_open      = function(b) bw:_openOnDoubleTap(b) end,
         on_book_hold      = function(b)
             if bw._selection:isActive() then
                 return true  -- suppress: no per-book menu in select mode
@@ -4542,7 +4645,7 @@ function BookshelfWidget:_repaintSelectionHighlight(old_fp, new_fp)
         union_dimen.y = union_dimen.y - PAD
         union_dimen.w = union_dimen.w + 2 * PAD
         union_dimen.h = union_dimen.h + 2 * PAD
-        UIManager:setDirty(self, function() return "ui", union_dimen end)
+        UIManager:setDirty(self, function() return "ui", union_dimen, self.dithered end)
     else
         UIManager:setDirty(self, "ui")
     end
@@ -4605,7 +4708,7 @@ function BookshelfWidget:_refreshSpineInPlace(fp)
         end
     end
     if replaced_dimen then
-        UIManager:setDirty(self, function() return "ui", replaced_dimen end)
+        UIManager:setDirty(self, function() return "ui", replaced_dimen, self.dithered end)
     end
     return replaced
 end
@@ -4682,6 +4785,33 @@ function BookshelfWidget:_paintOpeningEffect(fp)
                 bb:paintRect(rect.x, y_bot, dx, 1, W)
                 bb:paintRect(rect.x + rect.w - dx, y_bot, dx, 1, W)
             end
+        end
+    end
+    -- A selected cover wears the ring INSTEAD of a drop shadow (the selected
+    -- branch of _wrapCoverInCard sets no shadow_color), so erasing the ring
+    -- above left the opening cover flat and thin -- the "thicker book" cue was
+    -- lost only in the selected state (#271 follow-up). Restore the drop
+    -- shadow a non-selected cover would have, done BEFORE the flex so the
+    -- flex's lifted bands paint OVER it, exactly as the real card shadow sits
+    -- behind the cover (painting it after chopped across the lifting cover).
+    -- Method: paint the card's rounded shadow over the whole footprint, then
+    -- blit the clean cover face back on top -- only the rounded L outside the
+    -- cover survives, pixel-identical to a non-selected cover (rounded corners,
+    -- no square edges, no manual corner math). Non-selected / popup opens keep
+    -- their own real shadow untouched, so every path stays consistent.
+    if ringed and Screen.bb then
+        local sbb  = Screen.bb
+        local SO   = SpineWidget.SHADOW_OFFSET or Screen:scaleBySize(4)
+        local rad  = SpineWidget.CARD_RADIUS or Screen:scaleBySize(4)
+        local gray = SpineWidget.shadowGray and SpineWidget.shadowGray()
+        if gray then
+            pcall(function()
+                local snap = Blitbuffer.new(rect.w, rect.h, sbb:getType())
+                snap:blitFrom(sbb, 0, 0, rect.x, rect.y, rect.w, rect.h)
+                sbb:paintRoundedRect(rect.x + SO, rect.y + SO, rect.w, rect.h, gray, rad)
+                sbb:blitFrom(snap, rect.x, rect.y, 0, 0, rect.w, rect.h)
+                snap:free()
+            end)
         end
     end
     -- Paint the flex WITHOUT refreshing: the ring erase (above), the flex,
@@ -4999,7 +5129,7 @@ function BookshelfWidget:_swapMicroHeroInPlace()
         UIManager:nextTick(function() pcall(function() old_hero:free() end) end)
     end
     if scope then
-        UIManager:setDirty(self, function() return "ui", scope end)
+        UIManager:setDirty(self, function() return "ui", scope, self.dithered end)
     else
         UIManager:setDirty(self, "ui")
     end
@@ -5053,7 +5183,7 @@ function BookshelfWidget:_swapHeroInPlace()
     -- previous hero rendered).
     local scope = old_hero and old_hero.dimen
     if scope then
-        UIManager:setDirty(self, function() return "ui", scope end)
+        UIManager:setDirty(self, function() return "ui", scope, self.dithered end)
     else
         UIManager:setDirty(self, "ui")
     end
@@ -5160,7 +5290,7 @@ function BookshelfWidget:_previewBook(book, tap_t)
             cover_dimen.y = cover_dimen.y - t
             cover_dimen.w = cover_dimen.w + 2 * t
             cover_dimen.h = cover_dimen.h + 2 * t
-            UIManager:setDirty(self, function() return "ui", cover_dimen end)
+            UIManager:setDirty(self, function() return "ui", cover_dimen, self.dithered end)
         end
         return
     end
@@ -5265,6 +5395,11 @@ end
 -- callback in show().
 function BookshelfWidget:onCloseWidget()
     self:_stopStatusTimer()
+    -- Drop any pending draft-cover settle so it can't rebuild a torn-down widget.
+    if self._cover_settle_cb then
+        UIManager:unschedule(self._cover_settle_cb)
+        self._cover_settle_cb = nil
+    end
     -- Land any deferred nav state before we go away (e.g. closing bookshelf
     -- to open a book) so the page/cursor is durable for the next launch.
     self:_flushNavStateNow()
@@ -5364,9 +5499,17 @@ function BookshelfWidget:_gatedRepaint(tokens, debounce)
                 if w and w.covers_fullscreen then return end
             end
         end
+        if not self:_anyActiveRegionUses(tokens) then return end
+        -- Micro-page header or expanded strip: the status line lives above the
+        -- grid, not in a hero card, so refresh it via its own in-place swap
+        -- (#292). One record serves both surfaces.
+        if self._hero_status_strip then
+            _device_state_expires_at = 0
+            self:_swapHeroStatusStrip()
+            return
+        end
         local _hc = self._hero_card or (self._hero_parent and self._hero_parent[1])
         if not (_hc and _hc.replaceRightColumn) then return end
-        if not self:_anyActiveRegionUses(tokens) then return end
         -- Force a fresh _buildDeviceState read at paint time. The event
         -- handlers above already invalidate the cache when the
         -- triggering event fires, but any intermediate paint between
@@ -5406,6 +5549,14 @@ function BookshelfWidget:_startStatusTimer()
             -- (scoped, no re-roll of the other modules). No-op if the grid
             -- has no clock.
             require("lib/bookshelf_hero_modules").tickClocks(self)
+        end
+        if self._hero_status_strip then
+            -- Micro-page header or expanded strip: the status line isn't a
+            -- clock cell, so tick it here when it carries a time token (#292);
+            -- otherwise it lags behind the grid's own clock.
+            if self:_anyActiveRegionUses(TIMER_TOKENS) then
+                self:_swapHeroStatusStrip()
+            end
         else
             -- Book hero: repaint the status strip iff a template uses a
             -- time-driven token.
@@ -6375,6 +6526,24 @@ end
 -- (swipe) route through here so the scoping can't drift between them. Prefers
 -- the hero's live painted dimen; falls back to the stashed hero geometry, then
 -- a full refresh.
+-- Colour e-ink (Kaleido / PocketBook Color / Kindle Colorsoft): book covers
+-- only pick up the panel's colour-dither waveform when the refresh that draws
+-- them carries the dither hint. UIManager honours a top-level widget's
+-- `dithered` flag on plain "ui" refreshes automatically, and via the 3rd return
+-- of closure refreshes (see uimanager.lua). KOReader's own cover browser flags
+-- itself the same way (covermenu.lua: show_parent.dithered + "ui", region,
+-- dithered). We never did, so on colour panels our covers rendered desaturated
+-- until an unrelated full refresh (idle timer, task-switch) applied the colour
+-- waveform -- #289. Flagging ourselves fixes it. Colour panels only (nil on
+-- B&W, so their refresh behaviour is unchanged); gated behind the "Colour panel
+-- dithering" performance tweak so testers can compare with/without. Re-read on
+-- each rebuild so toggling the setting takes effect on the next refresh.
+function BookshelfWidget:_refreshDitherFlag()
+    local colour = Screen.isColorEnabled and Screen:isColorEnabled()
+    self.dithered = (colour and BookshelfSettings.nilOrTrue("color_panel_dithering"))
+        or nil
+end
+
 function BookshelfWidget:_rebuildRefreshBelowHero()
     local prev_hero  = self._hero_parent and self._hero_parent[1]
     local hero_dimen = prev_hero and prev_hero.dimen
@@ -6396,7 +6565,7 @@ function BookshelfWidget:_rebuildRefreshBelowHero()
     if below_y then
         below_y = below_y + Screen:scaleBySize(4)
         UIManager:setDirty(self, function()
-            return "ui", Geom:new{ x = 0, y = below_y, w = self.width, h = self.height - below_y }
+            return "ui", Geom:new{ x = 0, y = below_y, w = self.width, h = self.height - below_y }, self.dithered
         end)
     else
         UIManager:setDirty(self, "ui")
@@ -6423,7 +6592,7 @@ function BookshelfWidget:_rebuildRefreshHeroAndChips()
         -- cleanly (same margin rationale as _rebuildRefreshBelowHero).
         bottom = bottom + Screen:scaleBySize(4)
         UIManager:setDirty(self, function()
-            return "ui", Geom:new{ x = 0, y = 0, w = self.width, h = bottom }
+            return "ui", Geom:new{ x = 0, y = 0, w = self.width, h = bottom }, self.dithered
         end)
     else
         UIManager:setDirty(self, "ui")
@@ -7496,6 +7665,21 @@ end
 
 function BookshelfWidget:_filePollTick()
     if not self._file_poll_fn then return end
+    -- Self-correcting visibility guard (#304): the poll is only meant to run
+    -- while this widget is the actual foreground thing. It's normally
+    -- cancelled via _stopStatusTimer (onCloseWidget / _launchReader /
+    -- onSuspend), but a book opened by a route that bypasses all three --
+    -- e.g. KOReader's own History/Collections screens, or a Dispatcher
+    -- action that calls ReaderUI:showReader directly -- never hits any of
+    -- them, so the poll would otherwise keep re-arming and waking the
+    -- device every FILE_POLL_INTERVAL_S for the rest of that reading
+    -- session. isWidgetShown is a stack-membership check (true even while
+    -- hot-parked underneath a reader), so this specifically needs
+    -- getTopmostVisibleWidget, the same check onResume already uses.
+    if UIManager:getTopmostVisibleWidget() ~= self then
+        self:_cancelFilePoll()
+        return
+    end
     local snap = _snapshotHomeDirs()
     local changed = false
     local prev = self._home_dir_mtimes
@@ -7954,6 +8138,45 @@ end
 -- (smaller covers, "pinch"). Reads the stored setting so the step is off the
 -- user's chosen value, not the landscape-adjusted effective count. Clamped to
 -- [COLUMNS_MIN, COLUMNS_MAX]; a no-op at the limit still consumes the gesture.
+-- Draft regrid: a normal _rebuild with SpineWidget draft mode raised for its
+-- (synchronous) duration, so grid + hero covers reuse cached bitmaps rescaled
+-- to the new slot instead of decoding fresh ones (the slow BIM read). Each
+-- column/row step is drawn at full layout fidelity with soft/placeholder
+-- covers; _scheduleCoverSettle upgrades them once adjustments stop. pcall so
+-- the module flag is always lowered even if _rebuild throws.
+function BookshelfWidget:_draftRebuild()
+    SpineWidget.setDraftMode(true)
+    self._draft_regrid = true
+    local ok, err = pcall(self._rebuild, self)
+    self._draft_regrid = false
+    SpineWidget.setDraftMode(false)
+    if not ok then error(err) end
+end
+
+-- Debounced full-quality cover upgrade after draft regrid steps. Each call
+-- pushes the timer out; when adjustments stop for COVER_SETTLE_DELAY the shelf
+-- rebuilds normally, decoding correct-size covers.
+function BookshelfWidget:_scheduleCoverSettle()
+    if self._cover_settle_cb then UIManager:unschedule(self._cover_settle_cb) end
+    self._cover_settle_cb = function()
+        self._cover_settle_cb = nil
+        self:_rebuild()
+        UIManager:setDirty(self, "ui")
+    end
+    UIManager:scheduleIn(COVER_SETTLE_DELAY, self._cover_settle_cb)
+end
+
+-- Run the cover upgrade now, cancelling any pending settle timer. For the
+-- dialog's Accept/Cancel where the sharp covers should land immediately.
+function BookshelfWidget:_settleCoversNow()
+    if self._cover_settle_cb then
+        UIManager:unschedule(self._cover_settle_cb)
+        self._cover_settle_cb = nil
+    end
+    self:_rebuild()
+    UIManager:setDirty(self, "ui")
+end
+
 function BookshelfWidget:_nudgeColumns(delta)
     local cur = BookshelfSettings.read("bookshelf_columns")
     if type(cur) ~= "number" then cur = self:_nCols() end
@@ -7972,8 +8195,11 @@ function BookshelfWidget:_nudgeColumns(delta)
     self._nav_dirty = true
     self:_scheduleNavFlush()
     self:_clearDpadFocus()
-    self:_rebuild()
+    -- Draft regrid so a burst of pinches steps instantly (covers rescaled from
+    -- cache, not re-decoded); the settle timer sharpens them once you stop.
+    self:_draftRebuild()
     UIManager:setDirty(self, "ui")
+    self:_scheduleCoverSettle()
     return true
 end
 
@@ -9397,9 +9623,9 @@ function BookshelfWidget:_refreshBucket()
     if self._overlap_group.resetLayout then self._overlap_group:resetLayout() end
     UIManager:setDirty(self, function()
         if old_dimen and old_dimen.h and old_dimen.h > 0 then
-            return "ui", old_dimen
+            return "ui", old_dimen, self.dithered
         end
-        return "ui"
+        return "ui", nil, self.dithered
     end)
 end
 
@@ -9671,13 +9897,23 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
             return
         end
         closeModal()
-        local FileManager = require("apps/filemanager/filemanager")
-        local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
-        if FileManager.instance and FileManager.instance.bookinfo then
-            FileManager.instance.bookinfo:show(book.filepath)
-        else
-            FileManagerBookInfo:new{}:show(book.filepath)
-        end
+        -- Book info needs a live FileManager: its bookinfo module carries
+        -- the `ui` context getDocProps reads (self.ui.coverbrowser). While a
+        -- reader is parked there is no FileManager, so finish the park first
+        -- (close the book, FM reborn under the shelf) then show -- same move
+        -- as the menu tap. A bare FileManagerBookInfo:new{} has no ui and
+        -- crashes in getDocProps.
+        require("lib/bookshelf_reader_park").runInFileManager(function(fm)
+            fm = fm or require("apps/filemanager/filemanager").instance
+            if fm and fm.bookinfo then
+                fm.bookinfo:show(book.filepath)
+            else
+                -- Last resort (no FM at all -- shouldn't happen once the park
+                -- has finished): a stub ui keeps getDocProps from indexing
+                -- nil, so at least the info opens rather than crashing.
+                require("apps/filemanager/filemanagerbookinfo"):new{ ui = {} }:show(book.filepath)
+            end
+        end)
     end }
 
     -- Favourite toggle keys off the default collection (Collections membership
@@ -9751,33 +9987,37 @@ function BookshelfWidget:_buildBookEditTab(book, modal, avail_w, avail_h)
 
     local delete_btn = { text = "\xE2\x9C\x95 " .. _("Delete"), callback = function()  -- ✕
         closeModal()
-        local FileManager = require("apps/filemanager/filemanager")
-        if FileManager.instance and FileManager.instance.showDeleteFileDialog then
-            FileManager.instance:showDeleteFileDialog(book.filepath, function()
-                Repo.invalidateProgressCache(book.filepath)
-                Repo.invalidateWalkCache()
-                bw:_scrubFromDrilldown(book.filepath)
-                refreshShelf()
-            end)
-        else
-            UIManager:show(require("ui/widget/confirmbox"):new{
-                text    = _("Delete file permanently?") .. "\n\n" .. book.filepath,
-                ok_text = _("Delete"),
-                ok_callback = function()
-                    if os.remove(book.filepath) then
-                        require("readhistory"):fileDeleted(book.filepath)
-                        ReadCollection:removeItem(book.filepath)
-                        Repo.invalidateProgressCache(book.filepath)
-                        Repo.invalidateWalkCache()
-                        bw:_scrubFromDrilldown(book.filepath)
-                        refreshShelf()
-                    else
-                        UIManager:show(require("ui/widget/infomessage"):new{
-                            text = _("Failed to delete file."), icon = "notice-warning" })
-                    end
-                end,
-            })
+        local function afterDelete()
+            Repo.invalidateProgressCache(book.filepath)
+            Repo.invalidateWalkCache()
+            bw:_scrubFromDrilldown(book.filepath)
+            refreshShelf()
         end
+        -- Delete goes through the FileManager's own delete dialog (sidecar +
+        -- history + collections cleanup). That needs a live FM, so finish the
+        -- park first when a reader is parked -- same rule as Show info. The
+        -- confirmbox below is a defensive last resort only (no FM at all).
+        require("lib/bookshelf_reader_park").runInFileManager(function(fm)
+            fm = fm or require("apps/filemanager/filemanager").instance
+            if fm and fm.showDeleteFileDialog then
+                fm:showDeleteFileDialog(book.filepath, afterDelete)
+            else
+                UIManager:show(require("ui/widget/confirmbox"):new{
+                    text    = _("Delete file permanently?") .. "\n\n" .. book.filepath,
+                    ok_text = _("Delete"),
+                    ok_callback = function()
+                        if os.remove(book.filepath) then
+                            require("readhistory"):fileDeleted(book.filepath)
+                            ReadCollection:removeItem(book.filepath)
+                            afterDelete()
+                        else
+                            UIManager:show(require("ui/widget/infomessage"):new{
+                                text = _("Failed to delete file."), icon = "notice-warning" })
+                        end
+                    end,
+                })
+            end
+        end)
     end }
 
     local refresh_btn = { text = _("Refresh metadata"), callback = function()
@@ -12977,6 +13217,45 @@ end
 -- gesture.
 function BookshelfWidget:_openStartMenu(force)
     if not force and self:_startMenuPosition() == "off" then return end
+    -- Hot parking: a reader is still alive under the shelf, so the start menu's
+    -- captured menu-action shortcuts would resolve against the READER menu --
+    -- confusing on the home screen. Finish the park to the file manager first
+    -- (the same move the koreader-menu gesture makes via Park.finishToMenu),
+    -- then re-open against the live FM. runInFileManager real-closes the book
+    -- and re-instantiates the FM; that blocks briefly on sidecar/DocCache work,
+    -- so show the standard "Closing book…" affordance and defer a tick so it
+    -- paints first. The re-open targets BookshelfWidget.live because the finish
+    -- re-shows a fresh shelf widget; it is no longer parked, so it opens
+    -- normally against the FileManager.
+    local Park = require("lib/bookshelf_reader_park")
+    if Park.isParked() then
+        local msg
+        if BookshelfSettings.nilOrTrue("show_close_msg") then
+            local ok_im, InfoMessage = pcall(require, "ui/widget/infomessage")
+            if ok_im and InfoMessage then
+                msg = InfoMessage:new{ text = _("Closing book…"), timeout = 0.0 }
+                UIManager:show(msg)
+                UIManager:setDirty(msg, function() return "partial", msg.dimen end)
+            end
+        end
+        UIManager:forceRePaint()
+        UIManager:nextTick(function()
+            Park.runInFileManager(function()
+                -- Close the message AND flush the shelf back over its region
+                -- before opening the menu: the start-menu open animation
+                -- snapshots the screen as its backdrop, so a still-present
+                -- "Closing book…" would be baked into that backdrop and show as
+                -- a fragment when the menu is later closed.
+                if msg then
+                    UIManager:close(msg)
+                    UIManager:forceRePaint()
+                end
+                local live = BookshelfWidget.live
+                if live then live:_openStartMenu(force) end
+            end)
+        end)
+        return
+    end
     local ok, StartMenu = pcall(require, "lib/bookshelf_start_menu")
     if not ok or not StartMenu then
         logger.warn("[bookshelf] start menu unavailable:", tostring(StartMenu))

@@ -224,11 +224,14 @@ local function _probe(rui)
     UIManager:scheduleIn(PROBE_EVERY_S, _pending_probe)
 end
 
--- park(plugin) -> bool
+-- park(plugin, widget) -> bool
 -- plugin is the reader-context Bookshelf plugin instance (plugin.ui is the
--- live ReaderUI). Returns false when parking does not apply, so the caller
--- can fall back to the full close path.
-function Park.park(plugin)
+-- live ReaderUI). widget is the canonical shelf widget (_live_widget) - the
+-- reader-host plugin's own self._widget is nil at park time (its show() has
+-- not run), so the orientation guard below must be handed the widget that
+-- actually carries _pre_read_rotation. Returns false when parking does not
+-- apply, so the caller can fall back to the full close path.
+function Park.park(plugin, widget)
     if not Park.enabled() then return false end
     local rui = plugin and plugin.ui
     if not (rui and rui.document) then return false end
@@ -239,7 +242,13 @@ function Park.park(plugin)
     -- parked layout), which left the shelf stuck sideways until the deferred
     -- real close (issue #266). Only instant reopen for a differently-oriented
     -- book is given up; same-orientation exits still park.
-    local pre = plugin._widget and plugin._widget._pre_read_rotation
+    --
+    -- Read the rotation from the canonical widget (passed in), falling back to
+    -- plugin._widget only for callers that still have it: the earlier fix read
+    -- plugin._widget directly, which is nil in the reader host, so the guard
+    -- silently no-opped and differently-oriented reads parked anyway.
+    local shelf = widget or (plugin and plugin._widget)
+    local pre = shelf and shelf._pre_read_rotation
     if pre ~= nil then
         local Screen = require("device").screen
         if Screen and Screen.getRotationMode and Screen:getRotationMode() ~= pre then
@@ -363,6 +372,35 @@ function Park.finishToMenu()
         pcall(function() fm.menu:onShowMenu() end)
     end
     return true
+end
+
+-- runInFileManager(action) -> bool
+-- Run an action that only works with a live FileManager -- Show info,
+-- Delete, any file-dialog operation whose module reaches for the FM's `ui`
+-- context. While a reader is parked there is NO FileManager (the shelf sits
+-- over a live reader, not over the FM), so those actions must first finish
+-- the park: exactly the finishToMenu move, generalised. The book real-closes
+-- behind the still-visible shelf, KOReader re-instantiates the FileManager
+-- underneath, then `action` runs with FileManager.instance now live. When
+-- not parked the FM is already the home screen, so the action runs straight
+-- away. Returns true iff a park finish was performed (informational; callers
+-- can ignore it).
+--
+-- Why this matters: a parked long-press action that instead built a bare
+-- helper (e.g. FileManagerBookInfo:new{}) crashes -- the helper's methods
+-- index self.ui, which only the real FM/Reader-hosted module carries.
+function Park.runInFileManager(action)
+    local finished = false
+    if Park.isParked() then
+        _finishCore("fm-action")
+        finished = true
+    end
+    if action then
+        local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+        local fm = ok_fm and FileManager and FileManager.instance or nil
+        pcall(action, fm)
+    end
+    return finished
 end
 
 -- closeShelfToFileManager(live_widget) -> bool

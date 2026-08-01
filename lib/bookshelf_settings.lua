@@ -2349,7 +2349,8 @@ end
 -- Performance levers, grouped under one "Performance tweaks" submenu so the
 -- Advanced menu stays scannable.
 function Settings:_performanceSubItems()
-    return {
+    local Screen = require("device").screen
+    local items = {
         {
             text = _("Instant book close (beta)"),
             help_text = _("Show Bookshelf immediately when leaving a "
@@ -2425,6 +2426,41 @@ function Settings:_performanceSubItems()
             end,
         },
     }
+
+    -- Colour-panel only: on Kaleido / colour e-ink, covers only pick up the
+    -- panel's colour waveform when the refresh carries the dither hint (#289).
+    -- On by default; exposed so testers can compare with/without. No effect on
+    -- B&W panels, so the row is hidden there to avoid clutter.
+    if Screen.isColorEnabled and Screen:isColorEnabled() then
+        items[#items + 1] = {
+            text = _("Colour panel dithering"),
+            help_text = _("Applies the colour-dither waveform when redrawing "
+                .. "book covers so they keep their full saturation on colour "
+                .. "e-ink panels. Turn it off to compare; with it off, covers "
+                .. "can look washed out until a full-screen refresh. Colour "
+                .. "panels only."),
+            checked_func = function()
+                return BookshelfSettings.nilOrTrue("color_panel_dithering")
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local on = BookshelfSettings.nilOrTrue("color_panel_dithering")
+                BookshelfSettings.save("color_panel_dithering", not on)
+                BookshelfSettings.flush()
+                -- Apply live so the comparison is immediate: recompute the flag,
+                -- rebuild, and repaint the shelf with an ordinary "ui" refresh
+                -- (which now carries the hint only when the tweak is on).
+                local bw = self._bw
+                if bw and bw._refreshDitherFlag then
+                    bw:_refreshDitherFlag()
+                    if bw._rebuild then bw:_rebuild() end
+                    UIManager:setDirty(bw, "ui")
+                end
+            end,
+        }
+    end
+
+    return items
 end
 
 function Settings:_advancedSubItems()
@@ -2952,24 +2988,28 @@ function Settings:_openLayoutEditor(touchmenu_instance)
     end
     local COLS_MIN, COLS_MAX = 2, 6
 
-    local function rebuild()
-        if bw and bw._rebuild then
-            bw:_rebuild()
-            UIManager:setDirty(bw, "ui")
-        end
+    -- Draft regrid: step the layout instantly by rescaling cached covers
+    -- (no fresh decodes); the widget's settle timer upgrades them to
+    -- correct-size covers ~300ms after the last tap (and Accept/Cancel force it
+    -- immediately).
+    local function draftRebuild()
+        if not (bw and bw._draftRebuild) then return end
+        bw:_draftRebuild()
+        UIManager:setDirty(bw, "ui")
+        bw:_scheduleCoverSettle()
     end
 
     local dialog
     local function nudgeCols(delta)
         local v = math.max(COLS_MIN, math.min(COLS_MAX, curCols() + delta))
         BookshelfSettings.save("bookshelf_columns", v)
-        rebuild()
+        draftRebuild()
         Focus.reinit(dialog)
     end
     local function nudgeRows(delta)
         local v = math.max(1, math.min(maxRows(), curRows() + delta))
         BookshelfSettings.save("bookshelf_rows", v)
-        rebuild()
+        draftRebuild()
         Focus.reinit(dialog)
     end
     local function restore(key, val)
@@ -2983,14 +3023,21 @@ function Settings:_openLayoutEditor(touchmenu_instance)
         UIManager:close(dialog)
         restoreMenu()
     end
+    -- Both exits force the full-quality covers immediately (cancelling the
+    -- pending settle timer) so the shelf revealed behind the closing dialog is
+    -- sharp, not the last draft frame. Cancel restores the original grid first.
+    local function settleNow()
+        if bw and bw._settleCoversNow then bw:_settleCoversNow() end
+    end
     local function cancel()
         restore("bookshelf_columns", original_columns)
         restore("bookshelf_rows", original_rows)
-        rebuild()
+        settleNow()
         close()
     end
     local function accept()
         BookshelfSettings.flush()
+        settleNow()
         close()
     end
 
@@ -3000,17 +3047,25 @@ function Settings:_openLayoutEditor(touchmenu_instance)
         width_factor = 0.6,
 
         buttons = {
+            -- +/- greyed out at the limits so a dead tap doesn't read as a
+            -- bug. Button:paintTo re-evaluates enabled_func on every paint, and
+            -- the dialog repaints after each nudge (that's what updates the
+            -- count label), so the enabled state tracks the value live.
             {
-                { text = "−", callback = function() nudgeCols(-1) end },
+                { text = "−", enabled_func = function() return curCols() > COLS_MIN end,
+                  callback = function() nudgeCols(-1) end },
                 { text_func = function() return _("Columns: ") .. curCols() end,
                   enabled = false },
-                { text = "+", callback = function() nudgeCols(1) end },
+                { text = "+", enabled_func = function() return curCols() < COLS_MAX end,
+                  callback = function() nudgeCols(1) end },
             },
             {
-                { text = "−", callback = function() nudgeRows(-1) end },
+                { text = "−", enabled_func = function() return curRows() > 1 end,
+                  callback = function() nudgeRows(-1) end },
                 { text_func = function() return _("Rows: ") .. curRows() end,
                   enabled = false },
-                { text = "+", callback = function() nudgeRows(1) end },
+                { text = "+", enabled_func = function() return curRows() < maxRows() end,
+                  callback = function() nudgeRows(1) end },
             },
             {
                 { text = _("Cancel"), callback = cancel },

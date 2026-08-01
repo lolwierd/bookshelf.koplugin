@@ -14,6 +14,31 @@ the trailing `.N` is the fork revision, reset whenever the upstream base changes
 
 _Nothing yet._
 
+## [3.10.9.1] - 2026-08-01
+
+Sync with upstream **v3.10.9** (upstream releases v3.10.3–v3.10.9).
+
+### Upstream changes pulled in
+- Faster book closing from file-browser gestures and the quick menu, with
+  canonical reader rotation restored when parking a book.
+- True-aspect folder and series stack covers, smoother stack-card corners, and
+  preserved shadows when opening selected covers.
+- More reliable parked-reader file-manager routing and teardown handling,
+  including the Exit KOReader path and current hero status on micro pages.
+- New colour-panel dithering controls and cover-refresh hints for Kaleido
+  devices, plus shelf-size limit feedback and pinch/zoom layout work.
+- Fixes for settings shortcuts, Kobo virtual-library thumbnails, and file polls
+  that could outlive the widget and wake the device.
+- Refreshed translations, including Hungarian and European Portuguese, and
+  translatable multi-author “and” / “et al.” joins.
+
+### Fork fixes retained
+- **Screensaver host fallback** for suspend while Bookshelf owns the home screen.
+- **`onRequestSuspend` handler** while Bookshelf is the topmost widget.
+- **Multiswipe sleep gesture** using reader-side suspend bindings.
+- **Updater fork URLs** so stable and developer updates remain on this fork.
+- Upstream’s lifecycle-tied `_restoring_from_reader` active-chip protection.
+
 ## [3.10.2.1] - 2026-07-12
 
 Sync with upstream **v3.10.2** (98 commits since v3.8.4, spanning upstream

@@ -74,6 +74,18 @@ package.loaded["lib/bookshelf_book_repository"] = {
 package.loaded["ui/widget/booklist"] = {
     setBookInfoCacheProperty = function() end,
 }
+-- Controllable screen rotation for the orientation guard (issue #266).
+-- park() resolves this lazily via require("device").screen only when a
+-- pre-read rotation is recorded, so it stays inert for the other tests.
+local screen_rotation = 0
+package.loaded["device"] = {
+    screen = {
+        getRotationMode = function() return screen_rotation end,
+        setRotationMode = function(_self, m) screen_rotation = m end,
+        getWidth  = function() return 100 end,
+        getHeight = function() return 100 end,
+    },
+}
 
 local Park = dofile("lib/bookshelf_reader_park.lua")
 
@@ -104,6 +116,7 @@ local function reset()
     closed_widgets = {}
     scheduled = {}
     hot_park_enabled = true
+    screen_rotation = 0
     ReaderUI.instance = nil
     Park.noteRealClose()
     Park.consumeClosingToFM() -- drain any leftover one-shot
@@ -157,6 +170,34 @@ t.test("successful park: chrome closed, shelf raised, state set", function()
     local seen = table.concat(repo_calls, ",")
     assert(seen:find("stats:/books/a%.epub"), "stats invalidation: " .. seen)
     assert(seen:find("readstate"), "read-state invalidation: " .. seen)
+end)
+
+-- Orientation guard (issue #266, reader-context regression): the pre-read rotation
+-- lives on the canonical shelf widget (_live_widget), NOT on the reader-host
+-- plugin's own self._widget (which is nil at park time - its show() has not
+-- run). park() takes the widget as an argument so it reads the right one.
+t.test("park declines when orientation changed (canonical widget arg)", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    ReaderUI.instance = rui
+    local plugin = makePlugin(rui) -- reader-host plugin, no _widget
+    local shelf = { _pre_read_rotation = 0 } -- shelf was portrait pre-read
+    screen_rotation = 1 -- book was read in landscape
+    assert(Park.park(plugin, shelf) == false,
+        "must decline to park so the normal close restores portrait")
+    assert(Park.isParked() == false)
+end)
+
+t.test("park still parks when orientation is unchanged", function()
+    reset()
+    local rui = makeRui("/books/a.epub")
+    ReaderUI.instance = rui
+    local plugin = makePlugin(rui)
+    local shelf = { _pre_read_rotation = 0 }
+    screen_rotation = 0 -- same orientation throughout
+    assert(Park.park(plugin, shelf) == true,
+        "same-orientation exits keep the instant-reopen park")
+    assert(Park.isParked() == true)
 end)
 
 t.test("deferred park work is skipped after a real close in the gap", function()
@@ -311,6 +352,49 @@ end)
 t.test("finishToMenu is a false no-op when not parked", function()
     reset()
     assert(Park.finishToMenu() == false)
+end)
+
+print("--- Park.runInFileManager ---")
+
+t.test("parked: finishes the park, then runs the action with the reborn FM", function()
+    reset()
+    local fake_fm = { bookinfo = {} }
+    package.loaded["apps/filemanager/filemanager"] = { instance = nil }
+    local rui = parkFixture()
+    -- showFileManager rebirths the FM: mirror that by setting the instance.
+    rui.showFileManager = function(_self, f)
+        rui.fm_file = f
+        package.loaded["apps/filemanager/filemanager"].instance = fake_fm
+    end
+    local got_fm
+    assert(Park.runInFileManager(function(fm) got_fm = fm end) == true)
+    assert(rui.close_calls == 1, "must real-close the parked book first")
+    assert(got_fm == fake_fm, "action must receive the reborn FileManager.instance")
+    assert(Park.isParked() == false)
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("not parked: no finish, action still runs with the current FM", function()
+    reset()
+    local fake_fm = { bookinfo = {} }
+    package.loaded["apps/filemanager/filemanager"] = { instance = fake_fm }
+    local got_fm, ran = nil, false
+    assert(Park.runInFileManager(function(fm) ran = true; got_fm = fm end) == false)
+    assert(ran, "action must run even when not parked")
+    assert(got_fm == fake_fm, "action gets the already-live FileManager.instance")
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("action errors are contained (pcall'd) and still finish the park", function()
+    reset()
+    package.loaded["apps/filemanager/filemanager"] = { instance = {} }
+    local rui = parkFixture()
+    rui.showFileManager = function() end
+    -- A throwing action must not propagate or leave the park half-finished.
+    assert(Park.runInFileManager(function() error("boom") end) == true)
+    assert(rui.close_calls == 1)
+    assert(Park.isParked() == false)
+    package.loaded["apps/filemanager/filemanager"] = nil
 end)
 
 print("--- Park.closeShelfToFileManager ---")

@@ -540,9 +540,17 @@ function Bookshelf:hideMenu(touchmenu_instance)
     if not touchmenu_instance then
         return function() end
     end
+    -- A real TouchMenu always sets show_parent to a paintable container (or
+    -- itself; see KOReader touchmenu.lua "self.show_parent = self.show_parent
+    -- or self"). A duck-typed shim -- e.g. bookshelf_menu_shortcut.replay's,
+    -- used when a menu-action shortcut is launched from the start menu -- has
+    -- neither show_parent nor menu_container. It is a plain table, not a
+    -- widget, so it must NOT be treated as the container: re-showing it would
+    -- push a table with no paintTo onto the UIManager stack and crash on the
+    -- next paint (#288). Only hide/re-show a real container; when there is
+    -- none, the restore closure below just refreshes the instance.
     local menu_container = touchmenu_instance.show_parent
         or touchmenu_instance.menu_container
-        or touchmenu_instance
     if menu_container and UIManager and UIManager.close then
         UIManager:close(menu_container)
     end
@@ -1033,7 +1041,9 @@ function Bookshelf:_raiseInPlace()
     -- Same type the create path uses (UIManager:show(self._widget, "ui")
     -- at line 454). (#35.)
     UIManager:setDirty(_live_widget, function()
-        return "ui", _live_widget.dimen
+        -- Carry the colour-dither hint (#289) so covers keep their saturation
+        -- on the warm reopen the same as on cold show; nil on B&W panels.
+        return "ui", _live_widget.dimen, _live_widget.dithered
     end)
     return true
 end
@@ -1063,7 +1073,9 @@ function Bookshelf:_safeShow()
     -- (book opened from the raw FileManager - #110 "return to where you
     -- came from").
     local Park = require("lib/bookshelf_reader_park")
-    if Park.park(self) then return end
+    -- Pass the canonical widget: the orientation guard reads _pre_read_rotation
+    -- off it, and the reader-host plugin's own self._widget is nil here.
+    if Park.park(self, _live_widget) then return end
     local file = self.ui.document.file
     -- Feedback: centered InfoMessage with scoped partial refresh so the
     -- show doesn't trigger a full-screen flash. Skip when:
@@ -1385,6 +1397,33 @@ function Bookshelf:onToggleBookshelf()
     else
         self:_safeShow()
     end
+    return true
+end
+
+-- KOReader's native "File browser" system action (dispatcher `filemanager` =
+-- event "Home") - fired from a bound gesture or the quick menu - lands here
+-- before ReaderUI:onHome (child modules handle events before the container).
+-- Route it through the same instant-close fast path as the reader top-menu
+-- "File browser" tab so those exits park the book instead of doing the full
+-- pre-v3.10 close/rebuild (Reddit: instant close only worked from the icon).
+--
+-- Gated exactly like that tab's callback: only in the reader with a live
+-- document (in the FileManager self.ui.document is nil, so "Home" = go to home
+-- dir passes through untouched), and only when the shelf is the home the book
+-- was opened from - a book opened from the raw FileManager (#110 "return to
+-- where you came from") is left to ReaderUI:onHome so it lands back on the
+-- FileManager, not the shelf. Returning true consumes the event; nil lets it
+-- fall through to the default handler.
+function Bookshelf:onHome()
+    if not (self.ui and self.ui.document) then return end
+    if not self:_isShowing() then return end
+    local Park = require("lib/bookshelf_reader_park")
+    -- Shelf visible with the reader parked underneath: "Home" means the real
+    -- file manager, not the shelf already on screen (tab-callback parity).
+    if Park.isParked() and Park.closeShelfToFileManager(_live_widget) then
+        return true
+    end
+    self:_safeShow()
     return true
 end
 
