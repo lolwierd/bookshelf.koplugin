@@ -39,27 +39,87 @@ local LEGACY_KEY  = "chips_disabled"
 -- visible in the Bookshelf chips menu so the user can opt them on when
 -- they're ready. Upgrading users keep whatever they had via migrate()
 -- below -- the enabled flags here only affect first-launch installs.
-function TabModel.DEFAULTS()
+function TabModel.BUILTINS()
     return {
+        -- HOME ships as a spine shelf, newest first, with ornaments on.
+        -- These are the maintainer's own settings, adopted as defaults for the
+        -- sake of the first launch: a grid of covers sorted by FILENAME is
+        -- what the shelf could do on day one, not what it is for. Newest-first
+        -- puts a book the reader recognises at the front, spines show what the
+        -- feature actually looks like, and Always guarantees a piece stands on
+        -- the shelf rather than leaving it to a roll a one-row shelf can lose
+        -- for ever (see bookshelf_ornaments' frequency stops).
+        --
+        -- Every one of these is a normal pin the reader can change; none of
+        -- them is a new kind of setting.
         { id = "all",       label = tr("Home"),       source = { kind = "all"       },
-          filter = {}, sort_priority = { { key = "filename",    reverse = false } }, enabled = true  },
+          filter = {}, sort_priority = { { key = "date_added",  reverse = true  } },
+          view_mode = "spines", ornament_frequency = 2,
+          spine_face_out = { favorites = true, reading = true, recent = 5 },
+          enabled = true  },
+        -- RECENT ships as a LIST. Same reasoning as Home's spines: a shelf of
+        -- books you are part-way through is about titles and progress, not
+        -- cover art you have already looked at, and the list is the view that
+        -- shows both. Row density is deliberately NOT pinned -- nil means the
+        -- natural, screen-adaptive height (see _listRows), and a fixed count
+        -- would read sparse on a larger panel.
         { id = "recent",    label = tr("Recent"),     source = { kind = "recent"    },
-          filter = {}, sort_priority = { { key = "last_opened", reverse = true  } }, enabled = true  },
+          filter = {}, sort_priority = { { key = "last_opened", reverse = true  } },
+          view_mode = "list", enabled = true  },
         { id = "latest",    label = tr("Latest"),     source = { kind = "latest"    },
           filter = {}, sort_priority = { { key = "date_added",  reverse = true  } }, enabled = false },
+        -- SERIES ships as collage cards, most recently read first and then in
+        -- series order within a group -- so the shelf opens on the series the
+        -- reader is actually in, rather than alphabetically at whatever starts
+        -- with A. Collage shows the member covers, which is the whole reason
+        -- to group by series.
         { id = "series",    label = tr("Series"),     source = { kind = "series"    },
-          filter = {}, sort_priority = { { key = "series_name", reverse = false } }, enabled = true  },
+          filter = {}, sort_priority = { { key = "last_opened",  reverse = true  },
+                                         { key = "series_index", reverse = false } },
+          group_display = "collage", enabled = true  },
         { id = "authors",   label = tr("Authors"),    source = { kind = "authors"   },
           filter = {}, sort_priority = { { key = "author_surname", reverse = false } }, enabled = false },
+        -- GENRES ships ON and Favourites OFF. Both are the maintainer's own
+        -- arrangement, adopted for the same reason as Home's spines and
+        -- Series' collage: a first launch should show what the shelf is for.
+        -- Genres is the one that demonstrates stacks, and a favourites shelf
+        -- is empty until the reader has starred something, so it opens on
+        -- nothing. Favourites is one long-press away for anyone who wants it.
         { id = "genres",    label = tr("Genres"),     source = { kind = "genres"    },
-          filter = {}, sort_priority = { { key = "book_count",  reverse = true  } }, enabled = false },
+          filter = {}, sort_priority = { { key = "book_count",  reverse = true  } },
+          group_display = "ribbon", enabled = true  },
         { id = "tags",      label = tr("Tags"),       source = { kind = "tags"      },
           filter = {}, sort_priority = { { key = "book_count",  reverse = true  } }, enabled = false },
         { id = "languages", label = tr("Languages"),  source = { kind = "languages" },
           filter = {}, sort_priority = { { key = "book_count",  reverse = true  } }, enabled = false },
-        { id = "favorites", label = tr("Favourites"), source = { kind = "favorites" },
-          filter = {}, sort_priority = { { key = "date_added",  reverse = true  } }, enabled = true  },
+        { id = "favorites", label = tr("Favorites"), source = { kind = "favorites" },
+          filter = {}, sort_priority = { { key = "date_added",  reverse = true  } }, enabled = false },
     }
+end
+
+-- DEFAULTS(): what a FRESH INSTALL actually ships -- the built-ins that are
+-- ON, and nothing else.
+--
+-- It used to ship all nine, five of them switched off, on the reasoning that
+-- a reader could just tick the one they wanted. In practice that fills the
+-- shelf editor with rows nobody asked for and pushes the help line and
+-- "+ Add new shelf" off the bottom, so the two things a new reader needs to
+-- see are the two they cannot (maintainer, on a PW5, after deleting the
+-- disabled ones by hand).
+--
+-- Nothing is lost by leaving them out: every one of these sources is offered
+-- by the source picker when adding a shelf, so Authors or Favorites is the
+-- same two taps it always was.
+--
+-- migrate() deliberately still reads BUILTINS, not this: a v1 reader had ALL
+-- of them enabled, and rebuilding their list from the shipped subset would
+-- delete five shelves they were using.
+function TabModel.DEFAULTS()
+    local out = {}
+    for _i, t in ipairs(TabModel.BUILTINS()) do
+        if t.enabled ~= false then out[#out + 1] = t end
+    end
+    return out
 end
 
 -- migrate(): if the legacy disabled-set exists, apply it to a fresh defaults
@@ -75,7 +135,10 @@ end
 local function migrate()
     local legacy = BookshelfSettings.read(LEGACY_KEY)
     if type(legacy) ~= "table" then return nil end
-    local tabs = TabModel.DEFAULTS()
+    -- BUILTINS, not DEFAULTS: v1 shipped every chip enabled, so an upgrader
+    -- must get the full set back with their disabled-flags applied. Rebuilding
+    -- from the fresh-install subset would quietly delete five shelves.
+    local tabs = TabModel.BUILTINS()
     for _i, t in ipairs(tabs) do
         if legacy[t.id] then
             t.enabled = false
@@ -104,6 +167,18 @@ end
 function TabModel.save(tabs)
     BookshelfSettings.save(STORAGE_KEY, tabs)
     BookshelfSettings.flush()
+end
+
+-- saveDeferred(tabs): the same write with no flush, for a hot path.
+--
+-- One caller: the pinch, which writes a row count onto the chip it is aimed at
+-- and must not stop for a settings flush -- hundreds of milliseconds on Kindle
+-- flash, landing between the gesture and the repaint. The in-memory value
+-- updates immediately, so the rebuild that follows sees the new count;
+-- durability rides the shared nav-flush debounce and every close / suspend /
+-- onFlushSettings boundary, exactly as the column nudge does.
+function TabModel.saveDeferred(tabs)
+    BookshelfSettings.saveDeferred(STORAGE_KEY, tabs)
 end
 
 -- insertAfter(tabs, anchor_id, new_tab): splice `new_tab` into `tabs`

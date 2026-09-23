@@ -40,15 +40,9 @@ local logger          = require("logger")
 local Screen          = Device.screen
 local _               = require("lib/bookshelf_i18n").gettext
 
--- Wall-clock timer for perf instrumentation, matching bookshelf_widget.lua's
--- own [bookshelf perf] convention.
-local _gettime
-do
-    local ok, s = pcall(require, "socket")
-    _gettime = (ok and s and type(s.gettime) == "function")
-        and function() return s.gettime() end
-        or  os.clock
-end
+-- Shared wall-clock for [bookshelf perf] timestamps (and elapsed-time
+-- bookkeeping); see lib/bookshelf_gettime.lua for the fallback contract.
+local _gettime = require("lib/bookshelf_gettime")
 
 -- FrameContainer that pixel-inverts its own rect after painting (selected
 -- chips). Renders black-on-white then flips via a blitbuffer primitive so the
@@ -92,7 +86,32 @@ local TAB_FONT_KEYS = {
 -- label row, set via Settings > Text size > Modal tabs -- unlike the
 -- per-tab content sizes above.
 local TAB_LABEL_FONT_KEY     = "modal_tab_font_scale"
-local TAB_LABEL_FONT_BASE    = 13
+-- 20: the midpoint, arrived at by trying both ends on a real device.
+--
+-- The size was applied TWICE for a long time (Font:getFace scales its
+-- argument, and it was handed a pre-scaled one), so what every reader
+-- actually saw was 13 x scale x scale. On a 1236px short edge that is 56px,
+-- and 56px is what "my tabs were fine before" refers to. Simply removing the
+-- double scaling would have halved it.
+--
+-- The size was applied TWICE for years (Font:getFace scales its argument, and
+-- it was handed a pre-scaled one), so readers saw 13 x scale x scale: 56px on
+-- a 1236px short edge. Removing the double scaling alone left 27, which read
+-- as too small; restoring the old 56 then read as too large. 20 is the middle
+-- of those two, measured on the device rather than reasoned about.
+--
+--     short edge / override      was     now
+--     600, none                   13      20
+--     1236 (PW5)                  56      42
+--     1404                        73      47
+--     1236 + 400dpi override      69      46
+--
+-- The point of the change is the SHAPE, not the number: growth is linear in
+-- the screen scale instead of squared, which is why other readers' tabs
+-- looked worse the bigger their device or the higher their DPI override. The
+-- reader-facing "Modal tabs" scale still multiplies this, so the number is a
+-- starting point rather than a verdict.
+local TAB_LABEL_FONT_BASE    = 20
 
 -- Nerd Font zoom glyphs for the font-size buttons, rendered via KOReader's
 -- built-in "symbols" face (the bundled Nerd Font symbols font).
@@ -117,6 +136,10 @@ local REVIEW_CSS = [[
     body   { margin: 0; padding: 0; font-family: sans-serif; }
     h1     { font-size: 1.8em; margin: 0 0 0.15em 0; padding: 0; }
     p      { margin: 0 0 0.7em 0; text-align: left; }
+    /* A paragraph that contains line breaks arrives as div.p: HtmlBoxWidget's
+       <br> workaround injects a <div> that would CLOSE a real <p> and give
+       the first break a paragraph margin (issue #338). Same rhythm as p. */
+    div.p  { margin: 0 0 0.7em 0; text-align: left; }
     .stars   { font-family: "nerdstars"; font-size: 1.15em; }
     p.stars  { margin: 0.5em 0 0.05em 0; }
     p.rating { margin: 0 0 0.5em 0; }
@@ -151,7 +174,14 @@ function TabBar:init()
     self.pad_v      = Screen:scaleBySize(6)
     self.border     = Size.border.thin         -- segmented-control frame + separators
     self.sep_w      = Size.border.thin
-    self.face       = Font:getFace("cfont", Screen:scaleBySize(self.font_size or 13))
+    -- UNSCALED. Font:getFace runs Screen:scaleBySize over its size argument
+    -- itself, so a pre-scaled one is scaled twice -- and the error grows with
+    -- the panel, because that scale is a function of the screen's short edge.
+    -- At 600px it is 1 and nothing looks wrong; on a 1236x1648 panel it is
+    -- about 2, which put these labels at 56px beside a UI using 31
+    -- (maintainer: "our tabs are huge apparently by default", from several
+    -- screenshots -- it was every larger screen, not one device).
+    self.face       = Font:getFace("cfont", self.font_size or 13)
 
     -- Pack tabs into rows that fit self.width, wrapping when the next tab would
     -- overflow (so a narrow screen / high DPI keeps every tab reachable instead
@@ -342,6 +372,7 @@ local ReviewsModal = FocusManager:extend{
 }
 
 function ReviewsModal:init()
+    local _perf_init_t0 = _gettime()
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     -- Near-fullscreen with the standard screen-edge inset (matches TextViewer).
     self.width  = self.width  or (screen_w - Screen:scaleBySize(30))
@@ -411,18 +442,51 @@ function ReviewsModal:init()
     -- _assemble (mirrors the long-press menu's _reinitDialog); here we build one
     -- only to measure its height for the body budget.
     local header_h = 0
+    local _perf_header_t0 = _gettime()
     if self.header_builder then
         local probe = self:_buildHeader()
         header_h = probe and probe:getSize().h or 0
     end
+    local _perf_header_ms = (_gettime() - _perf_header_t0) * 1000
 
-    -- Footer row: Close | (Refresh) | zoom - | zoom + | Open. Close on the left,
-    -- Open on the right; the zoom controls sit between.
+    -- Footer row: (Open) | (Refresh) | zoom - | zoom + | Close.
+    --
+    -- CLOSE HOLDS THE BOTTOM-RIGHT CORNER (issue 338 #2), a straight swap of
+    -- the original Close-left/Open-right row. The reporter's case, verified
+    -- against KOReader source: ImageViewer, the book-cover viewer and the
+    -- description viewer all put Close at the bottom-RIGHT, and a reader
+    -- trained by those kept opening the book when they meant to close this
+    -- popup. Open takes the slot Close vacated -- the corner belongs to
+    -- Close whether or not a caller wires Open at all.
     local button_row = {}
-    button_row[#button_row + 1] = {
-        text = _("Close"),
-        callback = function() self:onClose() end,
-    }
+    -- Open the book. Only when a caller wired on_open. The popup stays ON
+    -- SCREEN through the document load - closing it first exposed the shelf
+    -- for the whole load gap (a visible flash). Feedback is painted straight
+    -- to the framebuffer (the load blocks the UI loop): the Open button
+    -- inverts and the header cover flexes open. onClose runs AFTER the open
+    -- kicks off; by then ShowingReader has armed the shelf's transition
+    -- paint suppression, so the close repaints nothing and the framebuffer
+    -- keeps showing the popup until the reader's first paint replaces it.
+    if self.on_open then
+        button_row[#button_row + 1] = {
+            text = _("Open"),
+            id   = "open",
+            callback = function()
+                local cb = self.on_open
+                if not cb then return end
+                pcall(function() self:_paintOpenFeedback() end)
+                -- The spine tap that opened this popup is still recorded as
+                -- SpineWidget.last_tapped for the SAME book - the shelf-side
+                -- opening effect would capture POPUP pixels at the covered
+                -- spine's rect and paint corruption. Clear the rendezvous.
+                pcall(function()
+                    require("lib/bookshelf_spine_widget").last_tapped = nil
+                end)
+                cb()
+                self:onClose()
+            end,
+        }
+    end
     -- Refresh only when a caller supplied on_refresh (unused by the book-detail
     -- popup; reviews load cache-first). Kept for any other caller.
     if self.on_refresh then
@@ -458,34 +522,10 @@ function ReviewsModal:init()
         callback = function() self:_changeFontSize(DESC_FONT_STEP) end,
         hold_callback = resetFontSize,
     }
-    -- Open the book. Only when a caller wired on_open. The popup stays ON
-    -- SCREEN through the document load - closing it first exposed the shelf
-    -- for the whole load gap (a visible flash). Feedback is painted straight
-    -- to the framebuffer (the load blocks the UI loop): the Open button
-    -- inverts and the header cover flexes open. onClose runs AFTER the open
-    -- kicks off; by then ShowingReader has armed the shelf's transition
-    -- paint suppression, so the close repaints nothing and the framebuffer
-    -- keeps showing the popup until the reader's first paint replaces it.
-    if self.on_open then
-        button_row[#button_row + 1] = {
-            text = _("Open"),
-            id   = "open",
-            callback = function()
-                local cb = self.on_open
-                if not cb then return end
-                pcall(function() self:_paintOpenFeedback() end)
-                -- The spine tap that opened this popup is still recorded as
-                -- SpineWidget.last_tapped for the SAME book - the shelf-side
-                -- opening effect would capture POPUP pixels at the covered
-                -- spine's rect and paint corruption. Clear the rendezvous.
-                pcall(function()
-                    require("lib/bookshelf_spine_widget").last_tapped = nil
-                end)
-                cb()
-                self:onClose()
-            end,
-        }
-    end
+    button_row[#button_row + 1] = {
+        text = _("Close"),
+        callback = function() self:onClose() end,
+    }
     -- Keep the row spec; the footer ButtonTable is rebuilt FRESH each _assemble
     -- (merging its layout into the modal's nils it, so a reused one would lose
     -- its focus layout after the first tab switch).
@@ -529,7 +569,19 @@ function ReviewsModal:init()
     -- without rebuilding the @font-face rule.
     self._css = css
 
-    self.scroll_html = ScrollHtmlWidget:new{
+    -- Deferred, NOT built here. Constructing the scroll widget runs
+    -- HtmlBoxWidget:setContent, i.e. a full MuPDF parse + layout of the
+    -- description -- measured at 70ms on a PW5. A long press opens the Edit
+    -- tab, which never shows it, and a book with both an embedded and a
+    -- Hardcover description uses per-source bodies instead, so the widget was
+    -- built, held and freed without ever being painted.
+    --
+    -- _activeBody builds it on first use. Every other reader is already
+    -- nil-guarded (_renderHtml, _isRetainedBody, onCloseWidget), and
+    -- _switchTab's _renderHtml call runs BEFORE _activeBody, so on the first
+    -- switch to an HTML tab it simply no-ops and _activeBody then creates the
+    -- widget with that tab's content.
+    self._scroller_opts = {
         html_body         = self:_activeHtml(),
         css               = css,
         default_font_size = Screen:scaleBySize(self.font_size),
@@ -563,6 +615,15 @@ function ReviewsModal:init()
     self._screen_w         = screen_w
     self._screen_h         = screen_h
     self:_assemble()
+    -- init is where the long-press wait actually lives, and it was
+    -- uninstrumented: _assemble's own line reports buildHeader~0 because the
+    -- header was already built and cached by the height probe above, and the
+    -- scroller is built between the two. So _assemble TOTAL is a floor, not
+    -- the wait.
+    logger.dbg(string.format(
+        "[bookshelf perf] ReviewsModal:init: header=%.0fms TOTAL=%.0fms tab=%s",
+        _perf_header_ms or 0,
+        (_gettime() - _perf_init_t0) * 1000, tostring(self._active_tab)))
 end
 
 -- Same root cause as BookshelfWidget's own handleEvent: UIManager:sendEvent
@@ -673,6 +734,31 @@ end
 -- order (`.focus_tables`, e.g. the Edit tab's several ButtonTables plus its
 -- one-off star/button rows) -- or nil for HTML / pills with no dpad support.
 -- HTML tabs reuse the single scroll_html.
+--- Build the shared HTML scroll widget, on first use. See init for why this
+--- is not done there: it is a MuPDF parse + layout that the Edit tab never
+--- shows. Refreshes html_body at build time so it picks up the tab that is
+--- actually being shown, not whatever was active during init.
+function ReviewsModal:_makeScrollHtml()
+    local o = self._scroller_opts
+    if not o then return nil end
+    o.html_body = self:_activeHtml()
+    -- ...and the size to render it AT. _scroller_opts was captured in init,
+    -- when the size belonged to whichever tab opened first -- which on the
+    -- long-press route into this popup is the EDIT tab, not the description
+    -- (issue #363). Refreshing only html_body built the description's scroller
+    -- at the Edit tab's size: the store held the right number, _switchTab had
+    -- already loaded it into self.font_size, and the text still came out at the
+    -- other tab's size, because nothing had told the scroller. Invisible
+    -- whenever the two sizes happen to match, which is why it took a reporter
+    -- with edit=18 and description=26 to surface it.
+    o.default_font_size = Screen:scaleBySize(self.font_size)
+    local _t = _gettime()
+    local w = self:_scroller(o)
+    logger.dbg(string.format("[bookshelf perf] ReviewsModal: scroller built lazily in %.0fms",
+        (_gettime() - _t) * 1000))
+    return w
+end
+
 function ReviewsModal:_activeBody()
     local tab = self._tabs and self._tabs[self._active_tab]
     if tab and tab.widget_builder then
@@ -686,6 +772,7 @@ function ReviewsModal:_activeBody()
         -- tab for cropping (the scroller manages its own painting).
         return self:_buildSourcedBody(tab, self.width, self._body_h), false, nil
     end
+    self.scroll_html = self.scroll_html or self:_makeScrollHtml()
     return self.scroll_html, false, nil
 end
 
@@ -701,8 +788,9 @@ function ReviewsModal:_buildSourceChips(tab)
     -- Match the main bookshelf nav chip bar exactly: a logical 16pt label scaled
     -- by the user's chip-font setting. NOT Screen:scaleBySize (the font layer
     -- scales that again) -- keeps these source chips smaller than the tab bar.
-    local _chip_scale = Store.read("chip_font_scale") or 100
-    local size    = math.floor(16 * _chip_scale / 100 + 0.5)
+    -- Through BandMetrics on CHIP_KEY, the one place that derivation lives.
+    local BandMetrics = require("lib/bookshelf_band_metrics")
+    local size    = BandMetrics.fontSize(BandMetrics.CHIP_KEY)
 
     -- Build the label widgets first (uppercased, UTF-8-aware so accented
     -- letters fold correctly -- issue #130) to find a uniform cell height.
@@ -790,7 +878,7 @@ function ReviewsModal:_isRetainedBody(w)
     return false
 end
 
--- Chip bar + an HTML scroller sized to the remaining body height. CACHED per
+-- Shelf menu + an HTML scroller sized to the remaining body height. CACHED per
 -- source (Embedded / Hardcover): switching the chip or tabbing back reuses the
 -- already-rendered body instead of allocating a fresh MuPDF render each time.
 -- The cache is keyed by source index and invalidated when the font size changes
@@ -825,7 +913,7 @@ function ReviewsModal:_buildSourcedBody(tab, w, h)
     -- own header+hairline gap (lib/bookshelf_widget.lua's _buildReviewsTab).
     -- (A later rule overrides just padding-top from the shared `body { padding }`.)
     local css = self._css .. string.format("\nbody { padding-top: %dpx; }", Screen:scaleBySize(8))
-    local scroller = ScrollHtmlWidget:new{
+    local scroller = self:_scroller{
         html_body         = (src and src.html) or "<p></p>",
         css               = css,
         default_font_size = Screen:scaleBySize(self.font_size),
@@ -1181,6 +1269,32 @@ end
 -- multiswipe would otherwise fire its action instead of closing (issue #171
 -- regression). KOReader's own fullscreen widgets close on any multiswipe
 -- regardless of gesture config; match that.
+-- _scroller(opts) -> a ScrollHtmlWidget that YIELDS an unusable swipe-down.
+--
+-- The stock widget's onScrollText claims every south swipe, even on page 1
+-- where scrollText(-1) does nothing -- so a swipe-down over the body was
+-- swallowed whether or not there was anything to scroll, and the modal never
+-- saw it. Overridden per instance rather than subclassed: it is one branch,
+-- and the modal is the only caller that wants it.
+--
+-- Only SOUTH, and only AT THE TOP. Mid-document, a swipe-down scrolls back up
+-- exactly as before -- "I'd need to detect if the area has any vertical
+-- scroll available first before passing to a close action". North swipes are
+-- untouched: an at-the-end no-op close would fire while someone is reading
+-- the last page, which is the wrong surprise.
+function ReviewsModal:_scroller(opts)
+    local w = ScrollHtmlWidget:new(opts)
+    local orig = w.onScrollText
+    w.onScrollText = function(w_self, arg, ges)
+        if ges and ges.direction == "south"
+                and w_self.htmlbox_widget.page_number <= 1 then
+            return false   -- nothing above: let the modal's swipe-down close
+        end
+        return orig(w_self, arg, ges)
+    end
+    return w
+end
+
 function ReviewsModal:onMultiSwipe(_arg, _ges)
     self:onClose()
     return true
@@ -1216,7 +1330,18 @@ function ReviewsModal:onSwipe(_arg, ges)
             end
         end
     end
+    -- A reserved-zone swipe (e.g. right-edge brightness) keeps its job first.
     if self:_tryPassthrough(ges) then return true end
+    -- Swipe-down dismisses, matching every stock KOReader popup (issue 338
+    -- #1). A south swipe only reaches here when no child claimed it: over the
+    -- header, the tab chips or the footer always, and over the body exactly
+    -- when the scroller had nothing above the fold to scroll back to -- see
+    -- _scroller. Mid-document, the body consumes it as a scroll, so a reader
+    -- paging back up never falls out of the popup.
+    if dir == "south" then
+        self:onClose()
+        return true
+    end
     return false
 end
 

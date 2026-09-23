@@ -5,6 +5,11 @@
 
 local _ok = pcall(require, "lib/bookshelf_i18n")  -- soft: tests stub-load without it
 local i18n = package.loaded["lib/bookshelf_i18n"]
+-- A require that FAILED under LuaJIT (which is what KOReader runs) leaves a
+-- sentinel value -- a garbage number, not nil -- in package.loaded. Reading it
+-- as a module then crashes tr() on its first call, which is the opposite of the
+-- soft degrade intended above.
+if type(i18n) ~= "table" then i18n = nil end
 local function tr(s) if i18n and i18n.gettext then return i18n.gettext(s) end; return s end
 
 local ok, AuthorName = pcall(require, "lib/bookshelf_author_name")
@@ -178,6 +183,66 @@ local function effective_percent(b)
     return b.percent_finished or b._pct
 end
 
+-- Exported because a surface that SHOWS a reading percentage has to show the
+-- number this sort orders by. Rendering 99% next to a "finished" book the sort
+-- has already promoted to the top of the page is its own bug, and a second
+-- copy of the rule elsewhere is how that would happen. A caller normalises its
+-- record onto the two field names read above before calling in.
+SortEngine.effectivePercent = effective_percent
+
+-- The author a GROUP sorts under, taken from its MEMBERS.
+--
+-- A series stack carries its books but no author of its own, so the fallback
+-- chain below used to reach b.series_name -- the SERIES TITLE -- and hand it
+-- to surnameSortKey, which duly parsed the last word of the title as a
+-- person's surname. "Sort by author surname" on a series shelf therefore
+-- ordered by the last word of each series name (issue #351).
+--
+-- The MODAL author, not the first. A series with a guest collaborator on one
+-- volume should still sort under whoever wrote the rest, and taking books[1]
+-- would make the answer depend on the order the members happen to be in.
+-- First-seen wins a tie, so the result is stable rather than pairs()-dependent.
+--
+-- Author cards do NOT take this path: a member's `author` field is the
+-- book's FIRST author, so on a co-authored book the modal member author is
+-- the wrong person for every card but the first author's (the second
+-- author's card sorted under the first author's surname, right beside it).
+-- Author shapes therefore carry the card's own name as `author`, which the
+-- fallback chain prefers over this function. Genre and collection cards
+-- change from "the genre name parsed as a surname" to "the modal author of
+-- its books", which is a different arbitrary answer to a question that has
+-- no meaningful one; neither orders genres usefully.
+local function groupAuthor(b)
+    -- BOTH member field names. A live group carries `books`; the SERIES shape
+    -- that is cached and handed to the comparator carries `books_meta`, which
+    -- is a different rebuild of the same list. Reading only `books` meant this
+    -- returned nil for exactly the shelf the issue was about.
+    local books = b.books or b.books_meta
+    if type(books) ~= "table" or #books == 0 then return nil end
+    local counts, order = {}, {}
+    for i = 1, #books do
+        local m = books[i]
+        -- One field per member, in the same preference order the record-level
+        -- chain uses, so a library that carries author_sort everywhere does not
+        -- split one author across two spellings of the same name.
+        local a = type(m) == "table"
+                  and (m.author_sort or m.author or m.authors) or nil
+        if type(a) == "string" and a ~= "" then
+            if counts[a] == nil then
+                counts[a] = 0
+                order[#order + 1] = a
+            end
+            counts[a] = counts[a] + 1
+        end
+    end
+    local best, best_n = nil, 0
+    for i = 1, #order do
+        local a = order[i]
+        if counts[a] > best_n then best, best_n = a, counts[a] end
+    end
+    return best
+end
+
 -- Memoized surname / given lookup. Caches on the record so a sort over
 -- 3000 books does 3000 parses, not ~35000 (one per comparison pair).
 --
@@ -195,8 +260,11 @@ end
 --                                 author_sort covers, but it's all we
 --                                 have for non-Calibre libraries.
 --   3. b.author_surname        -- pre-parsed surname (rarely set)
---   4. b.series_name           -- group shape (Authors / Genres tab)
---   5. b.name                  -- lfs entry (Home folder cards, where the
+--   4. groupAuthor(b)          -- a GROUP's modal member author. Above
+--                                 series_name because a series stack's name
+--                                 is a TITLE, not a person (issue #351).
+--   5. b.series_name           -- group shape (Authors / Genres tab)
+--   6. b.name                  -- lfs entry (Home folder cards, where the
 --                                 folder name IS the author identifier)
 --
 -- Parent-folder name is NOT a fallback for book files: the flat library
@@ -218,6 +286,7 @@ local function cachedSurname(b)
         end
     end
     local raw = b.author or b.authors or b.author_surname
+             or groupAuthor(b)
              or b.series_name or b.name or ""
     if type(raw) ~= "string" then raw = "" end
     -- surnameSortKey strips leading particles ("de Maupassant" sorts
@@ -242,6 +311,7 @@ local function cachedGiven(b)
     ensureEpoch(b)
     if b._given_cache ~= nil then return b._given_cache end
     local raw = b.author or b.authors or b.author_name
+             or groupAuthor(b)
              or b.series_name or b.name or ""
     if type(raw) ~= "string" then raw = "" end
     local s = AuthorName and AuthorName.givenOf(raw) or raw
@@ -258,11 +328,43 @@ end
 -- Safe to cache on the record: hydration (including Hardcover
 -- applyMetadata's title/series overrides) finishes before any sort runs,
 -- and records are rebuilt whenever metadata changes.
+-- Prefer calibre's curated title_sort over the raw title, exactly as
+-- cachedSurname prefers author_sort over a derived surname. If calibre wrote
+-- one, the reader has already said how this book should file, and with
+-- calibre's own language-aware rules rather than our guess (issue 401).
+--
+-- Failing that, drop a leading English article. The author key's fallback is a
+-- heuristic too -- it parses a surname out of a name -- so this is the same
+-- bargain: curated data when there is some, a sensible guess when there is
+-- not, and ONE ordering either way. Without it a mixed library files "Locked
+-- Tomb, The" under L and "The Locked Tomb" under T on the same shelf, which is
+-- worse than either rule alone.
+--
+-- Three articles, whole word, leading only, never when the article is the
+-- whole title. Neutral rather than helpful for other languages -- "Der Herr
+-- der Ringe" files under D either way -- so it costs them nothing.
+local ARTICLES = { ["the"] = true, ["a"] = true, ["an"] = true }
+
+-- Never when the article is the whole string: stripping that leaves an empty
+-- key, an empty key is a missing one, and a missing one sinks to the end of
+-- the shelf. Lifted out of cachedTitleKey when the series key needed the same
+-- rule (issue 412) -- two copies of a heuristic drift.
+local function stripLeadingArticle(v)
+    if type(v) ~= "string" or v == "" then return v end
+    local first, rest = v:match("^(%a+)%s+(.+)$")
+    if first and ARTICLES[first:lower()] then return rest end
+    return v
+end
+
 local function cachedTitleKey(b)
     ensureEpoch(b)
     local v = b._title_key_cache
     if v == nil then
-        v = b.title or (b.doc_props and b.doc_props.display_title) or b.name
+        v = b.title_sort
+        if v == nil or v == "" then
+            v = stripLeadingArticle(
+                b.title or (b.doc_props and b.doc_props.display_title) or b.name)
+        end
         v = (v ~= nil and v ~= "") and pinyinise(tostring(v):lower()) or false
         b._title_key_cache = v
     end
@@ -296,6 +398,43 @@ local function cachedSeriesKey(b)
     local v = b._series_key_cache
     if v == nil then
         v = b.series_name or b.series
+        -- A STANDALONE shape in a mixed group list has neither, and with no key
+        -- cmp's isMissing sends it to the end -- so a Series source showing
+        -- "standalone and books in series", sorted by Name (which on a group
+        -- chip IS the series_name key), came out partitioned: every series
+        -- group first, every loose book after, each run alphabetical
+        -- (issue 400). The standalone shape already carries title and filename
+        -- for exactly this reason; its own comment says they are there "so
+        -- _groupShapeCmp interleaves the mixed list for free".
+        --
+        -- Scoped to shapes flagged `standalone` so real Book records are
+        -- untouched. The author / library / genre / folder_flat chains sort
+        -- author_surname then series_name, and there a seriesless book belongs
+        -- AFTER that author's series runs rather than interleaved among them.
+        --
+        -- Mirror of the filename key's own fallback above (issue 235), which
+        -- repaired the same partitioning the other way round.
+        if (v == nil or v == "") and b.standalone then
+            v = b.title or b.filename
+        end
+        -- ISSUE 412. "books and series that start with the, a, an, etc. sort
+        -- based on that vs. the second word in the title/name." The Title key
+        -- has ignored a leading article since 120960a; a Series shelf sorts on
+        -- THIS key, so it had to learn the same rule.
+        --
+        -- Not by offering Title on that shelf, which is what the reporter
+        -- asked for: a series GROUP shape carries no title at all, so that key
+        -- would return nothing for every group and send the lot to the end of
+        -- the shelf -- issue 400 in reverse. One strip here instead reaches
+        -- all three shapes a Series shelf can hold: the group, the loose book
+        -- through the standalone fallback above, and the one-book series shown
+        -- as a card, which has a series_name and no title.
+        --
+        -- Calibre offers nothing to prefer here the way title_sort is
+        -- preferred for a book. It has no stored series sort field: it runs
+        -- its own title-sort algorithm over the series name when asked and
+        -- never persists the result, so the heuristic is all there is.
+        v = stripLeadingArticle(v)
         v = (v ~= nil and v ~= "") and pinyinise(tostring(v):lower()) or false
         b._series_key_cache = v
     end
@@ -315,26 +454,34 @@ end
 function SortEngine.sortKeyValue(item, key)
     if not item then return nil end
     refreshPinyinFlag()
+    -- THROUGH THE COMPARATORS' OWN MEMOS, never a second derivation of the
+    -- same idea. This function re-read item.title / item.series_name itself,
+    -- and so missed every refinement the keys gained afterwards: calibre's
+    -- title_sort (120960a), the leading-article strip (120960a, and 412 for
+    -- series), the standalone fallback (400) and the filepath-derived
+    -- filename (235). The visible order used those and the letter jump did
+    -- not, so a shelf sorted by title filed "The Locked Tomb" under L while
+    -- the jump looked for it under T.
     local v
     if key == "author_surname" then
         v = cachedSurname(item)
     elseif key == "author_name" then
         v = cachedGiven(item)
     elseif key == "title" then
-        v = item.title or (item.doc_props and item.doc_props.display_title) or item.name
+        v = cachedTitleKey(item)
     elseif key == "filename" then
-        v = item.filename or item.file or item.name or item.series_name
+        v = cachedFilenameKey(item)
     elseif key == "series_name" or key == "series_combined" then
-        v = item.series_name or item.series
+        v = cachedSeriesKey(item)
     end
-    if type(v) ~= "string" or v == "" then
-        v = item.title or (item.doc_props and item.doc_props.display_title)
-            or item.name or item.filename or item.file or item.series_name
-        if type(v) ~= "string" or v == "" then return nil end
-    end
-    -- cachedSurname/cachedGiven already pinyinised; raw derivations here
-    -- (title/filename/series + the title-ish fallback) get the same
-    -- treatment so a letter jump lands where the visible sort placed it.
+    -- Every branch above hands back a key its memo has already lowercased and
+    -- pinyinised, so it is returned untouched.
+    if type(v) == "string" and v ~= "" then return v end
+    -- Keys with no string identity (dates, progress, counts) land here, and
+    -- so does a record the branch above found nothing for.
+    v = item.title or (item.doc_props and item.doc_props.display_title)
+        or item.name or item.filename or item.file or item.series_name
+    if type(v) ~= "string" or v == "" then return nil end
     return pinyinise(v:lower())
 end
 
@@ -449,6 +596,24 @@ SortEngine.KEYS = {
                         comparator = function(a, b)
                             return cmp(a.page_count or a.total_pages,
                                        b.page_count or b.total_pages)
+                        end },
+    -- Book record: a.collection_order (the `order` KOReader stores per item in
+    -- a collection; the repository's collection source copies it onto the
+    -- record). Meaningful only on a collection source -- everywhere else every
+    -- book is missing it, which cmp ties, so the level costs nothing and the
+    -- next one decides.
+    --
+    -- KOReader writes `order` only for a MANUALLY collated collection (see
+    -- ReadCollection:writeCollection); one carrying a collate of its own saves
+    -- nil for every item, and then this key ties across the board by the same
+    -- route. That is the intended behaviour, not a gap: it is what lets the
+    -- default pair this key with a real second level.
+    -- short repeats the label rather than a bare "Order": on its own in a
+    -- catalogue that msgid could be an instruction, a sequence or a purchase,
+    -- and "Name" already meant three different things here once.
+    collection_order = { label = tr("Collection order"), short = tr("Collection order"),
+                        comparator = function(a, b)
+                            return cmp(a.collection_order, b.collection_order)
                         end },
 }
 

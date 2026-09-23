@@ -53,6 +53,48 @@ local HeroModules = {}
 -- panel. Falls back to white where blitbuffer is unavailable (test runner).
 local HERO_CARD_BG = Modules.CARD_BG or Blitbuffer.COLOR_WHITE
 
+-- _moduleCardBg() -> the card fill, from the palette, falling back to what it
+-- was before the setting existed.
+--
+-- SOLID, always. A semi-transparent card was tried and reverted: the widgets
+-- inside a module blit opaque white buffers of their own, so over a tint every
+-- line of text showed as a white box. A card cannot be less opaque than its
+-- own contents, which is why the knob is a COLOUR and not an alpha.
+--
+-- Read per card rather than cached at load: the value follows the day/night
+-- key, and a grid outlives a mode change without being rebuilt from here.
+local function _moduleCardBg()
+    local ok, CoverProgress = pcall(require, "lib/bookshelf_cover_progress")
+    if not (ok and CoverProgress and CoverProgress.resolvedColors) then
+        return HERO_CARD_BG
+    end
+    local ok_c, colors = pcall(CoverProgress.resolvedColors)
+    if ok_c and colors and colors.module_bg then return colors.module_bg end
+    return HERO_CARD_BG
+end
+
+-- _cardBorderInk() -> the hairline's colour.
+--
+-- FrameContainer defaults its border to BLACK, and on the light card that is
+-- exactly right: a black hairline on 0xEE. Device night mode inverts the whole
+-- frame and the same hairline arrives white, which is the look this is copying.
+-- The shelf's OWN dark theme inverts nothing, so the border stayed black on a
+-- near-black card and every edge disappeared -- the cards read as vague
+-- lighter patches instead of objects, which is why true night mode looked
+-- better than the theme meant to imitate it (maintainer).
+--
+-- COLOR_PRIMARY rather than a computed grey: on the light theme it IS black,
+-- so this reproduces the old look exactly rather than approximating it.
+--
+-- The attribute is `color`. FrameContainer spells its border colour that way
+-- ("color = Blitbuffer.COLOR_BLACK, -- border color"), and the obvious guess,
+-- bordercolor, is simply an unread field on the table -- no error, no warning,
+-- the border just stays black.
+local function _cardBorderInk()
+    if type(Modules.COLOR_PRIMARY) ~= "nil" then return Modules.COLOR_PRIMARY end
+    return Blitbuffer.COLOR_BLACK
+end
+
 -- Full rebuild + repaint after a module tap or edit. Does NOT bump the module
 -- generation: that counter keys the per-open caches several modules share
 -- (quote_of_day, shelf_size, …), so bumping it here would re-roll the quote
@@ -154,10 +196,15 @@ function HeroModules._ctx(bw, refresh, entry)
     return ctx
 end
 
-function HeroModules._tap(bw, entry, refresh)
+-- tapped_region: the id of the module-declared tap region the gesture landed
+-- in (see Kit.hitRegion), or nil for whole-cell activation - D-pad select,
+-- taps outside every region, and modules that declare none all pass nil, so
+-- on_tap must treat nil as the ordinary whole-card tap.
+function HeroModules._tap(bw, entry, refresh, tapped_region)
     local def = Modules.get(entry.module)
     if not def or type(def.on_tap) ~= "function" then return end
     local ctx = HeroModules._ctx(bw, refresh, entry)
+    ctx.tapped_region = tapped_region
     local keep = def.keep_open
     if type(keep) == "function" then
         local ok, r = pcall(keep, ctx)
@@ -219,10 +266,19 @@ local function _renderFitted(def, inner_w, inner_h, base_scale, refresh, entry, 
     local cfg   = Kit.entryConfig(entry, nil)
 
     local function renderAt(s, clamp)
+        -- Tap regions this render declares (ctx.set_tap_regions, optional):
+        -- rects in the returned widget's own coordinate space. Attached to the
+        -- widget itself so whichever render survives the fit/grow/clamp dance
+        -- carries ITS OWN regions - the cell reads widget._tap_regions at tap
+        -- time and the host does all screen-coordinate translation.
+        local pending_regions
         local ctx = {
             width = inner_w, height = inner_h, scale = s, preview = false,
             refresh = refresh, shape = shape, entry = entry,
             surface = _build_surface, bw = bw, menu = nil, config = cfg,
+            set_tap_regions = function(r)
+                pending_regions = type(r) == "table" and r or nil
+            end,
             -- clamp (last-resort fit, #249): set only after the shrink loop
             -- bottomed out at the legibility floor with the content still
             -- overflowing. A module that can, should truncate its expendable
@@ -233,6 +289,7 @@ local function _renderFitted(def, inner_w, inner_h, base_scale, refresh, entry, 
         }
         local ok, widget = pcall(def.render, ctx)
         if not ok or not widget then return nil end
+        if pending_regions then widget._tap_regions = pending_regions end
         local sz = widget.getSize and widget:getSize()
         return widget, (sz and sz.h) or 0, (sz and sz.w) or 0
     end
@@ -322,7 +379,20 @@ local function _renderFitted(def, inner_w, inner_h, base_scale, refresh, entry, 
             -- Carry the clamp through so an upsized quote card still keeps
             -- its attribution (overflow from the multiplier is deliberate,
             -- but the module should keep choosing WHAT overflows).
-            local rw = renderAt(adj, result_clamped)
+            local rw, rh = renderAt(adj, result_clamped)
+            -- The multiplier can overflow the cell on its own even when the
+            -- auto-fit stage above never needed to clamp (issue #249: this is
+            -- what let a >100% hero-module scale blow straight past the fit
+            -- with no ellipsis protection at all, unlike the 100% path).
+            -- Re-check at the FINAL size instead of only inheriting whatever
+            -- the pre-multiplier stage decided.
+            if rw and rh and rh > inner_h and not result_clamped then
+                local cw = renderAt(adj, true)
+                if cw then
+                    if rw.free then pcall(function() rw:free() end) end
+                    rw = cw
+                end
+            end
             if rw then
                 if result.free then pcall(function() result:free() end) end
                 result = rw
@@ -470,22 +540,43 @@ function HeroModules._makeCell(bw, entry, cell_w, cell_h, scale_pct, focusable, 
         }
     end
 
+    -- ClipContainer (not CenterContainer): the parent renders the module
+    -- into a bounded offscreen buffer so its draw can't escape the cell,
+    -- however oversized it is. bg matches the card so the centred child's
+    -- margin blends in. Held in a local so the tap handler below can
+    -- translate a screen tap into module-local coordinates (clip.dimen +
+    -- the recorded child centring offsets).
+    -- Modules.CARD_BG, not a fresh resolve: build() set it from
+    -- _moduleCardBg() before any cell was made, and reading it back is both
+    -- cheaper (one table lookup against a pcall + a palette walk, per cell)
+    -- and stricter -- the card cannot end up a different colour from the text
+    -- drawn on it, which is the pairing the whole setting exists to keep.
+    local card_bg = Modules.CARD_BG or _moduleCardBg()
+    local clip = ClipContainer:new{
+        w = inner_w,
+        h = inner_h,
+        bg = card_bg,
+        content,
+    }
+    -- Hairline, where this used to be borderless. It costs nothing on a plain
+    -- page and it keeps a card's edge readable when its fill happens to match
+    -- what is behind it -- a wallpaper, or another card.
+    --
+    -- Taken OUT OF THE PADDING, not added to it. FrameContainer:getSize()
+    -- counts border + padding + margin, so a border added on top widens every
+    -- cell by 2*border and the row overflows content_w by 2*border per card --
+    -- which reads as the grid having less air on the right than on the left,
+    -- because the row is left-aligned and the overflow all lands at the far
+    -- end. Eating the padding keeps the outer dimen at cell_w/cell_h exactly.
+    local card_border = Screen:scaleBySize(1)
     local frame = FrameContainer:new{
-        background = HERO_CARD_BG,
-        bordersize = 0,
-        radius     = radius,
-        padding    = card_pad,
-        margin     = press_b, -- empty ring at rest; becomes the pressed border
-        -- ClipContainer (not CenterContainer): the parent renders the module
-        -- into a bounded offscreen buffer so its draw can't escape the cell,
-        -- however oversized it is. bg matches the card so the centred child's
-        -- margin blends in.
-        ClipContainer:new{
-            w = inner_w,
-            h = inner_h,
-            bg = HERO_CARD_BG,
-            content,
-        },
+        background  = card_bg,
+        bordersize  = card_border,
+        color       = _cardBorderInk(),
+        radius      = radius,
+        padding     = math.max(0, card_pad - card_border),
+        margin      = press_b, -- empty ring at rest; becomes the pressed border
+        clip,
     }
     -- Wrap in a focus ring when navigable: border when focused, equal margin at
     -- rest, so the outer dimen stays cell_w/cell_h either way (the swap the chips
@@ -494,11 +585,12 @@ function HeroModules._makeCell(bw, entry, cell_w, cell_h, scale_pct, focusable, 
     local outer = frame
     if focus_b > 0 then
         outer = FrameContainer:new{
-            background = nil,
-            bordersize = focused and focus_b or 0,
-            margin     = focused and 0 or focus_b,
-            radius     = radius,
-            padding    = 0,
+            background  = nil,
+            bordersize  = focused and focus_b or 0,
+            color       = _cardBorderInk(),
+            margin      = focused and 0 or focus_b,
+            radius      = radius,
+            padding     = 0,
             frame,
         }
     end
@@ -509,7 +601,7 @@ function HeroModules._makeCell(bw, entry, cell_w, cell_h, scale_pct, focusable, 
             Hold = { GestureRange:new{ ges = "hold", range = cell.dimen } },
         }
     end
-    function cell:onTap()
+    function cell:onTap(_a, ges)
         -- Action cards (press_b > 0) get instant pressed-border feedback before
         -- the action runs (mirrors the chip flash): swap margin->border (outer
         -- size unchanged), repaint just this cell with the fast waveform, drain
@@ -521,10 +613,27 @@ function HeroModules._makeCell(bw, entry, cell_w, cell_h, scale_pct, focusable, 
             frame.margin = 0
             UIManager:setDirty(bw, function() return "fast", self.dimen end)
             UIManager:forceRePaint()
-            frame.bordersize = 0
+            -- card_border, NOT zero. Zero was right when this was written,
+            -- because the card was borderless then; the hairline above was
+            -- added afterwards and this reset was not updated with it, so the
+            -- first tap ate the outline and only a panel rebuild put it back
+            -- (issue 429). Nothing errors -- it is a valid number, just the
+            -- wrong one.
+            frame.bordersize = card_border
             frame.margin = press_b
         end
-        HeroModules._tap(bw, entry, refresh)
+        -- Resolve the tap against the module's declared regions (if any):
+        -- module-local = screen minus the clip's painted origin minus the
+        -- centring offset it recorded at paint. The clip has always painted
+        -- by the time a tap can land, so dimen/_child_dx are populated.
+        local region_id
+        if ges and ges.pos and content and content._tap_regions and clip.dimen then
+            local Kit = require("lib/bookshelf_module_kit")
+            region_id = Kit.hitRegion(content._tap_regions,
+                ges.pos.x - clip.dimen.x - (clip._child_dx or 0),
+                ges.pos.y - clip.dimen.y - (clip._child_dy or 0))
+        end
+        HeroModules._tap(bw, entry, refresh, region_id)
         return true
     end
     function cell:onHold() HeroModules._hold(bw, entry); return true end
@@ -539,11 +648,12 @@ function HeroModules._emptyState(bw, content_w, hero_h)
     local inner_w  = math.max(1, content_w - 2 * (border + card_pad))
     local inner_h  = math.max(1, hero_h   - 2 * (border + card_pad))
     local frame = FrameContainer:new{
-        background = HERO_CARD_BG,
-        bordersize = border,
-        radius     = radius,
-        padding    = card_pad,
-        margin     = 0,
+        background  = _moduleCardBg(),
+        bordersize  = border,
+        color       = _cardBorderInk(),
+        radius      = radius,
+        padding     = card_pad,
+        margin      = 0,
         CenterContainer:new{
             dimen = Geom:new{ w = inner_w, h = inner_h },
             TextWidget:new{
@@ -615,10 +725,52 @@ function HeroModules._gotoPage(bw, delta)
     end
 end
 
+--- Minimum width a flex cell needs before it will share a row.
+---
+--- twoColMinWidth() is scaleBySize(300), which scales with the screen -- and so
+--- does the hero -- so it lands at ~53% of content_w at EVERY size measured
+--- (412 of 776 at 824px wide, 618 of 1162 at 1236px). Two flex cells therefore
+--- never fit, and the two-column path this constant is named for was
+--- unreachable for them at the default size: every flex module got a full-width
+--- row of its own, however little content it had (issue #359).
+---
+--- Capped at half the row so two can pair. Three still cannot, because 3 * half
+--- exceeds content_w by construction -- so this admits a second column without
+--- ever cramming a third, which is what the 300dp floor was protecting against.
+function HeroModules._flexMinWidth(content_w, gap)
+    local floor_w = require("lib/bookshelf_module_kit").twoColMinWidth()
+    local half = math.floor(((content_w or 0) - (gap or 0)) / 2)
+    if half < 1 then return floor_w end
+    return math.min(floor_w, half)
+end
+
 -- Build the hero micro-module grid sized to content_w × hero_h.
 function HeroModules.build(bw, content_w, hero_h, PAD, opts)
     opts = opts or {}
     _build_surface = opts.surface or "hero"
+    -- Point the whole module system at the card colour BEFORE anything
+    -- renders: the modules read it at render time, and the text they draw
+    -- paints it as its own background. See Modules.setCardBg.
+    if Modules.setCardBg then Modules.setCardBg(_moduleCardBg()) end
+    -- ...and the ink that has to read on it. A card colour without a matching
+    -- ink is half a theme: the cards went dark and their text stayed black
+    -- (maintainer).
+    if Modules.setInk then
+        local ok_cp, CP = pcall(require, "lib/bookshelf_cover_progress")
+        local ink, muted
+        if ok_cp and CP and CP.ink then ink = CP.ink() end
+        if ink then
+            local ok_l, lum = pcall(function() return ink:getColor8().a end)
+            if ok_l and type(lum) == "number" then
+                -- A third of the way from the ink toward the card, which is
+                -- what the light theme's 0x55 is between black and 0xEE.
+                local card = (lum > 128) and 0x11 or 0xEE
+                local m = math.floor(lum + (card - lum) / 3 + 0.5)
+                muted = Blitbuffer.Color8(m)
+            end
+        end
+        Modules.setInk(ink, muted)
+    end
     -- Arm the light-touch home-screen crash marker before building the grid
     -- (issue #163). If a module hard-crashes during the hero paint, the sentinel
     -- file survives and the next launch comes up with the cover hero instead of
@@ -692,7 +844,12 @@ function HeroModules.build(bw, content_w, hero_h, PAD, opts)
     -- screen, so a third module wraps to the next row instead of squeezing three
     -- narrow, overflowing cells onto one row (#180 follow-up). Seeds the row
     -- count in packAt; a square card's target width is the row height.
-    local min_flex_w = Screen:scaleBySize(300)
+    -- Shared with the start menu (Kit.shape's no-height path) so a card of a
+    -- given width lays out the same whichever surface it is on. Required
+    -- lazily here, like _renderFitted does, to keep the module-load cycle out
+    -- of this file's top-level requires.
+    -- See _flexMinWidth: capped at half the row so two flex cells can pair.
+    local min_flex_w = HeroModules._flexMinWidth(content_w, gap)
 
     local function isSquare(item)
         local def = Modules.get(item.module)

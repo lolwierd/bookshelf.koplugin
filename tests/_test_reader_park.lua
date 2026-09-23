@@ -120,6 +120,7 @@ local function reset()
     ReaderUI.instance = nil
     Park.noteRealClose()
     Park.consumeClosingToFM() -- drain any leftover one-shot
+    Park.clearExit()          -- and any latched exit-in-flight flag
 end
 
 print("--- Park.park ---")
@@ -432,6 +433,127 @@ t.test("closes the parked reader to the FileManager behind the shelf", function(
     end
     assert(shelf_closed, "shelf widget must be dismissed after FM shows")
     assert(Park.consumeClosingToFM() == false, "one-shot must not leak")
+end)
+
+print("--- Park.ensureFileManager ---")
+
+t.test("no-op (false) when a FileManager already exists", function()
+    reset()
+    local called = false
+    package.loaded["apps/filemanager/filemanager"] = { instance = { menu = {} } }
+    local rui = makeRui("/books/a.epub")
+    rui.showFileManager = function() called = true end
+    assert(Park.ensureFileManager(rui, "/books/a.epub") == false)
+    assert(not called, "an existing FileManager must not be respawned")
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+-- The hostless shelf (#302): a close route that leaves no FileManager and no
+-- parked reader strands the shelf with nothing to forward gestures to, so the
+-- KOReader top menu goes dead until something spawns an FM.
+t.test("spawns the FileManager when there is none, passing the closed file", function()
+    reset()
+    local fake_fm = { menu = {} }
+    package.loaded["apps/filemanager/filemanager"] = { instance = nil }
+    local rui = makeRui("/books/a.epub")
+    local got_file
+    rui.showFileManager = function(_self, f)
+        got_file = f
+        package.loaded["apps/filemanager/filemanager"].instance = fake_fm
+    end
+    assert(Park.ensureFileManager(rui, "/books/a.epub") == true)
+    assert(got_file == "/books/a.epub", "the closed file locates the FM's folder")
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("false when the reader has no showFileManager", function()
+    reset()
+    package.loaded["apps/filemanager/filemanager"] = { instance = nil }
+    assert(Park.ensureFileManager(makeRui("/books/a.epub"), "/books/a.epub") == false)
+    assert(Park.ensureFileManager(nil, "/books/a.epub") == false)
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("false (contained) when showFileManager throws", function()
+    reset()
+    package.loaded["apps/filemanager/filemanager"] = { instance = nil }
+    local rui = makeRui("/books/a.epub")
+    rui.showFileManager = function() error("boom") end
+    assert(Park.ensureFileManager(rui, "/books/a.epub") == false,
+        "a failed spawn must report false, not raise")
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+t.test("false when showFileManager runs but no instance appears", function()
+    reset()
+    package.loaded["apps/filemanager/filemanager"] = { instance = nil }
+    local rui = makeRui("/books/a.epub")
+    rui.showFileManager = function() end -- silently does nothing
+    assert(Park.ensureFileManager(rui, "/books/a.epub") == false,
+        "the return value must reflect the FM actually existing")
+    package.loaded["apps/filemanager/filemanager"] = nil
+end)
+
+print("--- Park.noteExit / isExiting ---")
+
+t.test("not exiting by default", function()
+    reset()
+    assert(Park.isExiting() == false)
+end)
+
+t.test("noteExit latches, and the timed backstop clears it", function()
+    reset()
+    Park.noteExit()
+    assert(Park.isExiting() == true)
+    assert(#scheduled == 1, "noteExit must arm exactly one timed clear")
+    Park.noteExit() -- repeat calls must not stack more clears
+    assert(#scheduled == 1)
+    fireScheduled()
+    assert(Park.isExiting() == false,
+        "a cancelled or failed exit must not suppress the next book close")
+end)
+
+t.test("clearExit is idempotent", function()
+    reset()
+    Park.noteExit()
+    Park.clearExit()
+    Park.clearExit()
+    assert(Park.isExiting() == false)
+end)
+
+t.test("_raiseInPlace's deferred refreshfunc must not index the upvalue", function()
+    -- The Reddit crash (2026-08-22): setDirty's refreshfunc runs LATER, in
+    -- UIManager's repaint, and "Reset document settings" tears the shelf down
+    -- in between - the close callback nils the module upvalue _live_widget,
+    -- and a refreshfunc written against the upvalue indexes nil and takes
+    -- KOReader down. Pin that the closure captures a LOCAL widget instead.
+    local f = io.open("main.lua", "r")
+    assert(f, "cannot read main.lua")
+    local src = f:read("*a")
+    f:close()
+    local i = src:find("function Bookshelf:_raiseInPlace", 1, true)
+    assert(i, "_raiseInPlace went missing")
+    local j = src:find("\nend", i, true) or #src
+    local body = src:sub(i, j)
+    local fn = body:match("setDirty%([^,]+,%s*(function%(%).-end)%)")
+    assert(fn, "_raiseInPlace no longer queues a refreshfunc - update this pin")
+    assert(not fn:find("_live_widget", 1, true),
+        "the deferred refreshfunc must close over a local copy, "
+        .. "never the mutable _live_widget upvalue")
+end)
+
+t.test("idleSeconds: the clock starts on first use and counts from the last input", function()
+    -- A fresh instance: nothing has stamped it yet, so the first call must
+    -- start the clock rather than report idle since boot.
+    fake_now = 5000
+    local Fresh = dofile("lib/bookshelf_reader_park.lua")
+    assert(Fresh.idleSeconds() == 0, "first call baselines rather than reporting idle since boot")
+    fake_now = 5090
+    assert(Fresh.idleSeconds() == 90, "ninety seconds without input")
+    Fresh.noteInput()
+    assert(Fresh.idleSeconds() == 0, "an input resets it")
+    fake_now = 5150
+    assert(Fresh.idleSeconds() == 60)
 end)
 
 t.done()

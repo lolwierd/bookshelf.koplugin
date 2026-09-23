@@ -84,7 +84,9 @@ local ScaledCoverCache = {
     -- maps to memory, since per-entry size varies ~5x (shelf vs hero), ~4x
     -- (grayscale 1 B/px vs colour RGB32), and with DPI / layout. The user-
     -- facing setting is an MB budget that feeds _byte_budget (see the widget's
-    -- _applyCoverCacheBudget); 24 MiB is the default RAM allocation.
+    -- _applyCoverCacheBudget); with no setting, defaultBudgetMB below picks
+    -- 24 or 48 MiB from the device's memory. 24 MiB here is only the value
+    -- before the widget applies that.
     --
     -- _capacity is a non-user-facing entry-COUNT backstop, kept only to bound
     -- the O(n) _order scans in get/put and guard against a pathological
@@ -99,7 +101,81 @@ local ScaledCoverCache = {
     _hits     = 0,     -- perf: cache hits this session
     _puts     = 0,     -- perf: cache misses (scales) this session
     _evictions= 0,     -- perf: evictions this session
+    -- Bytes of bbs this cache has DROPPED ITS REFERENCE TO without freeing
+    -- (evictions, prefer-larger replacements, drop, clear). Those bbs are C
+    -- heap LuaJIT's GC cannot see -- it only sees a tiny cdata handle -- so
+    -- they sit unreclaimed until a full collect that nothing on the page-turn
+    -- path used to trigger. Rapid paging piled up tens of MB of them and
+    -- ground a PW5 into swap (60s stall, then the OOM killer). The widget
+    -- reads this after each turn and forces a collect past a threshold.
+    _orphan_bytes = 0,
+    -- Disk backing (see the block comment above _disk).
+    _disk_miss  = {},  -- filepath → true, books known not to be on disk
+    _disk_hits  = 0,   -- perf: covers served from disk this session
+    _disk_writes= 0,   -- perf: covers written to disk this session
 }
+
+-- Default RAM budget, by device memory ----------------------------------
+--
+-- 24 MB holds a 300 dpi greyscale shelf's whole working set (PW5, 2026-09-16:
+-- 211 covers resident, zero evictions since launch). Colour panels keep
+-- covers at four bytes a pixel, so the same budget holds about fifty and
+-- churns on a full shelf, re-decoding covers it has just evicted. Devices
+-- with a gigabyte or more have the headroom for twice that; 512 MB Kindles
+-- and Kobos keep 24. The user's own setting (cover_cache_mb) always wins;
+-- this only decides what "unset" means.
+ScaledCoverCache.DEFAULT_BUDGET_MB       = 24
+ScaledCoverCache.DEFAULT_BUDGET_MB_LARGE = 48
+ScaledCoverCache.LARGE_DEVICE_BYTES      = 1024 * 1024 * 1024
+
+-- defaultBudgetMB(total_bytes) -> MB. Pure. total_bytes as util.calcFreeMem
+-- reports it (bytes); anything unknown or odd stays conservative.
+function ScaledCoverCache.defaultBudgetMB(total_bytes)
+    if type(total_bytes) == "number"
+            and total_bytes >= ScaledCoverCache.LARGE_DEVICE_BYTES then
+        return ScaledCoverCache.DEFAULT_BUDGET_MB_LARGE
+    end
+    return ScaledCoverCache.DEFAULT_BUDGET_MB
+end
+
+-- deviceDefaultBudgetMB() -> MB for this device. KOReader's util.calcFreeMem
+-- reads /proc/meminfo and returns (available, total) in bytes, or nils off
+-- Linux; every failure reads as unknown.
+function ScaledCoverCache.deviceDefaultBudgetMB()
+    local total
+    local ok, util = pcall(require, "util")
+    if ok and type(util) == "table" and util.calcFreeMem then
+        local ok2, _avail, t = pcall(util.calcFreeMem)
+        if ok2 then total = t end
+    end
+    return ScaledCoverCache.defaultBudgetMB(total)
+end
+
+-- Disk backing -----------------------------------------------------------
+--
+-- The memory cache dies with the process, so every launch re-derived every
+-- visible cover: BIM hands back a zstd-compressed thumbnail, we decompress and
+-- scale it to the slot. On a PW5 that was ~900ms for one page of ~24 covers,
+-- about a quarter of a 3.5s cold start, paid again on every launch.
+--
+-- bookshelf_cover_disk_cache persists the RESULT of that work -- the scaled
+-- blitbuffer, raw -- so the next launch reads 101KB (2.9ms measured) instead
+-- of decompressing and rescaling (~37ms). Nothing new is stored: the covers
+-- themselves already live in BIM's database.
+--
+-- It hangs off this module rather than sitting beside it because every rule
+-- that keeps a scaled cover honest already lives here -- the filepath-only
+-- key, prefer-larger, drop() when BIM re-extracts, clear() from settings. The
+-- disk layer mirrors those and owns no invalidation logic of its own.
+local DiskCache = nil   -- nil = not tried, false = unavailable
+
+local function _disk()
+    if DiskCache == nil then
+        local ok, mod = pcall(require, "lib/bookshelf_cover_disk_cache")
+        DiskCache = (ok and mod) or false
+    end
+    return DiskCache or nil
+end
 
 -- setCapacity(n) — adjust the entry-COUNT backstop. Not user-facing: the RAM
 -- bound is _byte_budget (driven by the MB setting). Retained for completeness
@@ -152,12 +228,41 @@ function ScaledCoverCache:_evictIfNeeded()
         self._cache[key] = nil
         self._bytes = self._bytes - (self._sizes[key] or 0)
         if self._bytes < 0 then self._bytes = 0 end
+        self._orphan_bytes = self._orphan_bytes + (self._sizes[key] or 0)
         self._sizes[key] = nil
         self._evictions = self._evictions + 1
         if _PERF_LOG then logger.dbg(string.format(
             "[bookshelf perf] ScaledCoverCache: EVICT fp=%s size=%d/%d bytes=%d/%d",
             key, #self._order, self._capacity, self._bytes, self._byte_budget)) end
     end
+end
+
+-- _hydrate(filepath) — pull a cover in from disk if it is there and not
+-- already resident. Returns whether filepath is now in memory.
+--
+-- The negative set matters more than it looks: has() is called from a dozen
+-- places, most of them once per book per page, and without it every book that
+-- has never been scaled would cost a failed io.open on every probe. One failed
+-- open per book per session instead.
+--
+-- A book that misses, is scaled, and is then evicted will read as a miss for
+-- the rest of the session even though it is now on disk. That costs a re-scale
+-- we could have avoided; it is never wrong, only slower, and clearing the flag
+-- on write would trade a rare saved scale for a hot-path table write.
+function ScaledCoverCache:_hydrate(filepath)
+    if self._cache[filepath] ~= nil then return true end
+    if self._disk_miss[filepath] then return false end
+    local D = _disk()
+    if not D then return false end
+    local ok, bb = pcall(D.load, filepath)
+    if not ok or not bb then
+        self._disk_miss[filepath] = true
+        return false
+    end
+    self._disk_hits = self._disk_hits + 1
+    -- from_disk: installing it must not write it straight back out again.
+    self:put(filepath, bb, true)
+    return self._cache[filepath] ~= nil
 end
 
 -- get(filepath) — returns the cached bb (any dimensions) or nil. On
@@ -168,19 +273,31 @@ end
 function ScaledCoverCache:get(filepath)
     if not filepath or filepath == "" then return nil end
     local bb  = self._cache[filepath]
-    if not bb then return nil end
+    if not bb then
+        if not self:_hydrate(filepath) then return nil end
+        bb = self._cache[filepath]
+        if not bb then return nil end
+    end
     self._hits = self._hits + 1
     self:_removeKey(filepath)
     self._order[#self._order + 1] = filepath
     return bb
 end
 
--- has(filepath) — boolean probe. Doesn't touch MRU order or counters.
--- Used upstream of the BIM cover decode to skip the zstd decompress
--- when the cover is already cached (spine_widget will paint from cache).
+-- has(filepath) — is a cover ready to paint without decoding? Used upstream
+-- of the BIM cover decode to pass want_cover=false and skip the zstd
+-- decompress (spine_widget will paint from cache).
+--
+-- This reads the disk cache on a memory miss, which makes it no longer free.
+-- That is the point rather than a cost to be worked around: every caller uses
+-- a true answer to skip a decompress-and-rescale, so trading ~3ms of read for
+-- ~37ms of decode is the whole win. The callers all probe one PAGE of books,
+-- so this pulls in the covers that were about to be built anyway -- not the
+-- library. Doesn't touch MRU order or the hit counter on a memory hit.
 function ScaledCoverCache:has(filepath)
     if not filepath or filepath == "" then return false end
-    return self._cache[filepath] ~= nil
+    if self._cache[filepath] ~= nil then return true end
+    return self:_hydrate(filepath)
 end
 
 -- put(filepath, bb) — insert or upgrade. Returns the bb now serving as
@@ -200,7 +317,11 @@ end
 -- Callers should use the return value to decide what to paint with;
 -- this avoids a redundant get() round-trip and makes the discard case
 -- explicit at the call site.
-function ScaledCoverCache:put(filepath, bb)
+--
+-- from_disk is internal (see _hydrate) and means "this bb was just read from
+-- the disk cache". Callers never pass it. It suppresses the write-back that
+-- would otherwise rewrite the file we just read.
+function ScaledCoverCache:put(filepath, bb, from_disk)
     if not filepath or filepath == "" then return bb end
     local existing = self._cache[filepath]
     if existing == bb then
@@ -228,6 +349,7 @@ function ScaledCoverCache:put(filepath, bb)
         self:_removeKey(filepath)
         self._bytes = self._bytes - (self._sizes[filepath] or 0)
         if self._bytes < 0 then self._bytes = 0 end
+        self._orphan_bytes = self._orphan_bytes + (self._sizes[filepath] or 0)
         self._sizes[filepath] = nil
     end
     self._cache[filepath] = bb
@@ -243,6 +365,28 @@ function ScaledCoverCache:put(filepath, bb)
         (bb.getHeight and bb:getHeight() or 0),
         #self._order, self._capacity, self._bytes, self._byte_budget,
         self._hits, self._puts)) end
+    -- Write through. Only here, where the bb has actually become the entry:
+    -- the identity put and the prefer-larger reject both return above, so a
+    -- cover is written once when first scaled and again only when a larger
+    -- render (hero) upgrades it.
+    --
+    -- Synchronous, and a shelf cover is ~100KB. That is a few ms on top of the
+    -- decode-and-scale that just happened, paid once per cover ever, against
+    -- ~37ms saved on every later launch. Failures are ignored by design: a
+    -- full disk or a read-only data dir must cost nothing but the disk cache.
+    if not from_disk then
+        local D = _disk()
+        if D then
+            -- store() reports failure by RETURNING false, so the pcall
+            -- result alone would count a full disk as a successful write.
+            local ok, wrote = pcall(D.store, filepath, bb)
+            if ok and wrote then
+                self._disk_writes = self._disk_writes + 1
+                -- It is on disk now, so a later probe should find it.
+                self._disk_miss[filepath] = nil
+            end
+        end
+    end
     self:_evictIfNeeded()
     return bb
 end
@@ -254,20 +398,57 @@ end
 -- contract as put/clear: drops the reference, doesn't bb:free().
 function ScaledCoverCache:drop(filepath)
     if not filepath or filepath == "" then return end
+    -- Disk first, and BEFORE the not-resident early return below. Every caller
+    -- of drop() is saying "this book's source bytes changed"; on a fresh
+    -- launch nothing is resident yet, so returning early there would leave the
+    -- superseded cover on disk and repaint it on every launch from then on.
+    local D = _disk()
+    if D then
+        pcall(D.drop, filepath)
+        self._disk_miss[filepath] = true
+    end
+    -- The hero tier stashes hero-height copies of the same source bytes;
+    -- every drop() caller means "re-decode next time", so a stashed copy
+    -- would resurrect the old art. One funnel keeps the two in step.
+    pcall(function()
+        require("lib/bookshelf_hero_tier"):drop(filepath)
+    end)
     if self._cache[filepath] == nil then return end
     self._bytes = self._bytes - (self._sizes[filepath] or 0)
     if self._bytes < 0 then self._bytes = 0 end
+    self._orphan_bytes = self._orphan_bytes + (self._sizes[filepath] or 0)
     self._cache[filepath] = nil
     self._sizes[filepath] = nil
     self:_removeKey(filepath)
+end
+
+-- orphanBytes() -- bytes of bbs dropped-but-not-freed since the last
+-- resetOrphanBytes(). See the field comment: the widget's post-turn reclaim
+-- forces a full collect once this passes its threshold.
+function ScaledCoverCache:orphanBytes()
+    return self._orphan_bytes or 0
+end
+
+function ScaledCoverCache:resetOrphanBytes()
+    self._orphan_bytes = 0
 end
 
 -- clear — drop the cache's references. Same lifetime contract as put:
 -- we do NOT explicitly free; live widgets may still be holding bbs.
 -- LuaJIT will reclaim once every reference is gone.
 function ScaledCoverCache:clear()
-    logger.dbg(string.format("[bookshelf perf] ScaledCoverCache: clear hits=%d puts=%d evictions=%d",
-        self._hits, self._puts, self._evictions))
+    logger.dbg(string.format(
+        "[bookshelf perf] ScaledCoverCache: clear hits=%d puts=%d evictions=%d disk_hits=%d disk_writes=%d",
+        self._hits, self._puts, self._evictions, self._disk_hits, self._disk_writes))
+    -- Wipe the disk copies too. This is the user's "Clear cover cache"
+    -- action, whose whole purpose is to get rid of a cover that is wrong;
+    -- leaving the persisted copy would make the button do nothing visible on
+    -- the next launch.
+    local D = _disk()
+    if D then pcall(D.clear) end
+    -- Every resident bb is now dropped-but-not-freed; count it so the next
+    -- reclaim pass collects rather than waits.
+    self._orphan_bytes = (self._orphan_bytes or 0) + (self._bytes or 0)
     self._cache     = {}
     self._order     = {}
     self._sizes     = {}
@@ -275,6 +456,9 @@ function ScaledCoverCache:clear()
     self._hits      = 0
     self._puts      = 0
     self._evictions = 0
+    self._disk_miss = {}
+    self._disk_hits = 0
+    self._disk_writes = 0
 end
 
 return ScaledCoverCache

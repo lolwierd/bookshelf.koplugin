@@ -40,15 +40,9 @@ local logger            = require("logger")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local _                 = require("lib/bookshelf_i18n").gettext
 
--- Wall-clock timer, same idiom as main.lua so [bookshelf perf] lines share
--- a clock across modules. Also drives the input-idle bookkeeping.
-local _gettime
-do
-    local ok, s = pcall(require, "socket")
-    _gettime = (ok and s and type(s.gettime) == "function")
-        and function() return s.gettime() end
-        or  os.time
-end
+-- Shared wall-clock for [bookshelf perf] timestamps (and elapsed-time
+-- bookkeeping); see lib/bookshelf_gettime.lua for the fallback contract.
+local _gettime = require("lib/bookshelf_gettime")
 
 local Park = {}
 
@@ -158,6 +152,16 @@ end
 -- Exposed for tests and for any host that wants to stamp explicitly.
 function Park.noteInput()
     _last_input = _gettime()
+end
+
+-- idleSeconds() -> seconds since the last touch or key the stamp saw. Installs
+-- the stamp on first use and starts the clock then, so a shelf that has just
+-- come up counts as active rather than idle since boot. The file poll reads
+-- it to slow its cadence once the reader has walked away.
+function Park.idleSeconds()
+    _installInputStamp()
+    if _last_input == 0 then _last_input = _gettime() end
+    return _gettime() - _last_input
 end
 
 -- The core close sequence: really close the parked reader behind the
@@ -338,6 +342,12 @@ function Park.unpark(live_widget, after_open_callback)
         -- record must not survive into the next return (#103 parity with
         -- _launchReader).
         live_widget._hero_current_memo = nil
+        -- No ShowingReader broadcast on this route, so what main.lua's
+        -- onShowingReader does for a normal open happens here: the tree is
+        -- stale once the book is read again, and the dither hint comes off
+        -- while the reader is on top (softRefresh puts it back on return).
+        live_widget._tree_fresh = nil
+        live_widget.dithered = nil
         -- Same _launchReader parity: an unpark IS bookshelf opening the
         -- book, so the eventual close returns to the shelf.
         live_widget._opened_book = true
@@ -446,6 +456,72 @@ function Park.closeShelfToFileManager(live_widget)
         if msg then UIManager:close(msg) end
     end)
     return true
+end
+
+-- ─── Host lifecycle (not parking-specific) ───────────────────────────────────
+-- The two helpers below serve every close path, parked or not. They live here
+-- because this module already owns "who is underneath the shelf": the FM
+-- rebirth in _finishCore, runInFileManager, closeShelfToFileManager.
+
+-- ensureFileManager(rui, file) -> bool
+-- Guarantee a FileManager exists underneath the shelf, spawning one if not.
+--
+-- KOReader kills the FM when a book opens (readerui.lua showReader:
+-- FileManager.instance:onClose(), and filemanager.lua nils the instance), and
+-- only SOME close routes bring it back - the reader menu's "File browser" tab,
+-- our _safeShow, the park finish, all of which call showFileManager. A route
+-- that doesn't leaves the shelf with NO host: BookshelfWidget:handleEvent then
+-- has nowhere to forward the gestures it doesn't consume itself, so the
+-- KOReader top menu (whose touch zones belong to the FM), the brightness edge
+-- swipes and every user-configured Gestures zone go dead until something else
+-- spawns an FM. FM-dependent long-press actions (Show info, Delete) fall back
+-- to their degraded stubs at the same time. That was issue #302: nothing was
+-- frozen, the shelf simply had no host to hand the swipe to.
+--
+-- Returns true only when a FileManager was actually spawned by this call, so
+-- the caller knows it must splice the shelf back on top (showFileManager
+-- raises the fresh FM above it).
+function Park.ensureFileManager(rui, file)
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if not (ok_fm and FileManager) then return false end
+    if FileManager.instance then return false end
+    if not (rui and rui.showFileManager) then return false end
+    pcall(function() rui:showFileManager(file) end)
+    return FileManager.instance ~= nil
+end
+
+-- Exit/Restart in flight, and why the shelf must stand aside for it.
+--
+-- KOReader's main loop quits when the window stack empties, and on a
+-- reader-menu Exit it very nearly does: the Exit broadcast reaches
+-- DeviceListener:onExit -> ReaderMenu:exitOrRestart -> ui:onClose(), whose
+-- CloseWidget cascade reaches Bookshelf:onCloseWidget, which closes the shelf.
+-- The stack IS empty at that instant. But UIManager:handleInput runs
+-- _checkTasks() before its empty-stack check, so the nextTick(show) that
+-- onCloseDocument schedules for an ordinary book close fires first and
+-- resurrects the shelf - KOReader stays alive, "Exit" silently degrades to
+-- "close the book", and the user is left on a hostless shelf (#302; same
+-- family as #290's start-menu exit, fixed there in bookshelf_action_exec).
+--
+-- main.lua's onExit/onRestart latch this so onCloseDocument stands down and
+-- the stack drains. Timed clear because we latch on the broadcast, before the
+-- host actually tears down: an exit that never completes must not suppress the
+-- re-show on the next ordinary book close.
+local EXIT_FLAG_TTL_S = 5
+local _exiting = false
+
+function Park.clearExit()
+    _exiting = false
+end
+
+function Park.noteExit()
+    if _exiting then return end
+    _exiting = true
+    UIManager:scheduleIn(EXIT_FLAG_TTL_S, Park.clearExit)
+end
+
+function Park.isExiting()
+    return _exiting
 end
 
 return Park

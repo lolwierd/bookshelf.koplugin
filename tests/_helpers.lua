@@ -19,22 +19,51 @@ local M = {}
 --   t.test("name", function() assert(...) end)
 --   t.done()
 function M.runner()
-    local pass, fail = 0, 0
-    return {
+    local pass, fail, skip = 0, 0, 0
+    local skipped = {}
+    local t
+    t = {
         test = function(name, fn)
             local ok, err = pcall(fn)
             if ok then
                 pass = pass + 1
+            elseif type(err) == "table" and err.__skip then
+                pass = pass - 0        -- neither passed nor failed
+                skip = skip + 1
+                skipped[#skipped + 1] = name .. " (" .. tostring(err.why) .. ")"
             else
                 fail = fail + 1
                 io.stderr:write("FAIL  " .. name .. "\n  " .. tostring(err) .. "\n")
             end
         end,
+        -- A test that cannot run HERE, for a stated reason -- typically that
+        -- the KOReader tree it reads is not installed beside the checkout.
+        --
+        -- Twelve suites called this before it existed. It never bit on a dev
+        -- machine, because the skip branch is the one NOT taken when KOReader
+        -- is present; CI has no KOReader, took the branch, and died on
+        -- "attempt to call a nil value (field 'skip')" -- reported as a
+        -- failure, which is the opposite of what the caller meant.
+        --
+        -- Raises rather than returns: callers write `return t.skip(...)` from
+        -- inside the test body, and a plain return could not tell the runner
+        -- anything. The table marker keeps it clear of a real error(), which
+        -- is always a string here.
+        skip = function(why)
+            error({ __skip = true, why = why or "not applicable here" }, 0)
+        end,
         done = function()
-            io.stdout:write(("PASS %d  FAIL %d\n"):format(pass, fail))
+            if skip > 0 then
+                for _i = 1, #skipped do
+                    io.stdout:write("SKIP  " .. skipped[_i] .. "\n")
+                end
+            end
+            io.stdout:write(("PASS %d  FAIL %d%s\n"):format(
+                pass, fail, skip > 0 and ("  SKIP " .. skip) or ""))
             if fail > 0 then os.exit(1) end
         end,
     }
+    return t
 end
 
 -- Assert deep value/sequence equality (scalars + flat arrays); returns got so
@@ -148,6 +177,54 @@ function M.install_hardcover_cache_fake()
         kind  = function(kind) return store[kind] or {} end,
         clear = function() for k in pairs(store) do store[k] = nil end end,
     }
+end
+
+-- M.shelf_record(fp, extra) -- a record shaped like the ones the shelf
+-- actually renders.
+--
+-- Every row the shelf draws is a Repo.buildBookMeta record: BookInfoManager
+-- only, no DocSettings sidecar read (bookshelf_book_repository.lua:587-593),
+-- because that read is the dominant per-rebuild cost on libraries over 100
+-- books. On device that means these fields read nil on every book:
+--
+--   [diag] 'Salem's Lot | book_pct=nil percent_finished=nil _pct=nil
+--          status=nil read_status=nil _status=nil rating=nil page_count=nil
+--   [diag]     TRUTH  pct=0.0016 status=reading rating=nil pages=616
+--
+-- (offscreen at 1248x1648 over a real library, on the "all" chip, and the same
+-- under a rating / page_count / percent_read sort). The list-column suite
+-- passed anyway for five rounds, because every fixture in it carried fields
+-- the shelf does not supply.
+--
+-- Deliberately minimal: filepath, filename, format and title are all
+-- buildBookMeta reliably gives a row. ADDING A FIELD HERE TO MAKE A TEST PASS
+-- IS HOW THE GAP OPENED IN THE FIRST PLACE.
+--
+--   * `filename` is the basename with the EXTENSION STRIPPED, because that is
+--     what buildBookMeta stores (bookshelf_book_repository.lua:804,
+--     `:gsub("%.[^.]+$", "")`). An earlier fixture kept the extension, which
+--     is why a Format column that matched on `filename` looked fine in the
+--     suite and rendered a dash on every row of the device.
+--   * `format` is present for the same reason in reverse: buildBookMeta:823
+--     always sets it, and the column was never reading it.
+--   * NO `size`, `date_added` or `last_opened`: BIM stores no file size at
+--     all, and the fetchers that stamp the other two do it on the LIGHT
+--     candidate records they sort, which are discarded before the visible
+--     slice is rebuilt.
+--
+-- Lives here rather than in one suite because two now need it -- the column
+-- accessors and the token adapter -- and two copies of a fixture whose whole
+-- job is "do not quietly gain a field" is exactly how it would gain one.
+function M.shelf_record(fp, extra)
+    local base = fp:match("([^/]+)$") or fp
+    local b = {
+        filepath = fp,
+        filename = base:gsub("%.[^.]+$", ""),
+        format   = (base:match("%.(%w+)$") or ""):upper(),
+        title    = "T",
+    }
+    for k, v in pairs(extra or {}) do b[k] = v end
+    return b
 end
 
 return M

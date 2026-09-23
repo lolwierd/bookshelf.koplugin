@@ -44,8 +44,8 @@ the full table in `AGENTS.md`; the short list you must protect during a merge:
 | Screensaver host fallback | `main.lua` `_installScreensaverHostFallback` | `grep -c _installScreensaverHostFallback main.lua` ≥ 2 |
 | `onRequestSuspend` handler | `lib/bookshelf_widget.lua` | `grep -c onRequestSuspend lib/bookshelf_widget.lua` ≥ 2 |
 | Multiswipe sleep gesture | `lib/bookshelf_widget.lua` `handleEvent` | `grep -c multiswipe lib/bookshelf_widget.lua` ≥ 2 |
-| Updater → fork URLs | `lib/bookshelf_updater.lua` | `grep -c lolwierd lib/bookshelf_updater.lua` ≥ 1 |
-| `quote_of_day` FileManager nil-guard | `micromodules/quote_of_day.lua` | `grep -c FileManager micromodules/quote_of_day.lua` ≥ 2 |
+| Updater → fork URLs | `lib/bookshelf_updater.lua`, `lib/bookshelf_changelog.lua`, `tests/_test_updater.lua` | `grep -rn 'AndyHazz/bookshelf' lib main.lua tests` hits only `bookshelf_settings.lua` (About page credit) |
+| `quote_of_day` FileManager nil-guard | `micromodules/quote_of_day.lua` (upstream carries it now) | `grep -c FileManager micromodules/quote_of_day.lua` ≥ 2 |
 
 Some earlier fork fixes were **retired** because upstream solved the same problem
 better — do **not** reintroduce them (see §3.2).

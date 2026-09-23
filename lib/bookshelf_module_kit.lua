@@ -24,6 +24,94 @@ Kit.COLOR_PRIMARY = SM.COLOR_PRIMARY
 Kit.COLOR_MUTED   = SM.COLOR_MUTED
 Kit.CARD_BG       = SM.CARD_BG
 
+-- tintIcon(icon [, fg]) -> the icon, recoloured for the current card surface.
+--
+-- For the SVG/PNG path only. A glyph never needs this: TextWidget takes an
+-- fgcolor and honours it, so `fgcolor = Kit.COLOR_PRIMARY` is the whole answer.
+-- An IconWidget is a black-on-transparent bitmap that ignores fgcolor entirely,
+-- so under the shelf's dark theme it paints black on a near-black card and the
+-- module looks like it failed to render.
+--
+-- Safe to call unconditionally, and safe to call on a host that predates it:
+-- it hands the icon straight back on a light card, for artwork that carries
+-- its own colour, and if the wallpaper module cannot be reached at all.
+function Kit.tintIcon(icon, fg)
+    local ok, WP = pcall(require, "lib/bookshelf_wallpaper")
+    if not (ok and type(WP) == "table" and WP.tintIcon) then return icon end
+    local ink = fg
+    if type(ink) == "nil" then ink = Kit.COLOR_PRIMARY end
+    local ok_t, out = pcall(WP.tintIcon, ink, icon)
+    if ok_t and out then return out end
+    return icon
+end
+
+-- fmtDuration(secs) -> "3h 05m" / "3h" / "45m", gettext-wrapped so translated
+-- unit letters render translated everywhere. Was copied (divergently) into
+-- reading_stats and twice into reading_goal - the goal copies had dropped the
+-- gettext wrapping, so goal durations rendered untranslated.
+function Kit.fmtDuration(secs)
+    local _ = require("lib/bookshelf_i18n").gettext
+    local T = require("ffi/util").template
+    secs = math.max(0, tonumber(secs) or 0)
+    local h = math.floor(secs / 3600)
+    local m = math.floor((secs % 3600) / 60)
+    if h > 0 and m > 0 then return T(_("%1h %2m"), h, string.format("%02d", m)) end
+    if h > 0 then return T(_("%1h"), h) end
+    return T(_("%1m"), m)
+end
+
+-- ─── Tap regions ─────────────────────────────────────────────────────────────
+-- Hit-test a module-local point against the regions a module declared via
+-- ctx.set_tap_regions during render. Regions are rects in the coordinate
+-- space of the widget the module RETURNED (its top-left = 0,0); the host does
+-- the screen-to-module translation (cell position, card chrome, clip centring)
+-- before calling this - modules never see screen coordinates. First matching
+-- region wins (declare overlapping regions most-specific first). Returns the
+-- region's id and the region itself, or nil for a miss/malformed input -
+-- and on_tap must ALWAYS handle a nil ctx.tapped_region: D-pad activation,
+-- whole-cell taps outside every region, and older hosts all produce it.
+function Kit.hitRegion(regions, x, y)
+    if type(regions) ~= "table" or type(x) ~= "number" or type(y) ~= "number" then
+        return nil
+    end
+    for i = 1, #regions do
+        local r = regions[i]
+        if type(r) == "table"
+                and type(r.x) == "number" and type(r.y) == "number"
+                and type(r.w) == "number" and type(r.h) == "number"
+                and x >= r.x and x < r.x + r.w
+                and y >= r.y and y < r.y + r.h then
+            return r.id, r
+        end
+    end
+    return nil
+end
+
+-- ─── Settings-dialog helpers ─────────────────────────────────────────────────
+-- The standard "a pick landed" triple every module settings dialog performs:
+-- close the dialog, reload the menu beneath (so the card re-renders with the
+-- new setting), and re-open the dialog so its checkmarks refresh. Was copied
+-- verbatim into six modules.
+function Kit.settingsReopen(ctx, dialog, show_settings)
+    require("ui/uimanager"):close(dialog)
+    if ctx and ctx.menu and ctx.menu._reload then ctx.menu:_reload() end
+    if show_settings then show_settings(ctx) end
+end
+
+-- Kit.radioRow{ label=, active=, on_pick=, toggle= } -> ButtonDialog row.
+-- Checkmark-prefixed radio row (U+2713 when active, two-space placeholder
+-- otherwise, so labels stay aligned). Tapping the already-active row is a
+-- no-op unless toggle = true (a toggle/multi-select row acts on every tap).
+function Kit.radioRow(o)
+    return {
+        text = (o.active and "\xE2\x9C\x93 " or "  ") .. tostring(o.label),
+        callback = function()
+            if o.active and not o.toggle then return end
+            o.on_pick()
+        end,
+    }
+end
+
 -- sc(scale_pct) -> function(n): scaled, rounded pixel size, floored at 1.
 function Kit.sc(scale_pct)
     local p = scale_pct or 100
@@ -112,12 +200,30 @@ function Kit.valueCard(o)
     return g
 end
 
+-- The width at which a flexible card can hold TWO comfortable text columns
+-- instead of one. Single source for every surface that decides between a
+-- one- and two-column layout: the hero/full-screen grid uses it as a flex
+-- cell's minimum width (so a third module wraps rather than squeezing three
+-- narrow cells onto a row), and the start menu uses it to pick the shape it
+-- hands its module cards. Keeping both on one constant is what makes a
+-- start-menu card and a grid cell of the same width lay out the same way.
+function Kit.twoColMinWidth()
+    return require("device").screen:scaleBySize(300)
+end
+
 -- shape(width, avail_h) -> "wide" | "square" | "tall". Aspect bands for modules
 -- that want different LAYOUTS (not just font sizes) at different cell shapes.
--- nil/zero avail_h (the start menu, no height constraint) reads as "wide".
 -- ratio = width/avail_h; >= 1.6 wide, <= 0.7 tall, else square.
+--
+-- nil/zero avail_h means "no height constraint" (the start menu, whose cards
+-- take their natural height). There is no aspect to band in that case, so the
+-- decision falls back to WIDTH alone via twoColMinWidth() -- a card wide enough
+-- for two columns reads "wide", a narrower one reads "square". Callers that
+-- know their own shape should pass ctx.shape instead of calling this.
 function Kit.shape(width, avail_h)
-    if not avail_h or avail_h <= 0 then return "wide" end
+    if not avail_h or avail_h <= 0 then
+        return (width or 0) >= Kit.twoColMinWidth() and "wide" or "square"
+    end
     local r = (width or 0) / avail_h
     if r >= 1.6 then return "wide" end
     if r <= 0.7 then return "tall" end

@@ -87,6 +87,13 @@ _G.G_reader_settings = {
 -- row-count helpers under test never call into these, so the mock is inert.
 -- package.loaded (the explicit stubs) and on-disk lib/* files both resolve
 -- before this fallback, so it only catches unstubbed KOReader core deps.
+-- The widget's perf-log timer probes require("socket").gettime at load time
+-- (via lib/bookshelf_gettime). Installed BEFORE the catch-all mock searcher:
+-- the mock would answer with a function returning a mock TABLE, and any
+-- "[bookshelf perf]" line doing (_gettime() - t0) would crash on it (the
+-- same hazard _test_opds_nav_expand hit).
+package.loaded["socket"] = { gettime = function() return os.clock() end }
+
 local function mock()
     local m = {}
     return setmetatable(m, {
@@ -119,7 +126,13 @@ end
 -- ── Helper to build a minimal mock BookshelfWidget ─────────────────────────
 local function bw(width, height, expanded)
     return setmetatable(
-        { width = width, height = height, _expanded = expanded or false },
+        { width = width, height = height, _expanded = expanded or false,
+          -- Pinned to COVERS. This suite's row and page expectations are the
+          -- COVER GRID's, and under the Auto policy an expanded shelf is a
+          -- LIST -- the mode a real chip would be in here is not the mode
+          -- these numbers describe. The pin is the same one a chip uses.
+          _chipViewMode = function() return "covers" end,
+          _isDrilledIn  = function() return false end },
         { __index = BW }
     )
 end

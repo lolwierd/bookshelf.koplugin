@@ -181,11 +181,11 @@ function BulkActions.show(opts)
     favorite_button = {
         text_func = function()
             if draft.favorite == "add" then
-                return "+ " .. _("Favourite")
+                return "+ " .. _("Favorite")
             elseif draft.favorite == "remove" then
-                return "\xE2\x88\x92 " .. _("Favourite")  -- U+2212 minus
+                return "\xE2\x88\x92 " .. _("Favorite")  -- U+2212 minus
             end
-            return _("Favourite")
+            return _("Favorite")
         end,
         background = draft.favorite and STAGED_BG or nil,
         callback = function()
@@ -371,6 +371,50 @@ function BulkActions.show(opts)
                     if on_done then on_done() end
                 end,
             })
+        end,
+    }
+
+    -- Move: immediate action like Delete (NOT staged into the draft --
+    -- a path-changing op doesn't compose with staged actions keyed on
+    -- the old paths). scrubMissing first, same as Apply; exits
+    -- selection mode after a successful move since the selection's
+    -- keys are the old paths.
+    local move_button = {
+        text     = _("Move to folder\xE2\x80\xA6"),
+        callback = function()
+            local discard_toast = isDirty()
+            UIManager:close(dialog)
+            local lfs = require("libs/libkoreader-lfs")
+            selection:scrubMissing(function(p)
+                return lfs.attributes(p, "mode") == "file"
+            end)
+            local paths = selection:paths()
+            if #paths == 0 then
+                if on_done then on_done() end
+                return
+            end
+            require("lib/bookshelf_move_flow").moveBooks{
+                bw      = bw,
+                paths   = paths,
+                -- Leave selection mode BEFORE the shelf re-renders, so the
+                -- move flow's own rebuild is the only one. Rebuilding again
+                -- from on_done meant every bulk move built the widget tree
+                -- twice, which is what made the tail drag on a big library.
+                before_refresh = function(summary)
+                    if summary and #summary.moved > 0 then
+                        selection:exitMode()
+                    end
+                end,
+                on_done = function(summary)
+                    if discard_toast then
+                        UIManager:show(require("ui/widget/notification"):new{
+                            text    = _("Pending changes discarded"),
+                            timeout = 1,
+                        })
+                    end
+                    if on_done then on_done() end
+                end,
+            }
         end,
     }
 
@@ -600,11 +644,27 @@ function BulkActions.show(opts)
         end,
     }
 
+    -- "Select all in this shelf": the answer for a flat, filter-built chip,
+    -- which has no folder or stack tile to long-press for a group selection
+    -- (issue #320). Takes every book the current view holds across ALL its
+    -- pages, so the chip's own filters and sort decide the set. Sits at the
+    -- top because it changes WHAT is selected, where every row below acts on
+    -- the selection; closes the dialog so the newly selected covers are
+    -- visible (reopen from the bucket to act on them).
+    local select_all_button = {
+        text = _("Select all in this shelf"),
+        callback = function()
+            UIManager:close(dialog)
+            if bw and bw._selectAllInView then bw:_selectAllInView() end
+        end,
+    }
+
     local buttons = {
+        { select_all_button },
         { collections_button, rating_button },
         status_row,
         { favorite_button, refresh_button },
-        { remove_history_button },
+        { remove_history_button, move_button },
         { reset_button, delete_button },
         { cancel_button, apply_button },
     }

@@ -35,6 +35,18 @@ local function readSize()
     return v
 end
 
+--- Can this cell hold a clock face AND a date line?
+---
+--- Content is pad + face + pad + date, and the face has a minimum diameter, so
+--- in a short cell the face stops shrinking while the date keeps its reserve:
+--- the content grows past the cell and ClipContainer cuts the date through the
+--- middle. Exposed for tests because it decides whether a visible line is
+--- dropped, and getting it wrong loses the date in cells that could hold it.
+local function dateFits(avail_h, pad, date_h, min_diam)
+    if not (avail_h and pad and date_h and min_diam) then return true end
+    return (avail_h - 3 * pad - date_h) >= min_diam
+end
+
 local function readShowDate()
     local Store = require("lib/bookshelf_settings_store")
     local v = Store.read(DATE_KEY, true)
@@ -60,6 +72,19 @@ local function buildFace(diam, now, scale_pct)
     local Screen     = require("device").screen
     local unit = math.max(1, Screen:scaleBySize(1) * (scale_pct or 100) / 100)
     local function w(k) return unit * k end -- float weights, for crisp AA
+
+    -- The face is composited OVER whatever is already in the buffer, so its
+    -- colour is a luminance level rather than a Blitbuffer colour -- and it was
+    -- a hard-coded 0. Black ticks and hands on the dark theme's near-black card
+    -- is a blank square where the clock should be. COLOR_PRIMARY is the ink the
+    -- card was themed for; take its level and keep 0 as the fallback, which is
+    -- what the light theme resolves to anyway.
+    local face_ink = 0
+    local ok_sm, SM = pcall(require, "lib/bookshelf_start_menu_modules")
+    if ok_sm and type(SM) == "table" and type(SM.COLOR_PRIMARY) ~= "nil" then
+        local ok_l, lum = pcall(function() return SM.COLOR_PRIMARY:getColor8().a end)
+        if ok_l and type(lum) == "number" then face_ink = lum end
+    end
 
     local tm    = os.date("*t", now)
     local minA  = (tm.min / 60) * 2 * math.pi
@@ -91,7 +116,7 @@ local function buildFace(diam, now, scale_pct)
         local function blend(px, py, cov, ink)
             if cov <= 0 or px < x0 or px > x1b or py < y0 or py > y1b then return end
             if cov > 1 then cov = 1 end
-            ink = ink or 0
+            ink = ink or face_ink
             local g = bb:getPixel(px, py):getColor8().a
             bb:setPixel(px, py, Blitbuffer.Color8(floor(g * (1 - cov) + ink * cov + 0.5)))
         end
@@ -141,24 +166,22 @@ local function showSettings(ctx)
     local ButtonDialog = require("ui/widget/buttondialog")
     local UIManager    = require("ui/uimanager")
     local Store        = require("lib/bookshelf_settings_store")
+    local Kit          = require("lib/bookshelf_module_kit")
     local dialog
     local function commit()
-        UIManager:close(dialog)
-        if ctx and ctx.menu and ctx.menu._reload then ctx.menu:_reload() end
-        showSettings(ctx)
+        Kit.settingsReopen(ctx, dialog, showSettings)
     end
     local function sizeBtn(label, mode)
-        return {
-            text = (readSize() == mode and "\xE2\x9C\x93 " or "  ") .. label,
-            callback = function()
-                if readSize() == mode then return end
+        return Kit.radioRow{
+            label = label, active = readSize() == mode,
+            on_pick = function()
                 Store.save(SIZE_KEY, mode)
                 commit()
             end,
         }
     end
     dialog = ButtonDialog:new{
-        title        = _("Analogue clock"),
+        title        = _("Analog clock"),
         title_align  = "center",
         width_factor = 0.7,
         buttons      = {
@@ -166,9 +189,9 @@ local function showSettings(ctx)
             { sizeBtn(_("Medium"), "medium") },
             { sizeBtn(_("Large"),  "large") },
             {
-                {
-                    text = (readShowDate() and "\xE2\x9C\x93 " or "  ") .. _("Show date"),
-                    callback = function()
+                Kit.radioRow{
+                    label = _("Show date"), active = readShowDate(), toggle = true,
+                    on_pick = function()
                         Store.save(DATE_KEY, not readShowDate())
                         commit()
                     end,
@@ -181,7 +204,7 @@ end
 
 return {
     key   = "analogue_clock", -- stable id stored in user menus; never change it
-    title = _("Analogue clock"),
+    title = _("Analog clock"),
     summary = _("Device clock. Works offline."),
     -- The round face reads best as a square; the hero grid packs square-aspect
     -- modules tightly (more per row) rather than stretching them wide. (The
@@ -232,11 +255,25 @@ return {
         -- larger margin on every side (it would otherwise fill the width and
         -- sit tight top/bottom). Padding is uniform: top, clock-to-date, bottom.
         local size = preview and "small" or readSize()
+        local show_date = readShowDate()
         local pad, diam, face_scale
         if avail_h and avail_h > 0 and not preview then
             -- Height-aware (hero grid): fill the cell.
             pad = px(8)
-            local date_reserve = readShowDate() and (date_h + pad) or 0
+            -- DROP the date when the cell cannot hold a face AND a date line.
+            -- diam has a px(40) floor, so in a short cell the face stops
+            -- shrinking while the date keeps its reserve, the content grows
+            -- past avail_h, and ClipContainer cuts the date in half -- a date
+            -- sliced through the middle reads as broken rendering rather than
+            -- as a layout choice. The fit loop cannot rescue it either: the
+            -- font size has its own floor. Losing the line is the better
+            -- failure. Seen after the hero grid started pairing flex modules
+            -- (issue #359), which makes rows taller and cells squarer, but the
+            -- same shape was always reachable with enough modules.
+            if show_date and not dateFits(avail_h, pad, date_h, px(40)) then
+                show_date = false
+            end
+            local date_reserve = show_date and (date_h + pad) or 0
             diam = math.max(px(40),
                 math.min(mw - 2 * pad, avail_h - 2 * pad - date_reserve))
             face_scale = math.max(50,
@@ -254,7 +291,7 @@ return {
         local content = VerticalGroup:new{ align = "center" }
         content[#content + 1] = VerticalSpan:new{ width = pad }
         content[#content + 1] = buildFace(diam, now, face_scale)
-        if readShowDate() then
+        if show_date then
             content[#content + 1] = VerticalSpan:new{ width = pad } -- clock-to-date
             -- SHORTEN the format before shrinking the font: try full, then
             -- abbreviated, then numeric, and use the LONGEST that fits the cell
@@ -270,7 +307,9 @@ return {
             local date_txt, date_w
             for _, fmt in ipairs({ "%A %d %B", "%a %d %b", "%d %b", "%d/%m" }) do
                 date_txt = LocalDate.localize(os.date(fmt, now))
-                date_w = TextWidget:new{ text = date_txt, face = face }:getSize().w
+                local probe = TextWidget:new{ text = date_txt, face = face }
+                date_w = probe:getSize().w
+                probe:free()   -- measurement probe; render runs every minute
                 if date_w <= fit_w then break end
             end
             if date_w > fit_w and date_w > 0 then

@@ -14,6 +14,43 @@ the trailing `.N` is the fork revision, reset whenever the upstream base changes
 
 _Nothing yet._
 
+## [5.1.4.1] - 2026-09-23
+
+Sync with upstream **v5.1.4** plus the five commits after it on `master`
+(upstream releases v3.11.0–v5.1.4, 923 commits).
+
+### Upstream changes pulled in
+- **List view**: a full token-line list mode (per-chip, pinch to change rows,
+  layout presets, progress bars, bulk-selection checkboxes), alongside covers
+  and spines; the footer hold cycles covers -> list -> spines.
+- **Spines and ornaments**: bookshelf spine view with face-out covers (next
+  unread in series, recently added), shelf ornaments (SVG/PNG) and theming.
+- **OPDS catalogs as chips**: SQLite-backed feed windows, read-ahead, catalog
+  add/edit/delete, per-chip download folder, cover previews in the hero.
+- **Kindle library** as a chip source; calibre custom columns and a second
+  series stack from a Calibre series column.
+- Shelf styles: collage / ribbon / pile folder tiles, per-kind display modes,
+  per-chip and selected-chip colours, uppercase labels, cover shape and corner
+  options.
+- Reorganised plugin menu (4.0), a "go to home screen" Dispatcher action,
+  adjustable in-reader launcher, a browsable cached changelog viewer, and a
+  fresh-install default of four shelves and a real micro-module arrangement.
+- Hot parking: a reader is kept alive under the shelf instead of being torn
+  down, plus close-path perf work (issue 422) and night-mode panel repair.
+- Russian and Slovak translations, plus translation rounds for every release.
+
+### Fork fixes retained
+- **Screensaver host fallback** for suspend while Bookshelf owns the home screen.
+- **`onRequestSuspend` handler** while Bookshelf is the topmost widget.
+- **Multiswipe sleep gesture**, now also reading the reader-side suspend binding
+  from the parked ReaderUI when upstream's hot parking leaves no FileManager.
+- **Updater fork URLs**, extended to upstream's new changelog viewer: its
+  on-demand Refresh now fetches this fork's releases (the updater already seeds
+  the same cache from the fork), instead of mixing in upstream's notes. The
+  updater exports `REPO_SLUG` / `githubApi` for this; `tests/_test_updater.lua`
+  expects the fork's zipball URL.
+- `quote_of_day` FileManager nil-guard: already in upstream, nothing to carry.
+
 ## [3.10.9.1] - 2026-08-01
 
 Sync with upstream **v3.10.9** (upstream releases v3.10.3–v3.10.9).

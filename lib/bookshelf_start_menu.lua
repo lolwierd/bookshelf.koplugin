@@ -31,15 +31,9 @@ local PageWipe        = require("lib/bookshelf_page_wipe")
 local _               = require("lib/bookshelf_i18n").gettext
 local T               = require("ffi/util").template
 
--- Wall-clock timer for perf instrumentation, matching bookshelf_widget.lua's
--- own [bookshelf perf] convention.
-local _gettime
-do
-    local ok, s = pcall(require, "socket")
-    _gettime = (ok and s and type(s.gettime) == "function")
-        and function() return s.gettime() end
-        or  os.clock
-end
+-- Shared wall-clock for [bookshelf perf] timestamps (and elapsed-time
+-- bookkeeping); see lib/bookshelf_gettime.lua for the fallback contract.
+local _gettime = require("lib/bookshelf_gettime")
 
 -- When the "Disable micro-modules" advanced setting is on, micro-module
 -- entries are hidden from the start menu (the model keeps them, so re-enabling
@@ -135,7 +129,7 @@ local PANEL_SHADOW_DIST  = Screen:scaleBySize(2)
 local PANEL_SHADOW_DAY   = Blitbuffer.gray(0.5)
 local PANEL_SHADOW_NIGHT = Blitbuffer.gray(0.15)
 local function _panelShadowGray()
-    if G_reader_settings and G_reader_settings:isTrue("night_mode") then
+    if require("lib/bookshelf_night_mode_sync").active() then
         return PANEL_SHADOW_NIGHT
     end
     return PANEL_SHADOW_DAY
@@ -187,7 +181,7 @@ local StartMenu = InputContainer:extend{}
 -- provided the overlay paints an opaque close glyph over that region.
 -- context: "library" (home screen, default) | "reader" (in-reader launcher).
 -- Items whose scope is set to the other context are filtered out (#scope feat).
-function StartMenu.open(bw, bottom_inset, burger_dimen, context)
+function StartMenu.open(bw, bottom_inset, burger_dimen, context, burger_art, anchor_top, side_override)
     -- In reader context there's no bookshelf widget to repaint the area an
     -- in-place rebuild vacates (e.g. a closed folder flyout), so the flyout
     -- pixels would linger. Target ReaderUI instead, so the page beneath repaints
@@ -205,6 +199,15 @@ function StartMenu.open(bw, bottom_inset, burger_dimen, context)
         bottom_inset  = no_button and 0 or (bottom_inset + Screen:scaleBySize(6)),
         _balance_bottom_margin = no_button,
         burger_dimen  = burger_dimen,
+        burger_art    = burger_art,   -- actual launcher art size (#279 scaling)
+        -- anchor_top: grow the panel DOWN from the top edge instead of up from
+        -- the bottom. Set when the in-reader launcher has been moved to the top,
+        -- so the menu opens away from the button rather than across the screen
+        -- from it. bottom_inset is then the inset from the TOP edge.
+        anchor_top    = anchor_top and true or false,
+        -- side_override: "left"/"right" to hang the panel off that side
+        -- regardless of start_menu_position (reader mode has its own side).
+        side_override = side_override,
         context       = (context == "reader") and "reader" or "library",
         _repaint_under = under,
     }
@@ -217,28 +220,50 @@ function StartMenu.open(bw, bottom_inset, burger_dimen, context)
     local anim_steps = PageWipe.resolveSteps("start_menu_animation")
     if anim_steps and _sr and Screen.refreshUI then
         local shown = pcall(function()
+            local _perf_t0 = _gettime()
             local rx, ry, rw, rh = _sr.x, _sr.y, _sr.w, _sr.h
+            -- The background, read out of the framebuffer once. Needed anyway:
+            -- it is kept as _bg_snapshot for the close wipe-down.
             local old_bb = Screen.bb:copy()
-            menu:paintTo(Screen.bb, 0, 0)
-            local new_bb = Screen.bb:copy()
+            -- The panel is painted OFFSCREEN, over a RAM copy of that
+            -- background, and the screen is left showing the background so the
+            -- reveal has something to grow over. This used to paint into the
+            -- screen and then copy it back out, which is a second full-screen
+            -- framebuffer read at ~30MB/s -- 76ms on a PW5 -- for pixels that
+            -- were already in hand. Seeded from old_bb rather than a blank
+            -- buffer so anything the panel does not paint opaquely still shows
+            -- what is underneath.
+            local new_bb = old_bb:copy()
+            menu:paintTo(new_bb, 0, 0)
+            local _perf_prep = (_gettime() - _perf_t0) * 1000
+            -- Reveal from the edge the panel is anchored to, so it reads as
+            -- opening AWAY from the button: bottom-anchored grows upward,
+            -- top-anchored grows downward. Revealing bottom-up on a
+            -- top-anchored panel looked like it was closing.
+            local from_top = menu.anchor_top
             local STEPS, prev_dh = anim_steps, 0
             for i = 1, STEPS do
                 local dh = math.floor(rh * i / STEPS)
-                if rh - dh > 0 then
-                    Screen.bb:blitFrom(old_bb, rx, ry, rx, ry, rw, rh - dh)
-                end
-                Screen.bb:blitFrom(new_bb, rx, ry + rh - dh, rx, ry + rh - dh, rw, dh)
-                if i < STEPS then
-                    local strip_h = dh - prev_dh
-                    if strip_h > 0 then
-                        Screen:refreshUI(rx, ry + rh - dh, rw, strip_h)
+                local strip_h = dh - prev_dh
+                if strip_h > 0 then
+                    -- Only the strip revealed by THIS frame. The old content
+                    -- no longer has to be blitted back over the remainder --
+                    -- the screen still holds it, untouched.
+                    local strip_y = from_top and (ry + prev_dh) or (ry + rh - dh)
+                    Screen.bb:blitFrom(new_bb, rx, strip_y, rx, strip_y, rw, strip_h)
+                    if i < STEPS then
+                        Screen:refreshUI(rx, strip_y, rw, strip_h)
                         UIManager:yieldToEPDC(20000)
                     end
-                else
+                end
+                if i == STEPS then
                     Screen:refreshUI(rx, ry, rw, rh)
                 end
                 prev_dh = dh
             end
+            logger.dbg(string.format(
+                "[bookshelf perf] StartMenu: openAnim prep=%.0fms TOTAL=%.0fms steps=%d region=%dx%d",
+                _perf_prep, (_gettime() - _perf_t0) * 1000, STEPS, rw, rh))
             new_bb:free()
             menu._bg_snapshot = old_bb  -- kept for the close wipe-down
         end)
@@ -310,6 +335,11 @@ end
 
 function StartMenu:init()
     local _t0 = _gettime()
+    -- The module palette (card, ink) is process-global and only the LIBRARY's
+    -- hero build writes it. Under the reader this menu sits on a plain page
+    -- the shelf theme never touches, so after a dark or wallpapered shelf its
+    -- cards kept the dark card and white ink. See Modules.resetTheme.
+    if self.context == "reader" then pcall(Modules.resetTheme) end
     -- Menu-open signal: bump the loader's generation counter exactly once
     -- per open (init runs once per StartMenu instance; _reload does not
     -- re-init). Modules key per-open caches on it — see the README.
@@ -411,7 +441,13 @@ function StartMenu:_panelWidthBounds()
     -- and flyout panels go through here, so both widen together. Clamp to the
     -- max so a very large font can't exceed the panel cap.
     local max_w = math.floor(sw * 0.6)
-    local min_w = math.min(max_w, math.floor(Screen:scaleBySize(180) * pct / 100))
+    -- User floor (dp): the panel is otherwise sized by the longest row LABEL, so
+    -- short menu text drags module cards narrow with it. Raising this widens the
+    -- panel without touching the text. Still font-scaled (same reason as the
+    -- 180 default) and still clamped to max_w, so it can't exceed the cap.
+    local base = tonumber(Store.read("start_menu_min_width", 180)) or 180
+    if base < 120 then base = 120 elseif base > 600 then base = 600 end
+    local min_w = math.min(max_w, math.floor(Screen:scaleBySize(base) * pct / 100))
     return min_w, max_w
 end
 
@@ -685,22 +721,72 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     local function refresh()
         if sm._reload then sm:_reload(row and row.dimen and row.dimen:copy()) end
     end
+    -- Regions the module declares during render (ctx.set_tap_regions), plus a
+    -- handle on the hysteresis clip when one wraps the content, so the tap
+    -- handler can subtract its centring offset too.
+    local tap_regions, hyst_clip
     -- In safe mode every module is suppressed (a previous open crashed before
     -- painting); the row renders as a removable, tappable fallback instead.
     local blocked = self._safe_mode
     local inner, errored
     if def and not blocked then
+        -- Height ceiling for this row's content. Unlike the hero grid, the start
+        -- menu has no fit engine (_renderFitted) to shrink an oversized card --
+        -- it takes whatever height the module returns. A height-VARYING module
+        -- (the quote card, whose text length is user data) could therefore
+        -- report an unbounded natural height, and since the panel is
+        -- bottom-anchored the excess ran off the TOP of the screen, with
+        -- pagination unable to help because a single row can't be split.
+        -- Cap a single row at what the panel can actually show (minus its
+        -- chrome and one pager row, so pagination stays possible), and pass
+        -- clamp so a module that CAN truncate its expendable part does so
+        -- (quote_of_day ellipsises the quote, keeping the attribution).
+        -- Modules that ignore max_height/clamp are unaffected; so is any card
+        -- already shorter than the cap (fitText's height_adjust reports the
+        -- natural height when the text fits).
+        --
+        -- The cap travels as max_height, NOT height. `height` is the cell's
+        -- available height, and its absence is what tells a module there is no
+        -- height constraint here (cards take their natural height). Modules
+        -- infer their LAYOUT from that -- Kit.shape bands the width/height
+        -- ratio, and shelf_size reads it directly -- so putting the ceiling in
+        -- `height` silently reclassified every start-menu card as a tall cell
+        -- and flipped them all to their narrow layouts. One field cannot mean
+        -- both "how tall may I be" and "what shape am I".
+        local avail_panel_h = Screen:getHeight() - (self.bottom_inset or 0)
+        local panel_chrome  = 2 * (self._panel_border + self._panel_pad)
+        local pager_stride  = self._row_h + 2 * focus_border
+        local content_cap   = math.max(1,
+            avail_panel_h - panel_chrome - pager_stride
+            - 2 * card_margin - 2 * card_pad - 2 * focus_border)
+        -- Shape is decided on WIDTH here, by the same constant the hero /
+        -- full-screen grid uses to size a flex cell -- so a start-menu card
+        -- gets the two-column layout exactly when a grid cell of that width
+        -- would. A default-width panel is narrower than that, so cards stay
+        -- single-column until the panel is widened ("Minimum start menu
+        -- width") or the font scale grows it. Passed explicitly so a module
+        -- never has to infer it from the (deliberately absent) height.
+        local Kit = require("lib/bookshelf_module_kit")
+        local card_shape = Kit.shape(inner_w, nil)
         -- Render under pcall so a Lua error degrades to an "(error)" row rather
         -- than taking down the build. Force getSize() inside the guard so any
         -- layout/shaping error is caught here too. No disk writes on this path.
         -- The render still gets the scoped refresh (5th arg) for async redraws.
         local ok, widget = Breaker.guard(function()
             local wgt = def.render({
-                width = inner_w, height = nil,
+                width = inner_w, height = nil, max_height = content_cap,
                 scale = self._scale_pct or 100,
-                preview = false, refresh = refresh, shape = nil, entry = entry,
+                preview = false, refresh = refresh, shape = card_shape,
+                entry = entry,
                 surface = "start_menu", bw = self.bw, menu = self,
-                config = require("lib/bookshelf_module_kit").entryConfig(entry, nil),
+                clamp = true,
+                config = Kit.entryConfig(entry, nil),
+                -- Optional per-region taps (Kit.hitRegion): rects in the
+                -- returned widget's own coordinate space; resolved by the
+                -- row's onTap below into ctx.tapped_region.
+                set_tap_regions = function(r)
+                    tap_regions = type(r) == "table" and r or nil
+                end,
             })
             if wgt then wgt:getSize() end
             return wgt
@@ -743,6 +829,7 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
         if prev and math.abs(ih - prev) <= Screen:scaleBySize(6) then
             local ClipContainer = require("lib/bookshelf_clip_container")
             inner = ClipContainer:new{ w = iw, h = prev, bg = Modules.CARD_BG, inner }
+            hyst_clip = inner
         else
             self._module_heights[entry.id] = ih
         end
@@ -800,10 +887,29 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     end
     function row:onTap(_a, ges)
         if flyoutOwns(ges) then return false end
+        -- Resolve the tap against the module's declared regions (if any).
+        -- Module-local = screen minus the row's painted origin minus the card
+        -- chrome (focus ring, card margin/padding), all constant per build;
+        -- row.dimen is the PAINTED rect, so this is correct wherever the row
+        -- sits - flyouts and right-anchored panels included. The hysteresis
+        -- clip, when present, centres the content inside the held height, so
+        -- its recorded offsets are subtracted too.
+        local region_id
+        if ges and ges.pos and tap_regions and self.dimen then
+            local Kit = require("lib/bookshelf_module_kit")
+            local chrome = focus_border + card_margin + card_pad
+            local lx = ges.pos.x - self.dimen.x - chrome
+            local ly = ges.pos.y - self.dimen.y - chrome
+            if hyst_clip then
+                lx = lx - (hyst_clip._child_dx or 0)
+                ly = ly - (hyst_clip._child_dy or 0)
+            end
+            region_id = Kit.hitRegion(tap_regions, lx, ly)
+        end
         -- Pass the tapped row's painted rect so a keep_open re-render can scope
         -- its refresh to this row and below, rather than flashing the whole
         -- panel (rows above the tapped one shouldn't redraw).
-        sm:_activate(entry, self.dimen and self.dimen:copy()); return true
+        sm:_activate(entry, self.dimen and self.dimen:copy(), region_id); return true
     end
     function row:onHold(_a, ges)
         if flyoutOwns(ges) then return false end
@@ -1051,8 +1157,45 @@ function StartMenu:_build()
     local _bt2 = _gettime()
     local root_frame, root_rows = self:_buildPanel(slice, root_w)
     local _bt3 = _gettime()
-    local need_rebuild = false
-    if max_rows > 1 and _overflows(root_frame, has_prev, has_next) then
+    -- Reduce max_rows from the MEASURED row heights until the page fits, then
+    -- rebuild. Iterated (bounded) rather than one-shot: a single pass isn't
+    -- always enough, because the rows have unequal heights and _pageSlice
+    -- declines to paginate at all while #items <= max_rows -- so a page whose
+    -- rows simply don't fit could never shrink, and (the panel being
+    -- bottom-anchored) the excess ran off the TOP of the screen with no pager
+    -- to reach it. Each pass re-measures the rows actually rendered, so a page
+    -- whose own rows are taller than the ones a previous pass measured (module
+    -- rows vary in height -- the quote card's text is user data) converges too.
+    local MAX_FIT_PASSES = 4
+    local function _pageCount()
+        return math.max(1, math.ceil(#self._items / math.max(1, max_rows - 1)))
+    end
+    local function _clampPage()
+        local pages = _pageCount()
+        if self._page > pages then self._page = pages; return true end
+        return false
+    end
+    local function _rebuildSlice()
+        root_frame:free()
+        slice, has_prev, has_next = self:_pageSlice(self._items, self._page, max_rows)
+        root_frame, root_rows = self:_buildPanel(slice, root_w)
+    end
+    -- init seeds _page PAST the end to mean "open on the last page". Note that
+    -- intent before any clamping: max_rows only shrinks below, which grows the
+    -- page count, so a clamp against the nominal max_rows would strand the menu
+    -- on page 1 instead of the last page.
+    local want_last_page = self._page > _pageCount()
+    if _clampPage() then _rebuildSlice() end
+    -- Reduce max_rows from the MEASURED row heights until the page fits.
+    -- Iterated rather than one-shot: the rows have unequal heights, and
+    -- _pageSlice declines to paginate at all while #items <= max_rows -- so a
+    -- page whose rows simply don't fit could never shrink, and (the panel being
+    -- bottom-anchored) the excess ran off the TOP of the screen with no pager
+    -- to reach it. Re-measuring each pass also converges when a page's own rows
+    -- are taller than the ones the previous pass measured (module rows vary in
+    -- height -- the quote card's text is user data).
+    for _pass = 1, MAX_FIT_PASSES do
+        if max_rows <= 2 or not _overflows(root_frame, has_prev, has_next) then break end
         -- Sum measured row heights from the bottom (the panel is bottom-
         -- anchored), reserving the pager slot, to find how many rows fit.
         local chrome = 2 * (self._panel_border + self._panel_pad)
@@ -1064,20 +1207,16 @@ function StartMenu:_build()
             fit = fit + 1
         end
         local new_max = math.max(2, fit + 1) -- +1: _pageSlice reserves a pager row
-        if new_max < max_rows then max_rows = new_max; need_rebuild = true end
-    end
-    -- Clamp the scroll offset to the final max_rows (bottom-seeded _page).
-    if max_rows > 1 then
-        local _per   = math.max(1, max_rows - 1)
-        local _pages = math.max(1, math.ceil(#self._items / _per))
-        if self._page > _pages then self._page = _pages; need_rebuild = true end
+        -- Force the split: while #items <= max_rows, _pageSlice returns every
+        -- entry with no pager, so the page can't shrink no matter what `fit`
+        -- says. Strict decrease also guarantees this terminates.
+        if new_max > #self._items then new_max = #self._items end
+        if new_max >= max_rows then new_max = max_rows - 1 end
+        max_rows = math.max(2, new_max)
+        if want_last_page then self._page = _pageCount() else _clampPage() end
+        _rebuildSlice()
     end
     local _bt4 = _gettime()
-    if need_rebuild then
-        root_frame:free()
-        slice, has_prev, has_next = self:_pageSlice(self._items, self._page, max_rows)
-        root_frame, root_rows = self:_buildPanel(slice, root_w)
-    end
     local _bt5 = _gettime()
     self._root_pager = nil
     if has_prev or has_next then
@@ -1094,10 +1233,18 @@ function StartMenu:_build()
     -- Position setting read straight from the store (single source; the
     -- footer reads the same key). "right" mirrors the whole layout:
     -- root panel bottom-right, flyout opening leftward.
-    local on_right = Store.read("start_menu_position", "left") == "right"
+    -- Which side the panel hangs off. In reader context the launcher has its own
+    -- side (it can be opposite the shelf's footer button), and the panel must
+    -- follow the BUTTON it opens from -- same as the file-manager menu does.
+    local on_right
+    if self.side_override == "right" then on_right = true
+    elseif self.side_override == "left" then on_right = false
+    else on_right = Store.read("start_menu_position", "left") == "right" end
     local root_sz = root_frame:getSize()
     local root_x  = on_right and (sw - self._margin - root_sz.w) or self._margin
-    local root_y  = sh - self.bottom_inset - root_sz.h
+    -- bottom_inset is the inset from whichever edge we are anchored to.
+    local root_y  = self.anchor_top and self.bottom_inset
+        or (sh - self.bottom_inset - root_sz.h)
     -- Store pager hit region for onTapDismiss routing (backup tap path).
     -- The pager row sits at the bottom of the panel content; its top is
     -- root_sz.h minus the panel chrome minus one row_h.
@@ -1223,19 +1370,46 @@ function StartMenu:_build()
         -- frame: bd spans the whole side strip, so an opaque box that wide
         -- blanks out everything beside the glyph (e.g. a reader progress bar).
         local FG  = require("lib/bookshelf_footer_geom")
-        local art = FG.barMetrics().art
-        local cx    = bd.x + math.floor(bd.w / 2)
-        local box_x = cx - math.floor(art / 2)
+        -- burger_art: the launcher's ACTUAL art size. The in-reader launcher can
+        -- be scaled (#279), so the mask must shrink with it or an oversized
+        -- opaque box blanks the page around a small glyph.
+        local art = self.burger_art or FG.barMetrics().art
+        -- floor((w - art) / 2), NOT centre-minus-half-art. The bars are placed
+        -- by a CenterContainer, which uses the first expression; the two
+        -- disagree by a pixel whenever the strip width and the art size differ
+        -- in parity (bd.w = 100, art = 33: bars at 33, centre-minus-half at
+        -- 34). That pixel is the left edge of the first bar, left showing
+        -- through the close X -- which is what it looked like on device.
+        --
+        -- bar_w == art (FooterGeom.barMetrics), so the mask has no margin to
+        -- absorb the difference: it must land exactly where the bars do.
+        local box_x = bd.x + math.floor((bd.w - art) / 2)
         local box_y = bd.y + FG.focusBorder()
         local box_h = art
-        -- Clip to below the panel's bottom edge so the opaque box never erases
-        -- the panel's bottom-left border corner.
-        local panel_bottom = sh - self.bottom_inset
-        if box_y < panel_bottom then
-            box_h = box_h - (panel_bottom - box_y)
-            box_y = panel_bottom
+        -- The X morphs the VISIBLE hamburger, so it must only be painted where
+        -- the launcher is actually visible: never over the panel (which would
+        -- erase its border / rows). Test the panel rect directly rather than
+        -- assuming the launcher is bottom-anchored -- since #279 the user can
+        -- move it inward (behind the panel) or flip it to the top edge.
+        local panel = self._root_region
+        local covered = panel
+            and box_y < (panel.y + panel.h) and (box_y + box_h) > panel.y
+            and box_x < (panel.x + panel.w) and (box_x + art) > panel.x
+        if covered then
+            local panel_bottom = panel.y + panel.h
+            if box_y + box_h > panel_bottom then
+                -- Pokes out below the panel (the usual bottom-anchored case):
+                -- keep the visible sliver, as before.
+                box_h = box_h - (panel_bottom - box_y)
+                box_y = panel_bottom
+            else
+                -- Entirely behind the panel: there is no glyph on screen to
+                -- morph, so draw nothing at all.
+                box_h = 0
+            end
         end
         box_h = math.max(0, box_h) -- short dimens: never go negative
+        if box_h > 0 then
         -- Custom-painted X, NOT a glyph: the close X replaces the painted
         -- hamburger bars in the same slot, so the two must read at the SAME
         -- stroke weight — and glyph strokes can't be tuned (U+2715 was the
@@ -1249,6 +1423,25 @@ function StartMenu:_build()
         -- Ink footprint matches the bars' span (~62% of the art square),
         -- which also tracks the old glyph's ~70%-of-em ink box.
         local xspan = math.floor(art * 0.62)
+        -- THE SAME QUESTION THE FOOTER ASKS. This X is a repaint of the
+        -- footer's own close glyph, in the footer's own slot, so it takes the
+        -- footer's colour: _chromeInk. A literal black is right almost
+        -- everywhere -- device night mode inverts the whole frame, so black
+        -- paint reaches the panel as white without anyone asking -- and wrong
+        -- the moment the LOOK and the FRAME disagree. A light shelf on an
+        -- inverting panel paints its chrome pre-inverted so it comes out
+        -- light, and a literal black beside it comes out white, on a light
+        -- panel: "when shelf theme is set to light, and device is in dark
+        -- mode, the close icon is invisible" (maintainer).
+        local ink = Blitbuffer.COLOR_BLACK
+        do
+            local ok_i, v = pcall(function()
+                return self.bw and self.bw._chromeInk and self.bw:_chromeInk()
+            end)
+            -- A blitbuffer colour is ffi cdata, so this cannot fold into an
+            -- `and/or`: a nil one still has to fall through to the default.
+            if ok_i and type(v) ~= "nil" then ink = v end
+        end
         local Widget  = require("ui/widget/widget")
         local XWidget = Widget:extend{}
         function XWidget:getSize() return Geom:new{ w = xspan, h = xspan } end
@@ -1257,10 +1450,8 @@ function StartMenu:_build()
             -- Clamp so every square stays inside the art box.
             local last = xspan - stroke
             for t = 0, last do
-                bb:paintRect(x + t, y + t, stroke, stroke,
-                    Blitbuffer.COLOR_BLACK)              -- ↘ diagonal
-                bb:paintRect(x + last - t, y + t, stroke, stroke,
-                    Blitbuffer.COLOR_BLACK)              -- ↙ diagonal
+                bb:paintRect(x + t, y + t, stroke, stroke, ink)  -- ↘ diagonal
+                bb:paintRect(x + last - t, y + t, stroke, stroke, ink)  -- ↙
             end
         end
         local glyph = XWidget:new{}
@@ -1268,17 +1459,66 @@ function StartMenu:_build()
             dimen = Geom:new{ w = art, h = box_h },
             glyph,
         }
+        -- The fill is here to ERASE the hamburger beneath, not to be a colour
+        -- -- the X replaces those bars in the same slot. So it has to be the
+        -- shelf's own paper: a literal white rubs out with a black box once
+        -- the chrome is painting pre-inverted, which is the same disagreement
+        -- the ink above deals with.
+        --
+        -- Over a wallpaper a fill of any colour is just a box, so the erasing
+        -- is done by putting the image's own pixels back and drawing the X
+        -- over them.
+        -- NOT `has_wp and nil or <paper>`: in Lua that always yields the
+        -- paper, because nil is falsy and the `or` takes over.
+        local ok_wp, Wallpaper = pcall(require, "lib/bookshelf_wallpaper")
+        local has_wp = ok_wp and self.bw and self.bw.hasWallpaper
+                       and self.bw:groundIsPainted() or false
+        local close_bg
+        if not has_wp then
+            close_bg = Blitbuffer.COLOR_WHITE
+            local ok_p, paper = pcall(function()
+                local CP = require("lib/bookshelf_cover_progress")
+                return CP.resolvedColors().chrome_bg
+            end)
+            if ok_p and type(paper) ~= "nil" then close_bg = paper end
+        end
+        local close_inner = centered
+        if has_wp then
+            -- The footer carries a tinted panel and this box sits inside it,
+            -- so the eraser has to put the tint back along with the picture;
+            -- the wallpaper alone reads as a dark hole the size of this box.
+            local scrim_c, scrim_s
+            local ok_cp, CoverProgress = pcall(require, "lib/bookshelf_cover_progress")
+            if ok_cp and CoverProgress and CoverProgress.resolvedColors
+                    and self.bw and self.bw.wallpaperScrimStrength then
+                local ok_c, colors = pcall(CoverProgress.resolvedColors)
+                if ok_c and colors then scrim_c = colors.panel_bg end
+                local ok_s, sv = pcall(function()
+                    return self.bw:wallpaperScrimStrength()
+                end)
+                if ok_s then scrim_s = sv end
+            end
+            local eraser = Wallpaper.eraser(true, art, box_h, scrim_c, scrim_s)
+            if eraser then
+                close_inner = OverlapGroup:new{
+                    dimen = Geom:new{ w = art, h = box_h },
+                    eraser,
+                    centered,
+                }
+            end
+        end
         local close_frame = FrameContainer:new{
-            background = Blitbuffer.COLOR_WHITE,
+            background = close_bg,
             bordersize = 0,
             padding    = 0,
-            centered,
+            close_inner,
         }
         group[#group + 1] = OffsetContainer:new{
             x_off = box_x, y_off = box_y, close_frame,
         }
         self._burger_region = Geom:new{ x = box_x, y = box_y,
             w = art, h = box_h }
+        end
     end
 
     self[1] = group
@@ -1377,27 +1617,43 @@ function StartMenu:_close()
     local wiped = false
     if bg and r and anim_steps and Screen.refreshUI then
         wiped = pcall(function()
+            local _perf_t0 = _gettime()
             local rx, ry, rw, rh = r.x, r.y, r.w, r.h
-            local panel_bb = Screen.bb:copy()   -- current: background + panel
+            -- No snapshot of the panel is taken. The screen is already showing
+            -- it, so blitting back only the strip of background revealed by
+            -- each frame leaves the rest of the panel exactly where it is.
+            -- Copying the screen first, to re-blit the panel every frame over
+            -- pixels that already held it, cost a full-screen framebuffer read
+            -- (~76ms on a PW5 at ~30MB/s) for nothing.
+            --
+            -- Retract towards the anchored edge, the exact reverse of the open
+            -- reveal: a bottom-anchored panel wipes DOWN out of view, a
+            -- top-anchored one wipes UP. Always wiping down made a top-anchored
+            -- panel look like it was sliding away from its own button.
+            local from_top = self.anchor_top
             local STEPS, prev_dh = anim_steps, 0
             for i = 1, STEPS do
-                local dh = math.floor(rh * i / STEPS)  -- background revealed top-down
-                Screen.bb:blitFrom(bg, rx, ry, rx, ry, rw, dh)
-                if rh - dh > 0 then
-                    Screen.bb:blitFrom(panel_bb, rx, ry + dh, rx, ry + dh, rw, rh - dh)
-                end
-                if i < STEPS then
-                    local strip_h = dh - prev_dh
-                    if strip_h > 0 then
-                        Screen:refreshUI(rx, ry + prev_dh, rw, strip_h)
+                local dh = math.floor(rh * i / STEPS)  -- background revealed so far
+                local strip_h = dh - prev_dh
+                if strip_h > 0 then
+                    -- from_top: the background returns from the BOTTOM upward,
+                    -- so this frame's strip starts at the new boundary.
+                    -- Otherwise it returns from the top downward.
+                    local strip_y = from_top and (ry + rh - dh) or (ry + prev_dh)
+                    Screen.bb:blitFrom(bg, rx, strip_y, rx, strip_y, rw, strip_h)
+                    if i < STEPS then
+                        Screen:refreshUI(rx, strip_y, rw, strip_h)
                         UIManager:yieldToEPDC(20000)
                     end
-                else
+                end
+                if i == STEPS then
                     Screen:refreshUI(rx, ry, rw, rh)   -- final frame = the background
                 end
                 prev_dh = dh
             end
-            panel_bb:free()
+            logger.dbg(string.format(
+                "[bookshelf perf] StartMenu: closeAnim TOTAL=%.0fms steps=%d region=%dx%d",
+                (_gettime() - _perf_t0) * 1000, STEPS, rw, rh))
         end)
     end
     if bg then bg:free(); self._bg_snapshot = nil end
@@ -1432,7 +1688,11 @@ function StartMenu:onCloseWidget()
     if self[1] and self[1].free then self[1]:free() end
 end
 
-function StartMenu:_activate(entry, tap_rect)
+-- tapped_region: id of the module-declared tap region the gesture landed in
+-- (resolved by the row's onTap via Kit.hitRegion), or nil for whole-row
+-- activation - D-pad select, taps outside every region, and modules that
+-- declare none all pass nil, so on_tap must treat nil as the ordinary tap.
+function StartMenu:_activate(entry, tap_rect, tapped_region)
     if entry.type == "folder" then
         self:_toggleFlyout(entry.id)
         return
@@ -1458,7 +1718,8 @@ function StartMenu:_activate(entry, tap_rect)
         -- on_tap receives a context table (modules that ignore the arg keep
         -- working): bw = the bookshelf widget, menu = this start menu.
         local menu = self
-        local ctx = { bw = self.bw, menu = self, entry = entry, surface = "start_menu" }
+        local ctx = { bw = self.bw, menu = self, entry = entry, surface = "start_menu",
+                      tapped_region = tapped_region }
         -- Per-instance save: persist a change the module made to ctx.entry into
         -- the start-menu list, then reload. (Mirrors the hero ctx.save.)
         function ctx.save()

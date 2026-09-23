@@ -54,15 +54,10 @@ function CoverFetch.resetOnlineCache()
     pcall(lfs.rmdir, root)
 end
 
+-- Shared recursive, pcall-hardened helper (lib/bookshelf_fs); mkdir -p
+-- semantics kept - the online/<book> path is two levels deep.
 local function _ensureDir(dir)
-    if not dir then return false end
-    if lfs.attributes(dir, "mode") == "directory" then return true end
-    local parent = dir:match("^(.*)/[^/]+$")
-    if parent and lfs.attributes(parent, "mode") ~= "directory" then
-        _ensureDir(parent)  -- mkdir -p: the online/<book> path is two levels deep
-    end
-    lfs.mkdir(dir)
-    return lfs.attributes(dir, "mode") == "directory"
+    return require("lib/bookshelf_fs").ensureDir(dir)
 end
 
 -- runWhenOnline(fn[, on_error]) -> ok
@@ -91,7 +86,7 @@ end
 -- optional Accept header value.
 local function _requestString(url, accept)
     local ok_req, http, ltn12, socket, socketutil = pcall(function()
-        return require("socket/http"),
+        return require("socket.http"),
                require("ltn12"),
                require("socket"),
                require("socketutil")
@@ -129,18 +124,97 @@ function CoverFetch.getJson(url)
     return decoded
 end
 
--- download(url, dest_path) -> path|nil, err
+-- Pure-Lua base64 decode (no luasocket `mime` dependency, which is a C module
+-- not always resolvable and impossible to unit-test standalone). Used only for
+-- inline data: cover URIs, which are small thumbnails, so integer arithmetic
+-- per 4-char group is plenty fast. Ignores whitespace/newlines and honours
+-- "=" padding. Exposed on the module so it can be tested directly.
+local _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local _b64rev
+function CoverFetch._base64decode(s)
+    if type(s) ~= "string" then return nil end
+    if not _b64rev then
+        _b64rev = {}
+        for i = 1, #_B64 do _b64rev[_B64:sub(i, i)] = i - 1 end
+    end
+    s = s:gsub("[^A-Za-z0-9+/=]", "")
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c1 = _b64rev[s:sub(i, i)]
+        local c2 = _b64rev[s:sub(i + 1, i + 1)]
+        local ch3, ch4 = s:sub(i + 2, i + 2), s:sub(i + 3, i + 3)
+        local c3, c4 = _b64rev[ch3], _b64rev[ch4]
+        i = i + 4
+        if not c1 or not c2 then break end
+        out[#out + 1] = string.char((c1 * 4 + math.floor(c2 / 16)) % 256)
+        if ch3 ~= "=" and c3 then
+            out[#out + 1] = string.char(((c2 % 16) * 16 + math.floor(c3 / 4)) % 256)
+            if ch4 ~= "=" and c4 then
+                out[#out + 1] = string.char(((c3 % 4) * 64 + c4) % 256)
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+-- download(url, dest_path[, user, password]) -> path|nil, err
 -- Fetch a binary resource to dest_path atomically (tmp then rename). Creates the
 -- parent directory if needed. Overwrites any existing dest_path.
-function CoverFetch.download(url, dest_path)
+--
+-- user/password are OPTIONAL HTTP basic-auth credentials, handed straight to
+-- http.request the way OpdsFeed.fetch does. Password-protected OPDS catalogues
+-- 401 an anonymous thumbnail GET, so without them covers never appear. Both are
+-- needed for luasocket to build the Authorization header; omitting them (the
+-- non-OPDS callers) leaves the request exactly as it was.
+--
+-- opts (OPTIONAL) = { block_timeout = n, total_timeout = n } overrides the
+-- socketutil LARGE pair for this one request. The cover picker's download is a
+-- single, user-initiated, progress-backed fetch and keeps the generous default;
+-- the OPDS thumbnail fill is a serial batch on the main loop and asks for a
+-- much tighter budget so an unresponsive server cannot freeze the shelf.
+function CoverFetch.download(url, dest_path, user, password, opts)
     if type(url) ~= "string" or url == "" or type(dest_path) ~= "string" then
         return nil, "bad args"
     end
+    local auth_user = (type(user) == "string" and user ~= "") and user or nil
+    local auth_pass = (type(password) == "string" and password ~= "") and password or nil
     local parent = dest_path:match("^(.*)/[^/]+$")
     if not _ensureDir(parent) then return nil, "cache dir unavailable" end
 
+    -- Inline data: URI. Some OPDS feeds (Project Gutenberg's category/search
+    -- feeds are the common case) embed the cover thumbnail directly in the
+    -- feed as data:<mime>[;base64],<payload> instead of linking it. There is
+    -- nothing to fetch: decode the payload and write it straight to the cache.
+    -- MUST precede the HTTP path -- KOReader's socket/http has no "data"
+    -- scheme and throws indexing its scheme table, which is exactly why these
+    -- covers never appeared (every passive fetch failed fast, so only a tap's
+    -- separate path ever produced one).
+    local data_spec, data_body = url:match("^data:([^,]*),(.*)$")
+    if data_spec then
+        local bytes
+        if data_spec:find("base64", 1, true) then
+            bytes = CoverFetch._base64decode(data_body)
+        else
+            bytes = (data_body:gsub("%%(%x%x)", function(h)
+                return string.char(tonumber(h, 16))
+            end))
+        end
+        if type(bytes) ~= "string" or bytes == "" then return nil, "empty data uri" end
+        local dtmp = dest_path .. ".tmp"
+        local df = io.open(dtmp, "wb")
+        if not df then return nil, "cannot open temp file" end
+        df:write(bytes)
+        df:close()
+        pcall(os.remove, dest_path)
+        if not os.rename(dtmp, dest_path) then
+            pcall(os.remove, dtmp)
+            return nil, "rename failed"
+        end
+        return dest_path
+    end
+
     local ok_req, http, ltn12, socket, socketutil = pcall(function()
-        return require("socket/http"),
+        return require("socket.http"),
                require("ltn12"),
                require("socket"),
                require("socketutil")
@@ -150,13 +224,32 @@ function CoverFetch.download(url, dest_path)
     local tmp = dest_path .. ".tmp"
     local file = io.open(tmp, "wb")
     if not file then return nil, "cannot open temp file" end
+    local block_t = (opts and opts.block_timeout) or socketutil.LARGE_BLOCK_TIMEOUT
+    local total_t = (opts and opts.total_timeout) or socketutil.LARGE_TOTAL_TIMEOUT
     local ok_req2, code = pcall(function()
-        socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(block_t, total_t)
+        local headers = { ["User-Agent"] = "KOReader-Bookshelf" }
+        -- Set explicitly, because luasocket LOSES IT ON A REDIRECT: it builds
+        -- the header into a table adjustheaders creates, then rebuilds a 3xx
+        -- follow-up from the ORIGINAL request's headers, passing neither user
+        -- nor password. The second hop goes out unauthenticated and the
+        -- server answers 401. Same defect the feed fetch had, fixed there in
+        -- 12ba447; a cover url that redirects (a CDN, a signed-url handoff,
+        -- a trailing-slash tidy-up) hits it here. Confusing to debug from the
+        -- outside, because the shelf populates and only the pictures go
+        -- missing. The caller's headers are the one thing tredirect carries.
+        local ok_h, Http = pcall(require, "lib/bookshelf_http")
+        if ok_h and Http and Http.basicAuthHeader then
+            local a = Http.basicAuthHeader(auth_user, auth_pass)
+            if a then headers["Authorization"] = a end
+        end
         local c = socket.skip(1, http.request({
             url = url, method = "GET",
-            headers = { ["User-Agent"] = "KOReader-Bookshelf" },
+            headers = headers,
             sink = ltn12.sink.file(file),
             redirect = true,
+            user = auth_user,
+            password = auth_pass,
         }))
         socketutil:reset_timeout()
         return c
@@ -164,6 +257,16 @@ function CoverFetch.download(url, dest_path)
     pcall(function() socketutil:reset_timeout() end)
     if not ok_req2 or code ~= 200 then
         pcall(os.remove, tmp)
+        -- 429 gets the same word the feed layer uses, because the caller has
+        -- to be able to ACT on it rather than just log it. A rate-limited
+        -- cover is the commonest refusal of all -- a page of twenty books is
+        -- twenty requests -- and when it came back as an opaque "download
+        -- failed" string the pool could only narrow and carry on, spending
+        -- the window the server had just asked us to stop spending
+        -- (issue 434: measured, a capped server saw 7 refused cover requests
+        -- in a row and no back-off was recorded at all, because none of them
+        -- went through the feed fetch that knows about 429s).
+        if code == 429 then return nil, "ratelimited" end
         return nil, "download failed (" .. tostring(code) .. ")"
     end
     pcall(os.remove, dest_path)

@@ -242,21 +242,14 @@ end
 
 -- ─── Helpers ─────────────────────────────────────────────────────────────────
 
+-- Shared, gettext-wrapped formatter (the local copies this replaces rendered
+-- untranslated "h"/"m" unit letters).
 local function fmtDuration(secs)
-    secs = math.max(0, tonumber(secs) or 0)
-    local h = math.floor(secs / 3600)
-    local m = math.floor((secs % 3600) / 60)
-    if h > 0 and m > 0 then return string.format("%dh %02dm", h, m) end
-    if h > 0 then return string.format("%dh", h) end
-    return string.format("%dm", m)
+    return require("lib/bookshelf_module_kit").fmtDuration(secs)
 end
 
 local function fmtTargetHours(min)
-    local h = math.floor(min / 60)
-    local m = min % 60
-    if h > 0 and m > 0 then return string.format("%dh %02dm", h, m) end
-    if h > 0 then return string.format("%dh", h) end
-    return string.format("%dm", m)
+    return fmtDuration((tonumber(min) or 0) * 60)
 end
 
 local MONTH_NAMES = {
@@ -269,23 +262,21 @@ local MONTH_NAMES = {
 local function showSettings(ctx)
     local ButtonDialog = require("ui/widget/buttondialog")
     local UIManager    = require("ui/uimanager")
+    local Kit          = require("lib/bookshelf_module_kit")
     local S = store()
     local dialog
 
     local function reload()
         _data_cache = nil
-        UIManager:close(dialog)
-        if ctx and ctx.menu and ctx.menu._reload then ctx.menu:_reload() end
-        showSettings(ctx)
+        Kit.settingsReopen(ctx, dialog, showSettings)
     end
 
     -- ── Active-goals toggle row ──
     local active = readActive()
     local function goalToggle(label, goal)
-        local on = active[goal] == true
-        return {
-            text = (on and "\xE2\x9C\x93 " or "  ") .. label,
-            callback = function()
+        return Kit.radioRow{
+            label = label, active = active[goal] == true, toggle = true,
+            on_pick = function()
                 local a = readActive()
                 a[goal] = not a[goal]
                 -- ensure at least one stays active
@@ -302,11 +293,9 @@ local function showSettings(ctx)
 
     -- ── Daily target row ──
     local function dailyBtn(label, min)
-        local cur = readDaily()
-        return {
-            text = (cur == min and "\xE2\x9C\x93 " or "  ") .. label,
-            callback = function()
-                if readDaily() == min then return end
+        return Kit.radioRow{
+            label = label, active = readDaily() == min,
+            on_pick = function()
                 S.save(KEY_DAILY, min)
                 reload()
             end,
@@ -315,11 +304,9 @@ local function showSettings(ctx)
 
     -- ── Weekly target row ──
     local function weeklyBtn(label, min)
-        local cur = readWeekly()
-        return {
-            text = (cur == min and "\xE2\x9C\x93 " or "  ") .. label,
-            callback = function()
-                if readWeekly() == min then return end
+        return Kit.radioRow{
+            label = label, active = readWeekly() == min,
+            on_pick = function()
                 S.save(KEY_WEEKLY, min)
                 reload()
             end,
@@ -328,11 +315,9 @@ local function showSettings(ctx)
 
     -- ── Monthly target row ──
     local function monthlyBtn(n)
-        local cur = readMonthly()
-        return {
-            text = (cur == n and "\xE2\x9C\x93 " or "  ") .. tostring(n),
-            callback = function()
-                if readMonthly() == n then return end
+        return Kit.radioRow{
+            label = n, active = readMonthly() == n,
+            on_pick = function()
                 S.save(KEY_MONTHLY, n)
                 reload()
             end,
@@ -341,11 +326,9 @@ local function showSettings(ctx)
 
     -- ── Yearly target row ──
     local function yearlyBtn(n)
-        local cur = readYearly()
-        return {
-            text = (cur == n and "\xE2\x9C\x93 " or "  ") .. tostring(n),
-            callback = function()
-                if readYearly() == n then return end
+        return Kit.radioRow{
+            label = n, active = readYearly() == n,
+            on_pick = function()
                 S.save(KEY_YEARLY, n)
                 reload()
             end,
@@ -500,8 +483,24 @@ local function buildGoalBlock(goal, mw, scale_pct, data, t)
     local Geom       = require("ui/geometry")
     local Kit        = require("lib/bookshelf_module_kit")
     local sc = Kit.sc(scale_pct)
-    -- BLACK is the progress-bar FILL (a drawing colour, not text).
-    local BLACK = Blitbuffer.COLOR_BLACK
+    -- The bar is DRAWING, not text, so nothing hands it a colour: it was a
+    -- hard-coded black fill on a fixed 0xCC track. Under the shelf's dark
+    -- theme that reads exactly backwards -- the black fill sinks into the card
+    -- and the pale track becomes the part that looks filled, so a goal at 20%
+    -- shows as a goal at 80%.
+    --
+    -- Fill is the card's ink. The track keeps the relationship it has always
+    -- had to it: 0xCC is a seventh of the way from the 0xEE card toward black,
+    -- so a seventh of the way from the card toward the ink reproduces the
+    -- light theme exactly (238 + (0-238)/7 = 204 = 0xCC) and gives the dark
+    -- one a 0x33 track on its near-black card.
+    local FILL  = Kit.COLOR_PRIMARY or Blitbuffer.COLOR_BLACK
+    local TRACK = Blitbuffer.Color8(0xCC)
+    local ok_lum, lum = pcall(function() return FILL:getColor8().a end)
+    if ok_lum and type(lum) == "number" then
+        local card = (lum > 128) and 0x11 or 0xEE
+        TRACK = Blitbuffer.Color8(math.floor(card + (lum - card) / 7 + 0.5))
+    end
 
     local header_text, big_text, suffix, pct, context_text = computeGoal(goal, data, t)
 
@@ -516,8 +515,8 @@ local function buildGoalBlock(goal, mw, scale_pct, data, t)
     function Bar:getSize() return Geom:new{ w = bar_w, h = bar_h } end
     function Bar:paintTo(bb, x, y)
         self.dimen = Geom:new{ x = x, y = y, w = bar_w, h = bar_h }
-        bb:paintRect(x, y, bar_w, bar_h, Blitbuffer.Color8(0xCC))
-        if fill_w > 0 then bb:paintRect(x, y, fill_w, bar_h, BLACK) end
+        bb:paintRect(x, y, bar_w, bar_h, TRACK)
+        if fill_w > 0 then bb:paintRect(x, y, fill_w, bar_h, FILL) end
     end
 
     return Kit.valueCard{

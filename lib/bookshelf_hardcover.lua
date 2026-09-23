@@ -23,6 +23,11 @@ local _links
 local _external_links
 local _cache_db                 -- SQLite handle for the Hardcover cache (lazy)
 local _cache_memo = {}          -- [kind][ckey] -> decoded value (false = known-absent)
+-- [kind] -> true when the memo holds EVERY row of that kind, so a memo miss is
+-- a real absence and needs no query. Set only by a bulk load; cleared wherever
+-- _cache_memo is (invalidate, _cacheDelKind, _cacheReplaceKind). _cachePut
+-- keeps the memo in step with the DB, so a single write does not unset it.
+local _cache_bulk = {}
 local _hc_settings
 local _hc_settings_object
 
@@ -36,15 +41,9 @@ local function _cacheDir()
     return DataStorage:getSettingsDir() .. "/bookshelf_hardcover"
 end
 
+-- Shared recursive, pcall-hardened helper (lib/bookshelf_fs).
 local function _ensureDir(path)
-    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-    if not ok_lfs or not lfs or type(lfs.attributes) ~= "function" then return false end
-    if lfs.attributes(path, "mode") == "directory" then return true end
-    if type(lfs.mkdir) == "function" then
-        local ok = pcall(lfs.mkdir, path)
-        return ok and lfs.attributes(path, "mode") == "directory"
-    end
-    return false
+    return require("lib/bookshelf_fs").ensureDir(path)
 end
 
 local function _openExternalSettings()
@@ -182,6 +181,9 @@ local function _cacheGet(kind, ckey)
         local v = m[ckey]
         return v ~= false and v or nil
     end
+    -- Every row of this kind is already memoised, so not being there IS the
+    -- answer. Without this a bulk load would still pay a query per absent key.
+    if _cache_bulk[kind] then return nil end
     local v
     local db = _cacheDb()
     if db then
@@ -217,6 +219,7 @@ end
 
 local function _cacheDelKind(kind)
     _cache_memo[kind] = nil
+    _cache_bulk[kind] = nil
     local db = _cacheDb()
     if not db then return end
     pcall(function()
@@ -238,8 +241,9 @@ local function _cacheCount(kind)
     return (ok and n) or 0
 end
 
--- Whole-kind read / replace — used ONLY by the deliberate ratings-refresh
--- sweep, which is inherently set-wide; never on the hot render path.
+-- Whole-kind read / replace. Set-wide by nature: the ratings-refresh sweep,
+-- and Hardcover.preloadMetadata below, which puts this ON the render path for
+-- one query rather than one per book.
 local function _cacheReadKind(kind)
     local out = {}
     local db = _cacheDb()
@@ -273,6 +277,7 @@ local function _cacheReplaceKind(kind, tbl)
         stmt:close()
     end)
     _cache_memo[kind] = nil
+    _cache_bulk[kind] = nil
 end
 
 -- Merge a single book's aggregate rating into the ratings cache (per-book).
@@ -568,10 +573,54 @@ local function _mirrorExternalLink(filepath, config)
     _notifyLoadedHardcoverSettings(filepath, config, original)
 end
 
+-- linkedFiles() -> { filepath, ... }
+-- Every locally-linked book, from the Hardcover plugin's own link store.
+-- The bulk details refresh walks this list (refreshBook re-fetches one
+-- book's enrichment and re-caches it).
+function Hardcover.linkedFiles()
+    local out = {}
+    pcall(function()
+        local settings = _openHardcoverSettingsObject()
+        local books = settings and settings:readSetting("books")
+        if type(books) ~= "table" then return end
+        for fp, cfg in pairs(books) do
+            if type(fp) == "string" and type(cfg) == "table" and cfg.book_id then
+                out[#out + 1] = fp
+            end
+        end
+        table.sort(out)
+    end)
+    return out
+end
+
+-- linkedPages() -> { [filepath] = pages }
+-- The Hardcover plugin stores the matched edition's page count per linked
+-- book (that is how it reports reading progress as print pages). For the
+-- shelf that is a STABLE page count one local read away -- no network, no
+-- document render -- so the bulk page-count scan harvests these before
+-- paying the heavy per-book pagination (user insight). Empty table when
+-- the plugin or its settings are absent.
+function Hardcover.linkedPages()
+    local out = {}
+    pcall(function()
+        local settings = _openHardcoverSettingsObject()
+        local books = settings and settings:readSetting("books")
+        if type(books) ~= "table" then return end
+        for fp, cfg in pairs(books) do
+            local p = type(cfg) == "table" and tonumber(cfg.pages) or nil
+            if p and p > 0 and type(fp) == "string" then
+                out[fp] = math.floor(p)
+            end
+        end
+    end)
+    return out
+end
+
 function Hardcover.invalidate()
     _links = nil
     _external_links = nil
     _cache_memo = {}
+    _cache_bulk = {}
     _hc_settings = nil
     _hc_settings_object = nil
 end
@@ -702,6 +751,58 @@ function Hardcover.clearLink(filepath)
     pcall(_mirrorExternalLink, filepath, {
         _delete = { "book_id", "edition_id", "edition_format", "pages", "title" },
     })
+    Hardcover.invalidate()
+    return true
+end
+
+-- Batch form of relinkPath: one read and one save for the whole list
+-- instead of a full settings write per book (which is what made a bulk
+-- move pay a file write per link). `pairs_list` is { {old, new}, ... }.
+-- Returns how many links moved.
+function Hardcover.relinkPaths(pairs_list)
+    if type(pairs_list) ~= "table" or #pairs_list == 0 then return 0 end
+    local links = _readLinks()
+    local moved, mirror = 0, {}
+    for _i, pair in ipairs(pairs_list) do
+        local old_fp, new_fp = pair[1], pair[2]
+        local payload = old_fp and new_fp and old_fp ~= new_fp and links[old_fp] or nil
+        if type(payload) == "table" then
+            links[old_fp] = nil
+            links[new_fp] = payload
+            moved = moved + 1
+            mirror[#mirror + 1] = { old_fp, new_fp, payload }
+        end
+    end
+    if moved == 0 then return 0 end
+    _saveLinks(links)
+    -- The external-app mirror is per book by nature (it writes into each
+    -- book's own store), and best effort for the same reason as below.
+    for _i, m in ipairs(mirror) do
+        pcall(_mirrorExternalLink, m[1], {
+            _delete = { "book_id", "edition_id", "edition_format", "pages", "title" },
+        })
+        pcall(_mirrorExternalLink, m[2], m[3])
+    end
+    Hardcover.invalidate()
+    return moved
+end
+
+-- Re-key a link when its book file moves. Preserves the payload
+-- untouched. The external-app mirror calls are best effort: the old
+-- sidecar may already have moved (DocSettings.updateLocation runs
+-- first in the move sequence), so both are pcall'd.
+function Hardcover.relinkPath(old_fp, new_fp)
+    if not (old_fp and new_fp) or old_fp == new_fp then return false end
+    local links = _readLinks()
+    local payload = links[old_fp]
+    if type(payload) ~= "table" then return false end
+    links[old_fp] = nil
+    links[new_fp] = payload
+    _saveLinks(links)
+    pcall(_mirrorExternalLink, old_fp, {
+        _delete = { "book_id", "edition_id", "edition_format", "pages", "title" },
+    })
+    pcall(_mirrorExternalLink, new_fp, payload)
     Hardcover.invalidate()
     return true
 end
@@ -976,6 +1077,17 @@ function Hardcover.autoDecideFlags(book, enrichment)
                 local ew, eh = _parseSizetag(book.cover_sizetag)
                 local hw = tonumber(enrichment.cover_width)
                 local hh = tonumber(enrichment.cover_height)
+                if not (hw and hh) and type(enrichment.cover_path) == "string" then
+                    -- Hardcover usually reports the image's dimensions; when
+                    -- it does not, read them from the file we just downloaded
+                    -- rather than falling through to "keep the embedded
+                    -- cover" on a missing number.
+                    local ok_img, ImageSource =
+                        pcall(require, "lib/bookshelf_image_source")
+                    if ok_img and ImageSource.probeSize then
+                        hw, hh = ImageSource.probeSize(enrichment.cover_path)
+                    end
+                end
                 if ew and eh and hw and hh then
                     adopt = (hw * hh) > (ew * eh)
                 end
@@ -1152,6 +1264,13 @@ end
 -- Author / series extraction from a hydrated Hardcover search hit, mirroring
 -- the vendored search_dialog.lua (contributions may be a single .author string
 -- or an array of { author = { name } }; book_series[1].series.name is series).
+--
+-- ONLY plain authorship counts. cached_contributors lists every credited
+-- contributor with a role string ("Narrator", "Translator", "Illustrator",
+-- ... nil/empty for the authors themselves); joining them all put audiobook
+-- narrators into the author field, and the Authors shelf then grew a
+-- second one-book card per affected title (device report: Never Flinch
+-- under Stephen King AND under his narrator).
 local function _candidateAuthor(b)
     local c = b and b.contributions
     if type(c) ~= "table" then return nil end
@@ -1160,7 +1279,10 @@ local function _candidateAuthor(b)
     for _, a in ipairs(c) do
         if type(a) == "table" and type(a.author) == "table"
                 and type(a.author.name) == "string" then
-            names[#names + 1] = a.author.name
+            local role = a.contribution
+            if role == nil or role == "" or role == "Author" then
+                names[#names + 1] = a.author.name
+            end
         end
     end
     return #names > 0 and table.concat(names, ", ") or nil
@@ -1225,6 +1347,58 @@ local function _candidateGenres(b)
     return #out > 0 and out or nil
 end
 
+-- searchCandidates(modules, user_id, title, author) -> books | nil, err
+--
+-- THE ONE candidate search, shared by bestGuessLink and showBookPicker
+-- (issue 310). The bulk Best Guess used to search once with title + author
+-- and score only that set, while the picker had learned (f41c4f3) that an
+-- author-appended query can skew Hardcover's fuzzy search badly enough that
+-- the real book never appears -- "Katabasis R. F. Kuang" returns database
+-- books, "Katabasis" alone returns the novel. The retry lived only in the
+-- picker, so the reporter watched the bulk scan link 17 of 610 books whose
+-- correct match the individual picker surfaced immediately.
+--
+-- The retry fires only when NO hit's title clears the existing title
+-- threshold, and the merged set is deduplicated by book id -- so when the
+-- combined query already found the book, this is exactly one search, and the
+-- conservative 80/80 matcher downstream is untouched either way.
+function Hardcover.searchCandidates(modules, user_id, title, author)
+    local ok, books = pcall(function()
+        return modules.Api:findBooks(title, author or "", user_id)
+    end)
+    if not ok or type(books) ~= "table" then
+        return nil, "Hardcover search failed"
+    end
+    if author and author ~= "" then
+        local Match = require("lib/bookshelf_hardcover_match")
+        local matched = false
+        for _, b in ipairs(books) do
+            local ts = select(1, Match.scoreMatch(title, "x", b.title or "", "x"))
+            if ts and ts >= Match.TITLE_THRESHOLD then matched = true break end
+        end
+        if not matched then
+            local ok2, more = pcall(function()
+                return modules.Api:findBooks(title, "", user_id)
+            end)
+            if ok2 and type(more) == "table" and #more > 0 then
+                local seen = {}
+                for _, b in ipairs(books) do
+                    local id = b.book_id or b.id
+                    if id then seen[id] = true end
+                end
+                for _, b in ipairs(more) do
+                    local id = b.book_id or b.id
+                    if id and not seen[id] then
+                        seen[id] = true
+                        books[#books + 1] = b
+                    end
+                end
+            end
+        end
+    end
+    return books
+end
+
 -- "Best guess" link: full-text search Hardcover by the book's title + author,
 -- score the hits with the ebook-enricher heuristics, and link the best
 -- confident, canonical match (or nothing). Like linkFromEmbeddedIdentifiers it
@@ -1238,12 +1412,10 @@ function Hardcover.bestGuessLink(book)
 
     local modules, _settings, user_id, ctx_err = _openPickerContext()
     if not modules then return false, ctx_err end
-    local ok_search, results = pcall(function()
-        return modules.Api:findBooks(title, author or "", user_id)
-    end)
-    if not ok_search or type(results) ~= "table" then
-        return false, "Hardcover search failed"
-    end
+    -- Through the shared search, retry included -- see searchCandidates.
+    local results, search_err = Hardcover.searchCandidates(
+        modules, user_id, title, author)
+    if not results then return false, search_err end
     if #results == 0 then return false, "no_match" end
 
     local cands = {}
@@ -1283,39 +1455,10 @@ function Hardcover.showBookPicker(book, opts)
     if embedded then
         books = { embedded }
     else
-        books, err = modules.Api:findBooks(title, author, user_id)
-        -- findBooks appends the author to the query, which can skew Hardcover's
-        -- fuzzy search badly (e.g. "Katabasis R. F. Kuang" returns database
-        -- books). If none of the hits' titles resemble the book's, retry
-        -- title-only and merge the new ones in -- "Katabasis" alone tends to
-        -- surface the real book.
-        if author and author ~= "" and type(books) == "table" then
-            local Match = require("lib/bookshelf_hardcover_match")
-            local matched = false
-            for _, b in ipairs(books) do
-                local ts = select(1, Match.scoreMatch(title, "x", b.title or "", "x"))
-                if ts and ts >= Match.TITLE_THRESHOLD then matched = true; break end
-            end
-            if not matched then
-                local ok2, more = pcall(function()
-                    return modules.Api:findBooks(title, "", user_id)
-                end)
-                if ok2 and type(more) == "table" and #more > 0 then
-                    local seen = {}
-                    for _, b in ipairs(books) do
-                        local id = b.book_id or b.id
-                        if id then seen[id] = true end
-                    end
-                    for _, b in ipairs(more) do
-                        local id = b.book_id or b.id
-                        if id and not seen[id] then
-                            seen[id] = true
-                            books[#books + 1] = b
-                        end
-                    end
-                end
-            end
-        end
+        -- The shared search, retry and dedupe included: this is where the
+        -- title-only fallback was born (f41c4f3), and issue 310 is what
+        -- letting it drift out of step with the bulk path cost.
+        books, err = Hardcover.searchCandidates(modules, user_id, title, author)
     end
     if not books then return false, err or "No response from Hardcover" end
 
@@ -1585,7 +1728,7 @@ local function _downloadImage(url, key, force)
     end
 
     local ok_require, http, ltn12, socket, socketutil = pcall(function()
-        return require("socket/http"),
+        return require("socket.http"),
                require("ltn12"),
                require("socket"),
                require("socketutil")
@@ -1641,6 +1784,7 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
                 contributions: cached_contributors
                 cached_tags
                 book_series { position series { name } }
+                pages
                 rating
                 ratings_count
                 reviews_count
@@ -1649,6 +1793,7 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
                 id
                 title
                 cached_image
+                pages
               }
             }
         ]]
@@ -1671,6 +1816,7 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
                 contributions: cached_contributors
                 cached_tags
                 book_series { position series { name } }
+                pages
                 rating
                 ratings_count
                 reviews_count
@@ -1719,6 +1865,11 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
         series_name = _candidateSeries(data.book),
         series_position = _candidateSeriesPosition(data.book),
         genres = _candidateGenres(data.book),
+        -- Page count rides the same query for free: the linked edition's
+        -- print pages when known, the book's canonical count otherwise.
+        -- refreshBook writes it back into the link store, which is where
+        -- linkedPages() / the bulk page-count scan read from.
+        pages = tonumber(edition and edition.pages) or tonumber(data.book.pages),
         fetched_at = os.time(),
     }
 end
@@ -1742,6 +1893,31 @@ function Hardcover.refreshBook(book, opts)
     if not ok then return false, payload end
     _cachePut("enrich", _cacheKey(link.book_id, link.edition_id), payload)
     _backfillRatingEntry(link.book_id, payload)
+    -- Everything in the enrichment CACHE row was just replaced wholesale
+    -- (authors, genres, series, description, ratings -- corrections on
+    -- Hardcover flow in automatically). The two fields living OUTSIDE that
+    -- row are in the plugin's link store: pages (what linkedPages() and
+    -- the bulk page-count scan read) and the display title the sync
+    -- plugin shows. Refresh heals both; link identity is untouched.
+    do
+        local upd = {}
+        if tonumber(payload.pages) then
+            upd.pages = math.floor(tonumber(payload.pages))
+        end
+        if type(payload.title) == "string" and payload.title ~= "" then
+            upd.title = payload.title
+        end
+        if next(upd) then
+            pcall(function()
+                local settings = _openHardcoverSettingsObject()
+                if settings then
+                    local original = _applyExternalBookSetting(settings,
+                        book.filepath, upd)
+                    _notifyLoadedHardcoverSettings(book.filepath, upd, original)
+                end
+            end)
+        end
+    end
     -- First-link defaults for the per-book cover/description overrides. Guarded
     -- internally to fire once (only on undecided flags) -- safe to call on every
     -- refresh.
@@ -1987,6 +2163,35 @@ end
 -- all memoized -- no file I/O) so it's cheap enough to also run on the light
 -- grouping records, keeping the genre/author/series chips in sync with the
 -- per-book tag pills. Cover/description stay under their per-book toggles.
+-- Load every cached enrichment row in one query, for a caller about to ask
+-- about a whole library's worth of books.
+--
+-- applyMetadata runs once per book while the light-meta map is built. Each of
+-- those asked the cache for one row, and _cacheGet compiles a fresh SELECT for
+-- every distinct key, so a library with 229 linked books compiled and ran 229
+-- statements. Measured on a PW5 that was 231ms of a 663ms map build, itself a
+-- quarter of a 2.3s cold start. One query for the same rows costs a few ms.
+--
+-- Gated on the same two conditions applyMetadata checks, so a user who has no
+-- Hardcover plugin or has the override switched off does not read the table at
+-- all. Enrichment rows are small (235 rows / 330KB on the reference device) and
+-- the caller was about to hold every one of them decoded anyway, so this
+-- changes when the memory is taken, not how much.
+function Hardcover.preloadMetadata()
+    if _cache_bulk.enrich then return end
+    if not Hardcover.isAvailable() then return end
+    if not BookshelfSettings.isTrue("hardcover_use_metadata") then return end
+    local rows = _cacheReadKind("enrich")
+    local memo = _cache_memo.enrich or {}
+    for ckey, v in pairs(rows) do
+        -- Never overwrite a live memo entry: a _cachePut earlier this session
+        -- is newer than what the read returned.
+        if memo[ckey] == nil then memo[ckey] = v end
+    end
+    _cache_memo.enrich = memo
+    _cache_bulk.enrich = true
+end
+
 function Hardcover.applyMetadata(book)
     -- Reached directly on the light grouping-record path (not just via
     -- enrichBook), so it needs its own availability gate: with the plugin gone,

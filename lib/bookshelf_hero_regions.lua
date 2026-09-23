@@ -5,6 +5,7 @@
 
 local Regions = {}
 
+
 Regions.SETTINGS_KEY = "bookshelf_hero_regions"
 
 -- Render order from top to bottom. Renderer and chooser modal both use
@@ -12,15 +13,19 @@ Regions.SETTINGS_KEY = "bookshelf_hero_regions"
 Regions.ORDER = { "status", "rating", "title", "author", "metadata", "description", "tags", "progress" }
 
 Regions.DEFAULTS = {
-    status = {
-        template  = "\xef\x82\xa0 %disk[if:batt]  %batt_icon%batt[/if]"
-                 .. "[if:light]  %light_icon%light_pct[/if]  %wifi_icon  %time_12h",
-        font_face = nil,
-        font_size = 14,
-        bold      = false,
-        uppercase = false,
-        alignment = "right",
-    },
+    -- Sourced from the vendored status_line module rather than written out
+    -- here, because bookends mirrors this exact region (#348) and needs the
+    -- SAME defaults: bookshelf only writes the settings key once a user edits
+    -- a region, so on a default install the mirror has nothing to read and
+    -- must fall back to precisely what this renders. One definition, both
+    -- plugins. Copied rather than aliased: this table is handed to the line
+    -- editor as its `defaults`, and a shared mutable table reaching across a
+    -- vendored boundary is a trap waiting to be sprung.
+    status = (function()
+        local out = {}
+        for k, v in pairs(require("lib/status_line").DEFAULTS) do out[k] = v end
+        return out
+    end)(),
     title = {
         template  = "%title",
         font_face = nil,
@@ -50,7 +55,7 @@ Regions.DEFAULTS = {
         alignment = "right",
     },
     author = {
-        template  = "[if:authors]%authors[else]%author[/if]",
+        template  = "%authors_short",
         font_face = nil,
         font_size = 16,
         bold      = false,
@@ -68,7 +73,7 @@ Regions.DEFAULTS = {
         disabled  = true,     -- off by default; user opts in
     },
     description = {
-        template  = "%description",
+        template  = "[if:rating]%rating \xC2\xB7 [/if]%description",
         font_face = nil,
         font_size = 14,
         bold      = false,
@@ -76,7 +81,7 @@ Regions.DEFAULTS = {
         -- no `uppercase` — would be hostile on a long blurb
     },
     progress = {
-        template   = "[if:page_num]%page_num / %page_count[else]%book_pct[/if]  %bar  [if:book_time_left]%book_time_left LEFT[/if]",
+        template   = "%book_pct  %bar  [if:book_time_left]%book_time_left[/if]",
         font_face  = nil,
         font_size  = 14,
         bold       = true,
@@ -215,7 +220,12 @@ end
 -- "rating") fall through to Regions.DEFAULTS.
 Regions.FRESH_INSTALL = {
     status = {
-        template  = "%time_12h %spacer  %disk[if:batt]  %batt_icon%batt[/if][if:light]  %light_icon%light_pct[/if]  %wifi_icon",
+        -- The disk figure gets the same drive glyph the other readings have,
+        -- so the row reads as icon-and-value throughout instead of one bare
+        -- number among four labelled ones. U+F0A0, the glyph Regions.DEFAULTS
+        -- already uses for it; Private Use Area, which the bundled symbols
+        -- face covers.
+        template  = "%time_12h %spacer  \xEF\x82\xA0 %disk[if:batt]  %batt_icon%batt[/if][if:light]  %light_icon%light_pct[/if]  %wifi_icon",
         font_size = 14, bold = true, uppercase = false, alignment = "right",
     },
     title = {
@@ -228,7 +238,11 @@ Regions.FRESH_INSTALL = {
         font_face = "Caveat-Regular.ttf", font_size = 26, bold = false,
         uppercase = false, alignment = "left",
     },
+    -- OFF. The series it prints is already a pill in the tags line below, so
+    -- on this layout it was the same fact twice. The template stays, waiting
+    -- in the editor for anyone who enables the line.
     metadata = {
+        disabled  = true,
         template  = "[if:series]%series_name[if:series_num] / #%series_num[/if][/if]",
         font_size = 14, bold = true, uppercase = false, alignment = "right",
     },
@@ -236,7 +250,20 @@ Regions.FRESH_INSTALL = {
         template  = "[if:rating]%rating \xC2\xB7 [/if]%description",
         font_size = 16, bold = false, alignment = "left",
     },
-    tags = { disabled = false },
+    -- Series and genre only, one row. Author already has its own line
+    -- directly above; collections and folder say where the file lives rather
+    -- than what the book is. One row because the panel is a summary -- a
+    -- second row costs the description a line to show what the "+N" button
+    -- already reaches.
+    tags = {
+        disabled         = false,
+        show_author      = false,
+        show_series      = true,
+        show_collections = false,
+        show_genres      = true,
+        show_folder      = false,
+        max_rows         = 1,
+    },
     progress = {
         template   = "%book_pct  %bar  [if:book_time_left]%book_time_left[/if]",
         font_size  = 14, bold = true, uppercase = false, alignment = "left",

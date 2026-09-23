@@ -39,6 +39,7 @@ local DEFAULT_HEX = {
     border      = "#000000",
     invert      = "#FFFFFF",
     metro_fill  = "#000000",
+    plank       = "#B08050",  -- the spine shelf's wood: light oak (see cover_progress DEFAULT_PLANK)
     text_color  = nil,        -- "book text color" — clear rather than default
     symbol_color = nil,       -- "match text" — clear rather than default
     -- Cover-indicator colors (bookshelf-specific). bookmark matches
@@ -62,6 +63,11 @@ local DEFAULT_HEX = {
     -- both lookups.
     folder_bg   = "#E7C9A9",
     folder_fg   = "#000000",
+    -- Selected chip (#294). Defaults describe the appearance the invert
+    -- produces today (black fill, paper-white label), so the picker opens on
+    -- what the user is already looking at.
+    chip_selected_bg = "#000000",
+    chip_selected_fg = "#FFFFFF",
 }
 
 function Color.defaultHexFor(field) return DEFAULT_HEX[field] end
@@ -165,6 +171,40 @@ function Color.parseColorValue(v, is_color_enabled)
     end
 
     return nil
+end
+
+-- invertValue(v) -> the same storage shape, inverted.
+--
+-- Works on the STORED value, not the parsed Blitbuffer colour, so the parse
+-- cache and the greyscale luminance path are untouched -- an inverted hex is
+-- just another hex.
+--
+-- This exists for the shelf's own dark theme. Bookshelf's night colours are
+-- stored PRE-INVERTED, for a panel that will flip the whole frame; when the
+-- reader wants a dark shelf on a device that is NOT in night mode, nothing
+-- flips them, so they have to be flipped here instead.
+--
+-- false is "none" -- an absence, not a colour -- and inverting it would turn
+-- "no ribbon" into a black one.
+function Color.invertValue(v)
+    local t = type(v)
+    if t == "nil" or t == "boolean" then return v end
+    if t == "number" then
+        if v < 0 then return v end
+        return 255 - math.min(255, v)
+    end
+    if t == "table" then
+        if v.grey then return { grey = 255 - math.max(0, math.min(255, v.grey)) } end
+        if v.hex then
+            local hex = Color.normaliseHex(v.hex)
+            if not hex then return v end
+            local r = 255 - tonumber(hex:sub(2, 3), 16)
+            local g = 255 - tonumber(hex:sub(4, 5), 16)
+            local b = 255 - tonumber(hex:sub(6, 7), 16)
+            return { hex = string.format("#%02X%02X%02X", r, g, b) }
+        end
+    end
+    return v
 end
 
 function Color.flushCache()

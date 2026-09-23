@@ -55,17 +55,14 @@ local function showSettings(ctx)
     local ButtonDialog = require("ui/widget/buttondialog")
     local UIManager    = require("ui/uimanager")
     local Store        = require("lib/bookshelf_settings_store")
+    local Kit          = require("lib/bookshelf_module_kit")
     local dialog
     local function radio(label, store_key, read, value)
-        local active = read() == value
-        return {
-            text = (active and "\xE2\x9C\x93 " or "  ") .. label,
-            callback = function()
-                if read() == value then return end
+        return Kit.radioRow{
+            label = label, active = read() == value,
+            on_pick = function()
                 Store.save(store_key, value)
-                UIManager:close(dialog)
-                if ctx and ctx.menu and ctx.menu._reload then ctx.menu:_reload() end
-                showSettings(ctx)
+                Kit.settingsReopen(ctx, dialog, showSettings)
             end,
         }
     end
@@ -98,8 +95,14 @@ return {
     -- to fit it at a readable size (issue #183). The hero grid passes neither
     -- preview nor a clamp, so the quote keeps its natural height for the fit
     -- engine to shrink to the cell.
+    -- ctx.max_height is a ceiling WITHOUT a cell height: the start menu has no
+    -- fit engine, so it caps a card at what the panel can show while leaving
+    -- ctx.height nil (absent height is what marks "no height constraint", which
+    -- is also how layout shape is decided -- see Kit.shape). Either source
+    -- serves as the room to clamp into.
     render = function(ctx)
-        local width, scale_pct, preview, avail_h = ctx.width, ctx.scale, ctx.preview, ctx.height
+        local width, scale_pct, preview = ctx.width, ctx.scale, ctx.preview
+        local avail_h = ctx.height or ctx.max_height
         local Fonts         = require("lib/bookshelf_fonts")
         local TextWidget    = require("ui/widget/textwidget")
         local VerticalGroup = require("ui/widget/verticalgroup")

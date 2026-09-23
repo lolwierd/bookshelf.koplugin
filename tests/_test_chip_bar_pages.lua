@@ -46,6 +46,9 @@ package.loaded["lib/bookshelf_text_segments"] = {
 package.loaded["lib/bookshelf_settings_store"] = {
     read = function(_, default) return default end,   -- chip_font_scale -> nil -> 100
     isTrue = function() return false end,             -- chip_flex_widths off (equal-share)
+    -- chip_uppercase_labels defaults ON, so the widths measured here are the
+    -- uppercase ones - the same shape the plugin ships with.
+    nilOrTrue = function() return true end,
     generation = function() return 0 end,
 }
 
@@ -140,6 +143,22 @@ test("warmKeys: paginated returns current + next page only (page-bounded)", func
     local set2 = {}; for _i, k in ipairs(b:warmKeys()) do set2[k] = true end
     assert(set2[navKey(b._pages.pages[b._pages.num_pages].first)], "last-page chip warmable when on it")
 end)
+
+-- Issue 352: the strip paints inside a Size.border.thin frame, so its
+-- painted box is 2*border wider AND taller than self.dimen. The page-flip
+-- refresh region must cover the painted size, or the border band - with the
+-- old selected pill's bottom rows in it - keeps the previous frame on
+-- screen as a ghost line.
+do
+    local src = io.open("lib/bookshelf_chip_bar.lua"):read("*a")
+    local i = src:find("function ChipBar:_gotoPage", 1, true)
+    assert(i, "_gotoPage went missing")
+    local body = src:sub(i, (src:find("\nend\n", i, true) or #src))
+    assert(body:find("getSize", 1, true) and body:find("region_h", 1, true),
+        "_gotoPage's refresh regions must be sized from the PAINTED strip")
+    assert(not body:find("w = self.dimen.w, h = self.dimen.h }", 1, true),
+        "a region built raw from self.dimen misses the border band (issue 352)")
+end
 
 print(string.format("%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

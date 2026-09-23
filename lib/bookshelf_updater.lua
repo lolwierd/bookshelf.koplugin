@@ -22,6 +22,11 @@ local function githubWeb(path)
     return "https://github.com/" .. REPO_SLUG .. path
 end
 
+-- Exposed so other modules (the changelog viewer) hit the same repo as the
+-- updater instead of hardcoding upstream's.
+Updater.REPO_SLUG = REPO_SLUG
+Updater.githubApi = githubApi
+
 -- Unpack a downloaded .zip into `dest`, stripping the archive's single
 -- top-level directory (release/GitHub zips wrap everything in
 -- bookshelf.koplugin/ or bookshelf.koplugin-<branch>/).
@@ -60,12 +65,106 @@ local function unpackStripRoot(zip_path, dest)
     if extract_err then return false, extract_err end
     return true
 end
+-- Test hook (same convention as CoverFetch._base64decode): the strip-root
+-- logic is pure once ffi/archiver is stubbed, and install() is too entangled
+-- with the network to exercise it any other way off-device.
+Updater._unpackStripRoot = unpackStripRoot
+
+-- pluginDir() -> the folder the RUNNING plugin was loaded from.
+--
+-- Not <data dir>/plugins/bookshelf.koplugin, which is where this used to read
+-- and write. KOReader looks for plugins in TWO places -- "plugins" under the
+-- install directory first, then <data dir>/plugins -- and loads every
+-- directory ending .koplugin that it finds in either. On a Kindle those two
+-- are usually the same folder and nothing shows. Where they are not, or where
+-- a second copy is sitting around under another *.koplugin name, the updater
+-- was reading and writing one copy while KOReader ran the other.
+--
+-- The fingerprint is a reader saying About shows one version and "check for
+-- updates" shows another, having updated successfully several times: About
+-- reads the running code's own folder, this used to read a fixed path.
+--
+-- Derived the way About derives it -- this file sits at <dir>/lib/<file>.lua
+-- -- and falling back to the old path if that ever fails to parse.
+function Updater.pluginDir()
+    local src = debug.getinfo(1, "S").source:match("@(.*)$")
+    local dir = src and src:match("^(.*)/lib/[^/]+%.lua$")
+    if dir and dir ~= "" then return dir end
+    local DataStorage = require("datastorage")
+    return DataStorage:getDataDir() .. "/plugins/bookshelf.koplugin"
+end
 
 function Updater.getInstalledVersion()
-    local DataStorage = require("datastorage")
-    local meta_path = DataStorage:getDataDir() .. "/plugins/bookshelf.koplugin/_meta.lua"
-    local ok_meta, meta = pcall(dofile, meta_path)
+    local ok_meta, meta = pcall(dofile, Updater.pluginDir() .. "/_meta.lua")
     return (ok_meta and meta and meta.version) or "unknown"
+end
+
+-- otherCopies() -> paths of OTHER *.koplugin folders that look like this
+-- plugin, which KOReader will also have loaded.
+--
+-- Every directory ending .koplugin in either lookup path is loaded, with no
+-- check for a name already seen, so a leftover "bookshelf-old.koplugin" or a
+-- half-renamed "bookshelf.koplugin-master" runs alongside the real one. The
+-- About screen reports what this finds, because that is where a reader looks
+-- when the version reads wrong.
+-- Compared by IDENTITY, never by path string. KOReader's two lookup paths are
+-- "plugins", relative to its own working directory, and <datadir>/plugins --
+-- and on a Kobo, an Android install and the emulator those are THE SAME
+-- DIRECTORY reached two ways. Keyed on the strings, the scan walked it twice
+-- and the second pass reported the one true install as a second copy:
+--
+--     Another copy of Bookshelf is installed and is also being loaded
+--     ./plugins/bookshelf.koplugin
+--
+-- on a device with exactly one (Reddit, 2026-09-20; the reader had installed
+-- once and updated through the plugin for a year). pluginDir() derives our
+-- own path from debug.getinfo, which hands back whichever form the loader
+-- used, so the string compare against it was unreliable in both directions.
+--
+-- dev+ino is the same question the filesystem would answer, and it costs one
+-- stat we were already making. It also settles the symlinked install a
+-- developer runs from a working tree. Where lfs cannot supply them -- a
+-- platform without inodes -- the path stands in, which is exactly the old
+-- behaviour for that case and no worse.
+local function _identity(lfs, path)
+    local a = lfs.attributes(path)
+    if type(a) ~= "table" or a.mode ~= "directory" then return nil end
+    if a.ino and a.dev then return tostring(a.dev) .. ":" .. tostring(a.ino) end
+    return "path:" .. path
+end
+
+function Updater.otherCopies()
+    local out = {}
+    local ok = pcall(function()
+        local lfs = require("libs/libkoreader-lfs")
+        local DataStorage = require("datastorage")
+        local mine = Updater.pluginDir()
+        local mine_id = _identity(lfs, mine)
+        local seen = {}
+        local roots = { "plugins", DataStorage:getDataDir() .. "/plugins" }
+        for _i = 1, #roots do
+            local root = roots[_i]
+            local root_id = _identity(lfs, root)
+            if root_id and not seen[root_id] then
+                seen[root_id] = true
+                for entry in lfs.dir(root) do
+                    local path = root .. "/" .. entry
+                    if entry:sub(-9) == ".koplugin"
+                            and entry:lower():find("bookshelf", 1, true) then
+                        local id = _identity(lfs, path)
+                        -- A nil id is not a directory, so not a copy. An id
+                        -- equal to ours is us, however the path is spelled.
+                        if id and id ~= mine_id and not seen[id] then
+                            seen[id] = true
+                            out[#out + 1] = path
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then return {} end
+    return out
 end
 
 local function parseVersion(v)
@@ -90,7 +189,17 @@ end
 -- Branch path is URL-encoded except for alnum, dash, underscore, dot, tilde
 -- and forward slash (so feature/foo keeps its slash). Uses the public
 -- api.github.com zipball endpoint.
+-- Returns nil for a name we refuse to compose a URL from (empty, non-string,
+-- or containing ".."); callers must treat nil as "reject this branch".
 function Updater.composeBranchUrl(branch)
+    if type(branch) ~= "string" or branch == "" then return nil end
+    -- ".." would climb out of the repo path. The filter below deliberately
+    -- passes "/" and "." through so feature/v5.2-test survives, and both curl
+    -- (client-side) and api.github.com (server-side) collapse dot segments, so
+    -- "../../../owner/repo/zipball/master" retargets the download at an
+    -- arbitrary repo while every URL here still names REPO_SLUG. git
+    -- forbids ".." anywhere in a refname, so no real branch can contain one.
+    if branch:find("..", 1, true) then return nil end
     local encoded = branch:gsub("[^%w%-_/.~]", function(c)
         return string.format("%%%02X", c:byte())
     end)
@@ -99,52 +208,14 @@ function Updater.composeBranchUrl(branch)
         encoded)
 end
 
---- Try LuaSocket first, fall back to curl for platforms where SSL crashes.
+--- Shared luasocket-then-curl JSON GET (lib/bookshelf_http), with the GitHub
+--- Accept header and a slightly longer curl cap for the releases payload.
 local function httpGetJSON(url, user_agent)
-    local json = require("json")
-    local ok_require, http, ltn12, socket, socketutil =
-        pcall(function()
-            return require("socket/http"),
-                   require("ltn12"),
-                   require("socket"),
-                   require("socketutil")
-        end)
-    if ok_require then
-        local body = {}
-        local ok_req, code = pcall(function()
-            socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-            local c = socket.skip(1, http.request({
-                url = url,
-                method = "GET",
-                headers = {
-                    ["User-Agent"] = user_agent,
-                    ["Accept"]     = "application/vnd.github.v3+json",
-                },
-                sink = ltn12.sink.table(body),
-                redirect = true,
-            }))
-            socketutil:reset_timeout()
-            return c
-        end)
-        if ok_req and code == 200 then
-            local ok, data = pcall(json.decode, table.concat(body))
-            if ok then return data end
-        end
-        pcall(function() socketutil:reset_timeout() end)
-    end
-    -- Fallback: curl (available on Android, desktop)
-    local handle = io.popen(string.format(
-        "curl -s -L -H 'User-Agent: KOReader-Bookshelf' -H 'Accept: application/vnd.github.v3+json' %q",
-        url))
-    if handle then
-        local body = handle:read("*a")
-        handle:close()
-        if body and body ~= "" then
-            local ok, data = pcall(json.decode, body)
-            if ok then return data end
-        end
-    end
-    return nil
+    return require("lib/bookshelf_http").getJSON(url, {
+        user_agent    = user_agent,
+        accept        = "application/vnd.github.v3+json",
+        curl_max_time = 20,
+    })
 end
 
 function Updater.offerReleasesPage(message)
@@ -220,19 +291,51 @@ function Updater.checkBackground(on_update_found)
     end)
 end
 
+--- Shared Wi-Fi gate for the user-initiated network paths (#77).
+--
+-- Gate on isConnected, NOT isOnline. Despite the name, NetworkMgr:isOnline()
+-- is canResolveHostnames() - a DNS lookup of Microsoft's dns.msftncsi.com.
+-- Plenty of working connections fail it: a Pi-hole or AdGuard blocking
+-- Microsoft telemetry domains, a captive portal, a network where that host is
+-- unreachable, or simply a resolver that has not come back up in the seconds
+-- after a wake. On any of those, gating on isOnline asks the user to turn on
+-- Wi-Fi that is already on and connected - and runWhenOnline then makes it
+-- WORSE, because in exactly that connected-but-unresolvable case it shows the
+-- prompt and then FORFEITS the callback, so the action never runs even if they
+-- tap "Turn on". The updater is also the recovery path, so an update that
+-- silently does nothing is the worst possible failure here.
+--
+-- runWhenConnected has no such branch: connected means run, otherwise prompt
+-- per the user's prefs and run once the radio is up.
+--
+-- The re-entry is guarded by a second isConnected check rather than trusting
+-- the callback: beforeWifiAction fires once the connection ATTEMPT finishes,
+-- which is not the same as having succeeded, and re-entering while still
+-- disconnected would prompt in a loop.
+--
+-- Ported from bookends, which fixed this first (#348 keeps the two in step).
+--
+-- @param retry function: re-invokes the caller once a connection exists
+-- @return boolean: true if the caller should return and wait, false to proceed
+function Updater.gateOnConnection(retry)
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr:isConnected() then return false end
+    NetworkMgr:runWhenConnected(function()
+        if NetworkMgr:isConnected() then retry() end
+    end)
+    return true
+end
+
 function Updater.check(on_success)
 
     local installed_version = Updater.getInstalledVersion()
 
-    -- runWhenOnline (issue #77) attempts to bring Wi-Fi up if it's
-    -- currently off (prompting per the user's KOReader Wi-Fi prefs)
-    -- and runs the callback once isOnline. If the user cancels the
-    -- prompt the callback never fires -- that's the right cancel UX
-    -- so nothing more is needed here. Also stronger than the previous
-    -- isWifiOn check: catches "Wi-Fi radio on but connection dead",
-    -- which used to fail later with an HTTPS timeout.
-    local NetworkMgr = require("ui/network/manager")
-    NetworkMgr:runWhenOnline(function()
+    -- Bring Wi-Fi up if it is off and re-run once CONNECTED; if the user
+    -- cancels the prompt, nothing happens. See Updater.gateOnConnection for
+    -- why this gates on isConnected rather than isOnline.
+    if Updater.gateOnConnection(function() Updater.check(on_success) end) then
+        return
+    end
     UIManager:show(InfoMessage:new{
         text = _("Checking for updates..."),
         timeout = 1,
@@ -249,6 +352,11 @@ function Updater.check(on_success)
             Updater.offerReleasesPage(_("Could not check for updates."))
             return
         end
+        -- Free seeding for the changelog viewer: this payload is exactly
+        -- what it caches, so an update check keeps past notes revisitable.
+        pcall(function()
+            require("lib/bookshelf_changelog").seed(releases)
+        end)
 
         -- Collect releases newer than installed version
         local new_releases = {}
@@ -343,7 +451,6 @@ function Updater.check(on_success)
         }
         UIManager:show(viewer)
     end)
-    end)
 end
 
 function Updater.install(zip_url, old_version, new_version, on_success, error_label)
@@ -364,36 +471,106 @@ function Updater.install(zip_url, old_version, new_version, on_success, error_la
         end
         local zip_path = cache_dir .. "/bookshelf.koplugin.zip"
 
-        -- Try LuaSocket first, fall back to curl
-        local downloaded = false
+        -- Try LuaSocket first, fall back to curl.
+        --
+        -- `reason` carries WHY a download failed, so the message can say
+        -- something better than "Download failed." Practices here follow
+        -- storefront.koplugin's installer, which handles this well: it is
+        -- another plugin that downloads plugin zips onto e-readers, so it has
+        -- met the same failure modes.
+        local downloaded, reason = false, nil
         local ok_require, http, ltn12, socket, socketutil =
             pcall(function()
-                return require("socket/http"),
+                return require("socket.http"),
                        require("ltn12"),
                        require("socket"),
                        require("socketutil")
             end)
         if ok_require then
-            local file = io.open(zip_path, "wb")
+            -- Download to a temporary name and rename on success, so an
+            -- interrupted transfer can never leave a half-written zip where
+            -- the unpack step will find it and report a corrupt archive.
+            local tmp_path = zip_path .. ".tmp"
+            pcall(os.remove, tmp_path)
+            local file = io.open(tmp_path, "wb")
             if file then
-                local ok_dl, code = pcall(function()
-                    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-                    local c = socket.skip(1, http.request({
+                local ok_dl, code, headers, status = pcall(function()
+                    -- FILE_TOTAL_TIMEOUT is 60s and it is an ABSOLUTE
+                    -- ceiling on the whole transfer (settimeout(t) in
+                    -- socketutil), not a stall timeout. The release zip is
+                    -- ~2.9MB, so 60s demanded ~50KB/s sustained - a coin flip
+                    -- on e-reader Wi-Fi, and the likely cause of the
+                    -- "Download failed" reports. 300s asks ~10KB/s instead,
+                    -- which no working connection falls under, and it matches
+                    -- what the curl fallback below already allowed.
+                    --
+                    -- NOT -1 (uncapped), tempting as that is. http.request
+                    -- blocks, and this runs on the UI loop with no Trapper
+                    -- and no cancel, so an unbounded transfer freezes
+                    -- KOReader until the user kills it. A ceiling that
+                    -- reports a failure beats a hang.
+                    --
+                    -- FILE_BLOCK_TIMEOUT is the idle timeout and still fails
+                    -- a genuinely stalled connection within 15s, but it
+                    -- RESETS on every chunk, so it alone cannot bound a
+                    -- connection that dribbles.
+                    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, 300)
+                    -- socketutil's sink rather than ltn12's: it enforces the
+                    -- total timeout above, surfacing a dribbling transfer as
+                    -- SINK_TIMEOUT_CODE. The socket timeout only covers the
+                    -- wait BEFORE data arrives; once chunks are flowing this
+                    -- sink is the only thing still counting. Note it decides
+                    -- at CONSTRUCTION time and degrades to a plain
+                    -- ltn12.sink.file when total_timeout is negative, so it
+                    -- has to be built after set_timeout, as it is here.
+                    local sink = socketutil.file_sink and socketutil.file_sink(file)
+                                 or ltn12.sink.file(file)
+                    local c, h, st = socket.skip(1, http.request({
                         url = zip_url,
                         method = "GET",
                         headers = {
                             ["User-Agent"] = "KOReader-Bookshelf/" .. old_version,
+                            ["Accept"] = "application/zip, application/octet-stream, */*",
                         },
-                        sink = ltn12.sink.file(file),
+                        sink = sink,
                         redirect = true,
                     }))
                     socketutil:reset_timeout()
-                    return c
+                    return c, h, st
                 end)
+                pcall(function() file:close() end)
                 if not ok_dl then
                     pcall(function() socketutil:reset_timeout() end)
+                    reason = _("the connection failed")
+                elseif code == socketutil.TIMEOUT_CODE
+                        or code == socketutil.SINK_TIMEOUT_CODE then
+                    reason = _("the connection timed out")
+                elseif code == socketutil.SSL_HANDSHAKE_CODE then
+                    reason = _("the secure connection failed")
+                elseif not headers then
+                    -- No response at all, as opposed to an HTTP error code.
+                    reason = _("there was no response")
+                elseif tonumber(code) ~= 200 then
+                    reason = status or ("HTTP " .. tostring(code))
+                else
+                    downloaded = true
                 end
-                downloaded = ok_dl and code == 200
+                if downloaded then
+                    pcall(os.remove, zip_path)
+                    if not os.rename(tmp_path, zip_path) then
+                        -- Rename can fail across filesystems; copy instead.
+                        local ok_copy = pcall(function()
+                            local i, o = io.open(tmp_path, "rb"), io.open(zip_path, "wb")
+                            if not (i and o) then error("copy failed") end
+                            o:write(i:read("*all")); i:close(); o:close()
+                        end)
+                        downloaded = ok_copy
+                        if not ok_copy then reason = _("the file could not be saved") end
+                    end
+                end
+                pcall(os.remove, tmp_path)
+            else
+                reason = _("the file could not be saved")
             end
         end
         -- Fallback: curl (available on Android, desktop). The -f flag makes
@@ -402,25 +579,48 @@ function Updater.install(zip_url, old_version, new_version, on_success, error_la
         -- the unpack step would surface a misleading "extracting failed".
         if not downloaded then
             pcall(os.remove, zip_path)
+            -- shellQuote, not %q: see lib/bookshelf_http.shellQuote for why %q
+            -- is a Lua quote and lets the shell expand $ and backticks.
+            local shellQuote = require("lib/bookshelf_http").shellQuote
             local ret = os.execute(string.format(
-                "curl -sfL -o %q %q", zip_path, zip_url))
+                "curl -sfL --connect-timeout 10 --max-time 300 -o %s %s",
+                shellQuote(zip_path), shellQuote(zip_url)))
             downloaded = ret == 0 or ret == true
         end
         if not downloaded then
             pcall(os.remove, zip_path)
+            -- Say WHY where we know. "Download failed." on its own gives a
+            -- reporter nothing to tell us, and these fail for very different
+            -- reasons: a slow connection, a captive portal, a 404 on a
+            -- mistyped dev branch. Appended rather than replacing the label so
+            -- the existing wording still leads.
+            -- The reasons are sentence FRAGMENTS, so they continue the label
+            -- rather than following it: "Download failed. (the connection
+            -- timed out)" puts a lowercase clause after a full stop. Dropping
+            -- a trailing stop keeps both msgids intact - reworking the label
+            -- into "Download failed:" would orphan every existing translation
+            -- of it. A locale whose stop is not "." simply keeps it, which is
+            -- no worse than before.
+            local function withReason(label)
+                if not reason then return label end
+                return (tostring(label):gsub("%.%s*$", ""))
+                       .. " (" .. tostring(reason) .. ")"
+            end
             if error_label then
                 UIManager:show(InfoMessage:new{
-                    text = error_label,
+                    text = withReason(error_label),
                     timeout = 3,
                 })
             else
-                Updater.offerReleasesPage(_("Download failed."))
+                Updater.offerReleasesPage(withReason(_("Download failed.")))
             end
             return
         end
 
-        -- Extract to plugin directory (strip root folder from ZIP)
-        local plugin_path = DataStorage:getDataDir() .. "/plugins/bookshelf.koplugin"
+        -- Extract over the RUNNING plugin's own folder, not a fixed path: if
+        -- KOReader loaded this from somewhere else, installing to the fixed
+        -- path updates a copy nobody runs (see Updater.pluginDir).
+        local plugin_path = Updater.pluginDir()
         local ok, err = unpackStripRoot(zip_path, plugin_path)
         pcall(os.remove, zip_path)
 
@@ -458,14 +658,20 @@ end
 -- @param branch string: branch name (e.g. "feature/v5.2-test")
 -- @param on_success function or nil: fired after successful unpack
 function Updater.installBranch(branch, on_success)
-    -- See Updater.check for the runWhenOnline rationale (issue #77).
-    local NetworkMgr = require("ui/network/manager")
-    NetworkMgr:runWhenOnline(function()
-        local installed_version = Updater.getInstalledVersion()
-        local zip_url = Updater.composeBranchUrl(branch)
-        local error_label = _("Could not install branch:") .. " " .. branch
-        Updater.install(zip_url, installed_version, "branch:" .. branch, on_success, error_label)
-    end)
+    -- See Updater.gateOnConnection for why this gates on isConnected (#77).
+    if Updater.gateOnConnection(function() Updater.installBranch(branch, on_success) end) then
+        return
+    end
+    local installed_version = Updater.getInstalledVersion()
+    local zip_url = Updater.composeBranchUrl(branch)
+    local error_label = _("Could not install branch:") .. " " .. tostring(branch)
+    if not zip_url then
+        -- Rejected name (empty, or carrying ".."). Reuses the existing msgid so
+        -- this adds no untranslated string.
+        UIManager:show(InfoMessage:new{ text = error_label, timeout = 3 })
+        return
+    end
+    Updater.install(zip_url, installed_version, "branch:" .. branch, on_success, error_label)
 end
 
 --- Install the latest stable (non-prerelease) release, regardless of installed version.
@@ -474,9 +680,10 @@ end
 -- pull the release zip and re-stamp last_install_source = "release".
 -- @param on_success function or nil: fired after successful unpack
 function Updater.installLatestStable(on_success)
-    -- See Updater.check for the runWhenOnline rationale (issue #77).
-    local NetworkMgr = require("ui/network/manager")
-    NetworkMgr:runWhenOnline(function()
+    -- See Updater.gateOnConnection for why this gates on isConnected (#77).
+    if Updater.gateOnConnection(function() Updater.installLatestStable(on_success) end) then
+        return
+    end
     UIManager:show(InfoMessage:new{
         text = _("Downloading latest release..."),
         timeout = 1,
@@ -507,7 +714,6 @@ function Updater.installLatestStable(on_success)
         end
         local new_version = release.tag_name:gsub("^v", "")
         Updater.install(zip_url, installed_version, new_version, on_success)
-    end)
     end)
 end
 

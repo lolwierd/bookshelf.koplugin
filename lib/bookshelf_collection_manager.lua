@@ -115,7 +115,7 @@ end
 -- the row doesn't read as a raw internal key.
 local function _displayName(name)
     if name == ReadCollection.default_collection_name then
-        return _("Favourites")
+        return _("Favorites")
     end
     return name
 end
@@ -154,7 +154,11 @@ local function _pinAsChip(coll_name, bw)
         icon          = nil,
         source        = { kind = "collection", id = coll_name },
         filter        = {},
-        sort_priority = { { key = "last_opened", reverse = true } },
+        -- The editor owns the per-source defaults; a second copy here is how
+        -- a collection pinned from the manager ended up sorted differently
+        -- from the same collection picked in the editor (issue 441).
+        sort_priority = require("lib/bookshelf_chip_editor")
+                            .sourceSortDefaults("collection"),
         enabled       = true,
     }
     TabModel.save(tabs)
@@ -311,7 +315,7 @@ function CollectionManager.show(opts)
     -- Edit-collection 2x2 menu. Title spells out which collection
     -- you're editing ("Edit collection: To Be Read") so a long-pressed
     -- row makes its target obvious. Rows:
-    --   [ Rename       ] [ Pin to chip bar ]
+    --   [ Rename       ] [ Pin to shelf menu ]
     --   [ ✕ Delete     ] [ Cancel          ]
     -- For protected collections (Favourites, To Be Read), the rename /
     -- delete actions collapse to a single Pin / Cancel row -- the
@@ -402,7 +406,7 @@ function CollectionManager.show(opts)
             buttons = {
                 {
                     { text = _("Rename"),          callback = doRename },
-                    { text = _("Pin to chip bar"), callback = doPin    },
+                    { text = _("Pin to shelf menu"), callback = doPin    },
                 },
                 {
                     { text = "\xE2\x9C\x95 " .. _("Delete"),
@@ -413,7 +417,7 @@ function CollectionManager.show(opts)
         else
             buttons = {
                 {
-                    { text = _("Pin to chip bar"), callback = doPin    },
+                    { text = _("Pin to shelf menu"), callback = doPin    },
                     { text = _("Cancel"),          callback = hclose   },
                 },
             }
@@ -437,7 +441,15 @@ function CollectionManager.show(opts)
         local input
         input = InputDialog:new{
             title       = _("New collection"),
-            input_hint  = _("Name"),
+            -- "Collection name", not a bare "Name". That msgid was shared
+            -- with the group-order sort label, where it means a PERSON's name
+            -- on the Authors shelf -- and a language that distinguishes the
+            -- two can only render one of them (Slovak: meno for a person,
+            -- nazov for a thing; Czech, Polish, Russian, Ukrainian and German
+            -- split the same way). Reported by the Slovak translator, who
+            -- could see it from the catalogue but not fix it there (issue
+            -- 432). Naming what is being named also reads better here.
+            input_hint  = _("Collection name"),
             buttons = {{
                 { text = _("Cancel"), id = "close",
                   callback = function() UIManager:close(input) end },
@@ -686,7 +698,7 @@ function CollectionManager.show(opts)
         local mintro_face, mintro_bold = BFont:getFace("infofont", 16)
         content[#content + 1] = TextBoxWidget:new{
             text  = _("Tap a custom collection to rename, delete, or pin "
-                .. "it to the chip bar. Long-press a book on the shelf "
+                .. "it to the shelf menu. Long-press a book on the shelf "
                 .. "and tap Collections… to add or remove it from "
                 .. "collections."),
             face  = mintro_face,

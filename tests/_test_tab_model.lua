@@ -43,8 +43,11 @@ local function test(name, fn)
     else fail = fail + 1; io.stderr:write("FAIL  " .. name .. "\n  " .. tostring(err) .. "\n") end
 end
 
-test("defaults: produces all built-in tabs in expected order", function()
-    local tabs = TabModel.DEFAULTS()
+test("builtins: produces all built-in tabs in expected order", function()
+    -- BUILTINS is the full set. DEFAULTS is now the SHIPPED SUBSET of it --
+    -- the ones that are on -- so a fresh install does not fill the shelf
+    -- editor with rows nobody asked for. See _test_tab_defaults.lua.
+    local tabs = TabModel.BUILTINS()
     local ids = {} for _, t in ipairs(tabs) do ids[#ids + 1] = t.id end
     local expected = { "all", "recent", "latest", "series", "authors",
                        "genres", "tags", "languages", "favorites" }
@@ -54,16 +57,19 @@ test("defaults: produces all built-in tabs in expected order", function()
     end
 end)
 
-test("defaults: fresh install enables Home/Recent/Series/Favourites only", function()
+test("defaults: fresh install enables Home/Recent/Series/Genres only", function()
     -- v2.0.1: trimmed default chip set so new users see a focused
     -- starting bar instead of all 8 chips at once. Latest/Authors/
-    -- Genres/Tags exist but are disabled; user can opt them on via
-    -- the Bookshelf chips menu.
+    -- GENRES ships on, FAVOURITES off. Both are the maintainer's own
+    -- arrangement, adopted for the same reason as Home's spines: a first
+    -- launch should show what the shelf is for. Genres demonstrates stacks;
+    -- a favourites shelf opens on nothing until the reader has starred
+    -- something. Latest/Authors/Tags/Languages stay off, one long-press away.
     local enabled_by_default = {}
     for _, t in ipairs(TabModel.DEFAULTS()) do
         if t.enabled then enabled_by_default[t.id] = true end
     end
-    local expected = { all = true, recent = true, series = true, favorites = true }
+    local expected = { all = true, recent = true, series = true, genres = true }
     for id in pairs(expected) do
         assert(enabled_by_default[id],
                "expected " .. id .. " to be enabled in fresh-install defaults")
@@ -120,9 +126,18 @@ test("save: persists tabs and flushes", function()
 end)
 
 test("getById: returns the matching tab", function()
-    local t = TabModel.getById("favorites")
+    -- A SHIPPED shelf. getById searches the reader's own list, and every
+    -- caller passes a chip that exists in it.
+    local t = TabModel.getById("genres")
     assert(t ~= nil)
-    assert(t.id == "favorites")
+    assert(t.id == "genres")
+end)
+
+test("getById: a built-in that is not installed is nil, not conjured", function()
+    -- Favorites is a built-in but no longer ships enabled, so on a fresh
+    -- install there is no such shelf and getById must say so rather than
+    -- returning a tab the reader has not got.
+    assert(TabModel.getById("favorites") == nil)
 end)
 
 test("getActive: returns only enabled tabs in order", function()

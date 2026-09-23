@@ -13,6 +13,7 @@ local BD              = require("ui/bidi")
 local Blitbuffer      = require("ffi/blitbuffer")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local ScaledCoverCache = require("lib/bookshelf_scaled_cover_cache")
+local HeroTier         = require("lib/bookshelf_hero_tier")
 local BFont           = require("lib/bookshelf_fonts")
 local FrameContainer  = require("ui/widget/container/framecontainer")
 local CenterContainer = require("ui/widget/container/centercontainer")
@@ -28,6 +29,7 @@ local InputContainer  = require("ui/widget/container/inputcontainer")
 local Device          = require("device")
 local Screen          = Device.screen
 local CoverProgress   = require("lib/bookshelf_cover_progress")
+local TextFit         = require("lib/bookshelf_text_fit")
 local T               = require("ffi/util").template
 local _               = require("lib/bookshelf_i18n").gettext
 
@@ -39,6 +41,30 @@ local _               = require("lib/bookshelf_i18n").gettext
 -- _paintBorder, applied here too so the card border can finally show a
 -- real color, not just luminance.
 local ColorRGB32_t = ffi.typeof("ColorRGB32")
+
+-- The wallpaper module, or nil when it will not load. Declared here, above
+-- every caller: Lua binds the upvalue that exists when a body is compiled,
+-- and a helper put in below its first use reads nil at paint time.
+local _wpm, _wpm_looked = nil, false
+local function _wallpaperModule()
+    -- Looked up once. RoundedCornerCard wraps every cover tile and asks on
+    -- every paint; a pcall(require) per tile per frame was the cost.
+    if not _wpm_looked then
+        _wpm_looked = true
+        local ok, W = pcall(require, "lib/bookshelf_wallpaper")
+        _wpm = ok and W or nil
+    end
+    return _wpm
+end
+-- The flat page ground, when one is set and there is no picture. nil on a
+-- plain paper shelf, which keeps every historical path.
+local function _wallpaperGround()
+    local W = _wallpaperModule()
+    if not (W and W.ground) then return nil end
+    local ok, g = pcall(W.ground)
+    if not ok or type(g) == "nil" then return nil end
+    return g
+end
 
 -- #217: bb:paintBorder's rounded-corner arc only takes its fast, invert-safe
 -- Color8 path -- a ColorRGB32 border (any color screen, e.g. Android) falls
@@ -149,11 +175,23 @@ local SELECTED_BORDER = SHADOW_OFFSET
 -- inversion). No user control — purely a function of the active mode.
 local SHADOW_GRAY_DAY   = Blitbuffer.gray(0.5)
 local SHADOW_GRAY_NIGHT = Blitbuffer.gray(0.15)
+-- The card's drop shadow. User-settable since issue #199; the constants below
+-- stay as the floor, so a resolver that has not loaded yet (or a colour that
+-- fails to parse) paints exactly what it always did rather than nothing.
 local function _shadowGray()
-    if G_reader_settings:isTrue("night_mode") then
+    local ok, colors = pcall(CoverProgress.resolvedColors)
+    if ok and colors and colors.card_shadow then return colors.card_shadow end
+    if require("lib/bookshelf_night_mode_sync").active() then
         return SHADOW_GRAY_NIGHT
     end
     return SHADOW_GRAY_DAY
+end
+
+-- The ring a selected / current-book cover sits on. Same fallback reasoning.
+local function _selectionColor()
+    local ok, colors = pcall(CoverProgress.resolvedColors)
+    if ok and colors and colors.selection then return colors.selection end
+    return Blitbuffer.COLOR_BLACK
 end
 
 -- Placeholder (no-image) cover backgrounds. In day these are near-white
@@ -168,7 +206,7 @@ local FALLBACK_INNER_BG_DAY   = Blitbuffer.COLOR_WHITE
 local FALLBACK_OUTER_BG_NIGHT = Blitbuffer.gray(0.12)
 local FALLBACK_INNER_BG_NIGHT = Blitbuffer.gray(0.16)
 local function _fallbackBgs()
-    if G_reader_settings:isTrue("night_mode") then
+    if require("lib/bookshelf_night_mode_sync").active() then
         return FALLBACK_OUTER_BG_NIGHT, FALLBACK_INNER_BG_NIGHT
     end
     return FALLBACK_OUTER_BG_DAY, FALLBACK_INNER_BG_DAY
@@ -205,6 +243,24 @@ local function _glyphTopLift(show_titles)
     if show_titles then return GLYPH_TOP_LIFT_EXPANDED end
     return GLYPH_TOP_LIFT_REGULAR
 end
+
+--- How far a status badge hangs below the COVER on a list thumbnail, as a
+--- fraction of the badge's own height.
+---
+--- Not zero, and the first attempt at this was. Tucking the badges fully
+--- inside read as wrong -- the overhang is what makes them look like marks
+--- ON the book rather than part of its artwork -- and it also HID the
+--- in-progress bookmark outright, because that glyph paints UNDER the cover
+--- image (see _renderShadowedCard) and the grid only ever shows you the part
+--- hanging past the edge.
+---
+--- Small, and clamped by the slack that actually exists: a list card is a
+--- fixed box and its bottom edge lines up with the row divider, so the only
+--- room to hang into is whatever the artwork left empty (nine pixels for a
+--- 1.50 cover on a PW5, and NONE at all for one at the aspect cap, which
+--- fills its card). Clamping rather than picking a pixel count is what keeps
+--- a cap-filling cover from putting its badge on the divider.
+local LIST_BADGE_DANGLE = 0.15
 
 -- When the Cover badge size enlarges a bottom-anchored bookmark glyph,
 -- this fraction of the EXTRA height extends the visible dangle downward;
@@ -315,15 +371,107 @@ end
 -- A simple Widget subclass that paints a rounded rectangle in a fixed grey.
 -- Used as the shadow layer behind every cover. Has its own dimen so
 -- OverlapGroup positioning containers can size it correctly.
+-- The card's drop shadow. Its corners have to match the CARD's, not a
+-- constant: the shadow sits directly under the card and offset down-right, so
+-- a rounded shadow under a square cover pulls away at every corner and leaves
+-- a light notch exactly where the two outlines should coincide. Defaults to
+-- the rounded radius for callers that do not care.
 local ShadowRect = Widget:extend{
     width  = nil,
     height = nil,
+    radius = nil,
+    -- The card's offset from this shadow (SHADOW_OFFSET). Over a picture the
+    -- card, painted after, hides all of the shadow but an L-shaped margin
+    -- this wide, so only that margin is blended. nil: the whole rect.
+    exposed = nil,
 }
 function ShadowRect:init()
     self.dimen = Geom:new{ w = self.width, h = self.height }
 end
+-- _shadowShade() -> 0..1, how hard to darken what is behind the shadow.
+--
+-- Derived from the shadow COLOUR, so the reader's setting still means what it
+-- meant: the figure is the darkness that colour would have shown on a plain
+-- page. Night is read from the painted value's other side, because a night
+-- shadow is painted LIGHT so it displays dark.
+-- Resolved once and remembered: ShadowRect:paintTo runs for EVERY cover on
+-- screen, on every paint, and both of these were being redone each time -- a
+-- pcall + require and a palette walk per card, twenty-odd times a frame.
+--
+-- require() on a loaded module is only a table lookup, but the pcall wrapper
+-- around it allocates a closure, and that is per cover per paint.
+local _wp_mod, _wp_looked = nil, false
+local function _wallpaperMod()
+    if not _wp_looked then
+        _wp_looked = true
+        local ok, m = pcall(require, "lib/bookshelf_wallpaper")
+        _wp_mod = ok and m or nil
+    end
+    return _wp_mod
+end
+
+-- Memoised on the settings generation and the mode, which is exactly what the
+-- answer depends on -- the same two keys resolvedColors caches itself on.
+local _shade_v, _shade_gen, _shade_night = nil, nil, nil
+local function _shadowShade(night)
+    local gen = BookshelfSettings.generation and BookshelfSettings.generation() or 0
+    if _shade_v and _shade_gen == gen and _shade_night == night then
+        return _shade_v
+    end
+    local ok, c = pcall(function() return _shadowGray():getColor8().a end)
+    if not ok or type(c) ~= "number" then c = night and 0x26 or 0x80 end
+    local displayed = night and (255 - c) or c
+    _shade_v, _shade_gen, _shade_night = 1 - (displayed / 255), gen, night
+    return _shade_v
+end
+
 function ShadowRect:paintTo(bb, x, y)
-    bb:paintRoundedRect(x, y, self.width, self.height, _shadowGray(), CARD_RADIUS)
+    local radius = self.radius or CARD_RADIUS
+    -- Over a wallpaper the shadow DARKENS the picture instead of painting a
+    -- colour on top of it.
+    --
+    -- A fixed grey is a shadow on white paper and a HIGHLIGHT over a dark
+    -- wallpaper -- it is lighter than the thing it is supposed to be a shadow
+    -- on. Blending toward black (toward white at night, which displays as
+    -- black) is relative to whatever is behind, so it darkens anything.
+    --
+    -- KNOWN GAP: the rounded card's BR corner mask (below) still paints the
+    -- shadow grey opaquely where it overlaps this. On a plain page the two
+    -- agree; over a wallpaper that corner can read slightly flatter than the
+    -- rest of the shadow. Converting it means blending inside the per-pixel
+    -- corner loop -- see issue #93 for why that mask resolves its colour live.
+    local Wallpaper = _wallpaperMod()
+    if Wallpaper and Wallpaper.isShowing and Wallpaper.isShowing() then
+        local night = Screen.night_mode and true or false
+        local off = tonumber(self.exposed) or 0
+        local ok
+        if off > 0 and Wallpaper.shadeClipped then
+            -- The margin the card leaves showing: a strip down the right, a
+            -- strip along the bottom, and the squares behind the card's own
+            -- rounded corners where the picture would otherwise show through
+            -- unshaded. Disjoint by construction.
+            local w, h, r = self.width, self.height, radius
+            local clips = {
+                { x = x + w - off,     y = y,             w = off, h = h - off },
+                { x = x,               y = y + h - off,   w = w,   h = off },
+                { x = x + w - off - r, y = y + h - off - r, w = r, h = r },
+            }
+            if r > off then
+                clips[#clips + 1] = { x = x + w - off - r, y = y, w = r, h = r - off }
+                clips[#clips + 1] = { x = x, y = y + h - off - r, w = r - off, h = r }
+            end
+            ok = Wallpaper.shadeClipped(bb, x, y, w, h, _shadowShade(night), night,
+                                        radius, clips)
+        else
+            ok = Wallpaper.shade(bb, x, y, self.width, self.height,
+                                 _shadowShade(night), night, radius)
+        end
+        if ok then
+            return
+        end
+    end
+    CoverProgress.paintRoundedRect(bb, x, y, self.width, self.height,
+                                   _shadowGray(), radius)
 end
 
 -- Paints a shorter-than-box image top-anchored within a fixed
@@ -372,9 +520,9 @@ function BorderOverlay:init()
 end
 function BorderOverlay:paintTo(bb, x, y)
     local t = self.thickness
-    bb:paintRoundedRect(x - t, y - t,
+    CoverProgress.paintRoundedRect(bb, x - t, y - t,
                         self.width + 2 * t, self.height + 2 * t,
-                        self.color or Blitbuffer.COLOR_BLACK,
+                        self.color or _selectionColor(),
                         (self.radius or 0) + t)
 end
 
@@ -391,6 +539,69 @@ end
 -- the inscribed quarter-disc. Finally paint the rounded border on top so
 -- the arc reads cleanly. Per-pixel cost is 4 × radius² operations per
 -- card paint — negligible at the radii we use.
+-- ── CornerKeep ───────────────────────────────────────────────────────────
+-- What was behind a card's rounded corners, kept so the cut can put it back.
+--
+-- RoundedCornerCard paints the cover as a square and then cuts the corners by
+-- painting over them, and what it painted was a GUESS at the background: the
+-- wallpaper's pixels, else the page ground colour, else white. Inside the dark
+-- top panel the right answer is the panel (a scrim over the page, not the
+-- page); under a stack's front cover it is the pile's layer; on a dark theme
+-- with a white background the guess came out as bright corners on both
+-- (maintainer). Guessing is the wrong shape: the pixels that were there are
+-- the answer, so they are copied out before the cover paints and copied back
+-- for exactly the rows the cut removes. Right over a panel, a pile, the page
+-- or a picture, and in the page-wipe's offscreen buffer, which already holds
+-- its own page.
+--
+-- Four r x r squares in the target's own type; a corner is ~10px, so this is
+-- a few hundred bytes and four small blits per cover.
+local CornerKeep = {}
+CornerKeep.__index = CornerKeep
+
+-- take(bb, x, y, w, h, r) -> keep | nil (nothing to keep, or a target that
+-- cannot be read from). x, y, w, h is the card's rect on bb, r its radius.
+function CornerKeep.take(bb, x, y, w, h, r)
+    if not (bb and bb.blitFrom and bb.getType) then return nil end
+    if not (r and w and h) or r <= 0 or w < r or h < r then return nil end
+    local ok, squares = pcall(function()
+        local typ = bb:getType()
+        local at  = { { x, y }, { x + w - r, y }, { x, y + h - r }, { x + w - r, y + h - r } }
+        local sq  = {}
+        for i = 1, 4 do
+            local s = Blitbuffer.new(r, r, typ)
+            s:blitFrom(bb, 0, 0, at[i][1], at[i][2], r, r)
+            sq[i] = { bb = s, x = at[i][1], y = at[i][2] }
+        end
+        return sq
+    end)
+    if not ok or type(squares) ~= "table" then return nil end
+    return setmetatable({ squares = squares, r = r }, CornerKeep)
+end
+
+-- putRow(bb, cx, cy, cw) -> true when one kept square held the row and it was
+-- painted back; false lets the caller fall back to its old guess.
+function CornerKeep:putRow(bb, cx, cy, cw)
+    if not cw or cw <= 0 then return false end
+    local r = self.r
+    for i = 1, 4 do
+        local s = self.squares[i]
+        if s and cx >= s.x and cx + cw <= s.x + r and cy >= s.y and cy < s.y + r then
+            local ok = pcall(bb.blitFrom, bb, s.bb, cx, cy, cx - s.x, cy - s.y, cw, 1)
+            return ok and true or false
+        end
+    end
+    return false
+end
+
+function CornerKeep:free()
+    for i = 1, 4 do
+        local s = self.squares[i]
+        if s and s.bb and s.bb.free then pcall(s.bb.free, s.bb) end
+    end
+    self.squares = {}
+end
+
 local RoundedCornerCard = Widget:extend{
     inner        = nil,                       -- widget to paint inside (image)
     width        = nil,
@@ -457,6 +668,13 @@ function RoundedCornerCard:paintTo(bb, x, y)
     -- (the opening-book squeeze in bookshelf_widget) can target the exact
     -- cover card rather than reconstructing layout geometry.
     self.dimen.x, self.dimen.y = x, y
+    -- What is behind the corners, before the cover paints over it (see
+    -- CornerKeep). An explicit bg_color -- the selection ring behind a
+    -- selected cover -- is meant to show at the corner, so it still wins.
+    local keep = nil
+    if type(self.bg_color) == "nil" and self.radius and self.radius > 0 then
+        keep = CornerKeep.take(bb, x, y, self.width, self.height, self.radius)
+    end
     if self.inner then
         self.inner:paintTo(bb, x + self.border_size, y + self.border_size)
     end
@@ -475,7 +693,42 @@ function RoundedCornerCard:paintTo(bb, x, y)
     if self.radius and self.radius > 0 then
         local r       = self.radius
         local w, h    = self.width, self.height
-        local bg      = self.bg_color or Blitbuffer.COLOR_WHITE
+        -- WHAT IS BEHIND THE CORNER, which for a long time could only be the
+        -- page and so could only be white. Over a ground it is not: the four
+        -- masked corners came out as white teeth on a dark shelf, and over a
+        -- picture they punched holes in it (maintainer, on device).
+        --
+        -- `fill` tries the real thing first -- Wallpaper.restore puts the
+        -- picture's own pixels back, and answers false when there is no image
+        -- or the target is not the screen -- and otherwise paints a colour:
+        -- the caller's bg_color if it set one (the selection ring matches its
+        -- own backdrop), else the flat ground, else page white.
+        --
+        -- One call per corner ROW, not per pixel: the mask already emits a
+        -- single strip per row, so this is ~4r calls per card and not 4r².
+        local bg = self.bg_color
+        if type(bg) == "nil" then bg = _wallpaperGround() end
+        if type(bg) == "nil" then bg = Blitbuffer.COLOR_WHITE end
+        local _wp = (type(self.bg_color) == "nil") and _wallpaperModule() or nil
+        -- type(), never `== nil` or `or`, on anything that may hold a
+        -- Blitbuffer colour: they are ffi cdata, and `a or b` on one is not
+        -- the guard it looks like. paintRect indexes the colour it is handed,
+        -- so a nil reaching it takes the whole shelf down mid-paint -- which
+        -- is exactly what it did.
+        local function fill(cx, cy, cw, colour)
+            if not cw or cw <= 0 then return end
+            local restorable = (type(colour) == "nil")
+            -- The pixels that were there, when they were kept.
+            if keep and restorable and keep:putRow(bb, cx, cy, cw) then return end
+            if _wp and restorable and _wp.restore
+                    and _wp.restore(bb, cx, cy, cw, 1) then
+                return
+            end
+            local c = colour
+            if type(c) == "nil" then c = bg end
+            if type(c) == "nil" then c = Blitbuffer.COLOR_WHITE end
+            bb:paintRect(cx, cy, cw, 1, c)
+        end
         local r_sq    = r * r
         -- Resolve the shadow grey LIVE here, not from self.shadow_color
         -- (captured at build time). ShadowRect:paintTo also calls _shadowGray()
@@ -508,8 +761,8 @@ function RoundedCornerCard:paintTo(bb, x, y)
                 cutoff_top = cutoff_top + 1
             end
             if cutoff_top > 0 then
-                bb:paintRect(x, y + dy, cutoff_top, 1, bg)                  -- TL
-                bb:paintRect(x + w - cutoff_top, y + dy, cutoff_top, 1, bg) -- TR
+                fill(x, y + dy, cutoff_top)                  -- TL
+                fill(x + w - cutoff_top, y + dy, cutoff_top)  -- TR
             end
             -- Bottom half (dy near h): arc center same, but our local dy
             -- iterator runs 0..r-1 while the actual row is h-r+dy. The arc
@@ -520,7 +773,7 @@ function RoundedCornerCard:paintTo(bb, x, y)
                 cutoff_bot = cutoff_bot + 1
             end
             if cutoff_bot > 0 then
-                bb:paintRect(x, y + h - r + dy, cutoff_bot, 1, bg)          -- BL
+                fill(x, y + h - r + dy, cutoff_bot)          -- BL
                 -- BR may overlap the enclosing shadow, so it isn't a flat
                 -- bg strip. #217: bb:setPixel always applies its own
                 -- night-mode invert, whereas bb:paintRect (on Android) stays
@@ -540,24 +793,24 @@ function RoundedCornerCard:paintTo(bb, x, y)
                         if run_start == nil then
                             run_start, run_in_shadow = dx, in_shadow
                         elseif in_shadow ~= run_in_shadow then
-                            bb:paintRect(x + w - cutoff_bot + run_start, y + py,
-                                         dx - run_start, 1,
-                                         run_in_shadow and shadow_paint or bg)
+                            fill(x + w - cutoff_bot + run_start, y + py,
+                                 dx - run_start,
+                                 run_in_shadow and shadow_paint or nil)
                             run_start, run_in_shadow = dx, in_shadow
                         end
                     end
                     if run_start then
-                        bb:paintRect(x + w - cutoff_bot + run_start, y + py,
-                                     cutoff_bot - run_start, 1,
-                                     run_in_shadow and shadow_paint or bg)
+                        fill(x + w - cutoff_bot + run_start, y + py,
+                             cutoff_bot - run_start,
+                             run_in_shadow and shadow_paint or nil)
                     end
                 else
-                    bb:paintRect(x + w - cutoff_bot, y + h - r + dy,
-                                 cutoff_bot, 1, bg)                         -- BR
+                    fill(x + w - cutoff_bot, y + h - r + dy, cutoff_bot)   -- BR
                 end
             end
         end
     end
+    if keep then keep:free() end
     if self.border_size and self.border_size > 0 then
         -- Honour the user's "Border color" setting when the SpineWidget
         -- doesn't set border_color explicitly. resolvedColors().border
@@ -585,6 +838,10 @@ end
 local CornerFlag = Widget:extend{
     width  = nil,   -- card width
     height = nil,   -- card height
+    -- Extra room between the circle and the card's top/left edges. The cover
+    -- grid needs none (its frame around the cover keeps the circle off the
+    -- edge); a face-out on the spine shelf has no frame, so it asks for some.
+    inset  = 0,
 }
 
 function CornerFlag:getSize()
@@ -595,7 +852,8 @@ function CornerFlag:paintTo(bb, x, y)
     -- Flag scaled so the black "glass corner" reads from across the room
     -- on e-ink. Cap raised to 64dp; the 0.28 ratio scales down sanely on
     -- small thumbnails.
-    local leg = math.min(Screen:scaleBySize(64), math.floor(self.width * 0.28))
+    local inset = self.inset or 0
+    local leg = math.min(Screen:scaleBySize(64), math.floor(self.width * 0.28)) + inset
     -- Fill the triangle by rasterising one horizontal line per row,
     -- shrinking the line width as we move down. Row i (0..leg-1) fills
     -- pixels from x..x+(leg-1-i) at y+i.
@@ -614,16 +872,28 @@ function CornerFlag:paintTo(bb, x, y)
     -- cover's left/top edges — closer to the corner than the geometric
     -- incentre (which sits too far inside the triangle visually) but
     -- not so close that the circle bleeds out into the cover's frame.
-    local r_max = math.max(2, math.floor((leg - 2) / 3.41421))
+    local r_max = math.max(2, math.floor((leg - 2 - inset) / 3.41421))
     local r_out = math.max(2, math.floor(r_max * 0.80))
-    local cx    = x + r_out + 1
-    local cy    = y + r_out + 1
+    local cx    = x + inset + r_out + 1
+    local cy    = y + inset + r_out + 1
     local r_in  = math.max(1, math.floor(r_out * 0.5))
     bb:paintCircle(cx, cy, r_out, Blitbuffer.COLOR_WHITE)
     bb:paintCircle(cx, cy, r_in,  Blitbuffer.COLOR_BLACK)
 end
 
 local SpineWidget = InputContainer:extend{
+    -- flat_card: draw the placeholder as a BUTTON rather than a book - no
+    -- inner frame, no drop shadow. Used by the Text group style, whose tile is
+    -- a label you press, not a cover you look at; the double frame and shadow
+    -- are what make the standard placeholder read as a book, and on a folder
+    -- tile they say the wrong thing.
+    flat_card = false,
+    -- force_shadow: keep the card's shadow AND its reservation even when the
+    -- reader has turned drop shadows off globally. Set by the stack folder
+    -- styles (#362): inside a pile the grey is not a shadow cast on the page,
+    -- it is what separates the front book from the ones behind it, and without
+    -- it the tile reads as a stack of blank sheets with a chipped corner.
+    force_shadow = false,
     book        = nil,
     width       = nil,
     height      = nil,
@@ -695,11 +965,34 @@ local SpineWidget = InputContainer:extend{
     -- underlying cover but should NOT show indicators -- they'd
     -- appear above/around overlay graphics. Opt-in from ShelfRow.
     show_progress       = false,
+    -- The list view's thumbnails want the READ-STATUS cues -- pause badge,
+    -- recessed fade, completed bookmark / tickbox -- without the rest of the
+    -- grid's chrome (issue #365). Splitting them off rather than reusing
+    -- show_progress is the whole point: that flag is one switch over five
+    -- things, and the top-edge bar, the page-count pill, the series-number
+    -- pill and the OPDS downloaded mark are all unreadable at the ~30x45 a
+    -- list row gives a cover -- and the row's own token lines already say
+    -- what the bar and the page count would. show_progress implies this.
+    show_status         = false,
     -- ShelfRow's expanded mode renders book titles BELOW each cover.
     -- The bookmark glyph at the bottom-left would clash with the title
     -- if it dangled; lift it fully inside the cover when titles are
     -- visible. Regular grid: glyph can dangle for character.
     show_titles         = false,
+    -- Drop the two CORNER PILLS -- the "#N" series number and the "<n>p"
+    -- page count -- while keeping everything else the cover shows. The
+    -- spine shelf's face-out books are the caller: a face-out stands in a
+    -- row of spines that already carry their series number on the foot and
+    -- state their length by how wide they are, so the pills repeat what the
+    -- shelf says and break the skeuomorphism the same way the favourite
+    -- heart did (user ruling, and the same one that gave us
+    -- suppress_favorite_badge).
+    --
+    -- Deliberately NOT show_progress=false: that switch also takes the
+    -- top-edge progress bar and the read-status glyphs, which a face-out
+    -- does want -- it is the only cover on the shelf big enough to read
+    -- them.
+    suppress_number_badges = false,
     -- True when this cover renders inside a single-series view (drilled
     -- into a series stack OR a chip whose source.kind = "single_series").
     -- Consumed by _showSeriesNum's "in_series" three-state choice so the
@@ -713,6 +1006,37 @@ local SpineWidget = InputContainer:extend{
     -- happens on the settle rebuild. Usually inherited from the module draft
     -- flag (see below) rather than set per-instance.
     draft               = nil,
+    -- Ask for the no-cover placeholder WITHOUT its title/author text: just the
+    -- card. Opt-in from callers that draw this widget as a thumbnail and carry
+    -- the book's name themselves -- list view's cover column is the one today
+    -- (bookshelf_list_row.lua). The caller knows its own intent, so it says so
+    -- rather than leaving _renderFallback to infer "too small for text" from a
+    -- size, which is a judgement about the caller the renderer can only get
+    -- wrong: the grid's own smallest coverless tile (6 columns, stack folder
+    -- style) needs its label MORE than a roomy one, not less.
+    bare_placeholder    = false,
+    -- Draw the cover FLAT: square corners, no drop shadow, and -- the part
+    -- that is easy to miss -- no shadow reservation in the layout either.
+    -- _cardDimensions normally hands the card (width - SHADOW_OFFSET,
+    -- height - SHADOW_OFFSET) so the shadow has an L of pixels to paint into,
+    -- which means "remove the shadow" and "give the cover those pixels back"
+    -- are the same request. A flat thumbnail fills the box it was given.
+    --
+    -- Opt-in for the same reason bare_placeholder is: intent belongs to the
+    -- caller. List view's cover column is a spreadsheet cell -- a table has no
+    -- room for chrome and nothing in it is meant to look raised off the page --
+    -- while the grid and the hero are card surfaces whose shadow and radius are
+    -- the whole look. Inferring flatness from a size instead would be the
+    -- renderer guessing at the caller, which cost the grid its coverless folder
+    -- labels the last time it was tried (see bare_placeholder).
+    --
+    -- Distinct from flat_card, which is the Text folder style's "this tile is a
+    -- BUTTON, not a book": that one restyles the no-cover placeholder (drops
+    -- the ornate inner frame, flattens the two fills together) and keeps the
+    -- shadow's reserved pixels precisely so the tile stays aligned with the
+    -- folder cardboard drawn around it. Opposite requirement, so a separate
+    -- flag rather than one overloaded one.
+    flat_thumb          = false,
 }
 
 -- Module-level draft flag: BookshelfWidget:_rebuild{draft=true} raises it for
@@ -721,7 +1045,31 @@ local SpineWidget = InputContainer:extend{
 -- flag through ShelfRow / HeroCard. Deferred builders (in-place page swap,
 -- book-menu preview) run outside that window and correctly see false.
 local _draft_mode = false
-function SpineWidget.setDraftMode(on) _draft_mode = on and true or false end
+
+-- Draft quality tally, reset whenever draft mode is raised.
+--
+-- A draft render has three outcomes: a placeholder (no cached bitmap), a Lua
+-- nearest-neighbour upscale (visibly soft), or -- when the cached bitmap is
+-- already at least the slot size -- an ImageWidget built with byte-identical
+-- arguments to the normal cache-first path, which is not a downgrade at all.
+-- When EVERY cover took that third route the settle rebuild would repaint
+-- identical pixels, so it can be skipped along with its full-screen refresh.
+--
+-- Counted as "full out of total" rather than as a downgrade blacklist, so any
+-- render path added later is missing from _draft_full and therefore counts as
+-- a downgrade. The safe direction is to run the settle unnecessarily.
+local _draft_total, _draft_full = 0, 0
+function SpineWidget.setDraftMode(on)
+    _draft_mode = on and true or false
+    if _draft_mode then _draft_total, _draft_full = 0, 0 end
+end
+
+--- Did the draft just rendered come out pixel-identical to a full rebuild?
+--- False when nothing was drafted, so a caller can never mistake "no covers
+--- involved" for "nothing to upgrade".
+function SpineWidget.draftWasLossless()
+    return _draft_total > 0 and _draft_full == _draft_total
+end
 
 -- Gate the "#N" series-number badge. Three-state setting:
 --   "always" / true / nil  -> show on every cover with a series_num
@@ -758,7 +1106,11 @@ function SpineWidget:init()
             and ((self.book.has_cover and (effective_bb or can_lazy)) or external_cover) then
         self[1] = self:_renderCover(effective_bb)
     else
+        -- Placeholder card (no cover). Flagged so callers can suppress a
+        -- redundant title/author label below it -- the fallback already shows
+        -- both, larger and centred, on the card itself.
         self[1] = self:_renderFallback()
+        self.is_fallback = true
     end
     self.ges_events = {
         Tap  = { GestureRange:new{ ges = "tap",  range = self.dimen } },
@@ -783,11 +1135,82 @@ end
 --   * FrameContainer's padding directly shifts the inner widget's paint
 --     position by exactly the padding amount — straightforward, no centering
 --     surprises.
+-- What read-status chrome this surface is entitled to.
+--
+--   show_progress -- the full grid treatment (bar, page-count pill, badges,
+--                    fade). The series-number pill and the OPDS downloaded
+--                    mark have their own show_progress gates elsewhere.
+--   show_status   -- badges and fade only (list-view thumbnails, #365).
+--   neither       -- the hero card, folder stacks and series stacks, which
+--                    paint their own overlays and must stay clean.
+--
+-- decide() is asked once and the unwanted fields are zeroed, rather than
+-- calling it twice with different arguments: it is the single source of
+-- truth for how a status maps to chrome, and a second entry point would be
+-- a second place for the on-hold cue rules (issue #121) to drift.
+-- How far a list badge is pulled UP from where the grid would put it, so its
+-- bottom edge clears the row.
+--
+-- The grid hangs its badges off the card and lets them overhang: the card has
+-- room below it and the overhang is what makes a badge read as a mark ON the
+-- book. A list card's bottom edge is the row's, so the same placement puts the
+-- badge's last pixels on the divider -- on a PW5 the completed tickbox lost
+-- its entire bottom border that way, which is what issue #365's follow-up
+-- reported.
+--
+-- Taken off the BADGE'S OWN HEIGHT rather than off the cover. The obvious fix
+-- is to anchor to where the artwork ends instead of where the card does, and
+-- it does not work: the only cheap source for that is bookAspect's
+-- cover_sizetag, which disagrees with what the renderer actually draws.
+-- Measured on a PW5, Katabasis reports ~1.38 and renders at ~1.50, so an
+-- artwork-derived anchor put the badge 19px too high and it stopped hanging
+-- below the cover at all. The badge's height is a number we already have and
+-- can trust, it scales with the Cover badge size dialog and with DPI, and the
+-- overhang survives.
+--
+-- Deliberately SMALL. The grid's placement was very nearly right already --
+-- the badge hung a few pixels past the cover and only its last row or two
+-- were lost -- so this takes back just enough for the bottom border and its
+-- halo, and leaves the rest of the overhang alone. Floored at 3px so it never
+-- rounds down to less than the border plus halo it exists to rescue.
+local LIST_BADGE_CLEARANCE = 0.12
+function SpineWidget:_listBadgeClearance(badge_h)
+    return math.max(3, math.floor((badge_h or 0) * LIST_BADGE_CLEARANCE + 0.5))
+end
+
+function SpineWidget:_statusIndicators()
+    if not (self.show_progress or self.show_status) then
+        return { bar = false, bar_pct = 0, glyph = nil }
+    end
+    local ind = CoverProgress.decide(self.book)
+    if self.show_progress then
+        -- The page-count pill is a NUMBER BADGE, so it leaves with the series
+        -- one; the bar and the glyphs stay. Decided here rather than at the
+        -- paint site so every "which surface shows which chrome" rule lives
+        -- in one function -- which is also the only way the split is
+        -- testable (see tests/_test_spine_status_gate.lua).
+        if self.suppress_number_badges and ind.page_count then
+            local copy = {}
+            for k, v in pairs(ind) do copy[k] = v end
+            copy.page_count = false
+            return copy
+        end
+        return ind
+    end
+    return {
+        bar          = false,
+        bar_pct      = 0,
+        glyph        = ind.glyph,
+        on_hold      = ind.on_hold,
+        on_hold_fade = ind.on_hold_fade,
+        page_count   = false,
+    }
+end
+
 function SpineWidget:_renderShadowedCard(inner)
     local card_w, card_h = self:_cardDimensions()
-    local indicators     = self.show_progress
-        and CoverProgress.decide(self.book)
-        or  { bar = false, bar_pct = 0, glyph = nil }
+    local indicators     = self:_statusIndicators()
+    local list_badges    = self.show_status and not self.show_progress
 
     local children = {}
 
@@ -801,17 +1224,45 @@ function SpineWidget:_renderShadowedCard(inner)
             width     = card_w,
             height    = card_h,
             thickness = SELECTED_BORDER,
-            radius    = CARD_RADIUS,
+            radius    = self:_squareCorners() and 0 or CARD_RADIUS,
         }
+    elseif self.flat_thumb then
+        -- No shadow, and _cardDimensions already gave the reserved pixels back
+        -- to the card.
+    elseif self.flat_card then
+        -- A button does not cast a shadow. Suppressed here rather than by
+        -- skipping the wrapper, so selection borders, badges and glyphs all
+        -- still work on a flat tile.
+    elseif self:_noShadow() and not self.force_shadow then
+        -- #353: the reader asked for a flat grid. Checked after flat_card so
+        -- that tile keeps its own reservation (see _cardDimensions).
+        -- force_shadow opts a stack's front cover back in (#362).
     elseif not (indicators.on_hold_fade and not self.is_bulk_selected) then
         children[#children + 1] = FrameContainer:new{
             bordersize   = 0,
             padding      = 0,
             padding_top  = SHADOW_OFFSET,
             padding_left = SHADOW_OFFSET,
-            ShadowRect:new{ width = card_w, height = card_h },
+            ShadowRect:new{
+                width   = card_w,
+                height  = card_h,
+                radius  = self:_squareCorners() and 0 or CARD_RADIUS,
+                exposed = SHADOW_OFFSET,
+            },
         }
     end
+
+    -- glyphs_top_left (spine shelf face-outs): both status glyphs move to
+    -- the top-left corner the favourite heart vacated there. On the shelf
+    -- the bottom edge meets the plank, so the usual below-card dangle
+    -- disappeared behind the lift shadow / plank bands (user report); at
+    -- the top edge the bookmark drapes over the book's pages instead --
+    -- the same overhang share the favourite star uses. The relocated
+    -- glyph must paint IN FRONT of the artwork (its on-card body carries
+    -- the message now, not a dangle), so the in-progress branch defers
+    -- its insertion until after `inner`.
+    local glyph_top_left = self.glyphs_top_left
+    local deferred_glyph
 
     -- 2. In-progress glyph (IN FRONT of inner): anchored so its top is
     --    GLYPH_TOP_LIFT * glyph_h above the card bottom (i.e. the entire
@@ -838,6 +1289,11 @@ function SpineWidget:_renderShadowedCard(inner)
                 CoverProgress.GLYPH_BOOKMARK, glyph_h, halo_w,
                 colors.border,      -- halo (shared "Border color")
                 colors.bookmark)    -- centre fill (user-tunable bookmark color)
+            -- So a night-mode flip re-colours it in place instead of waiting
+            -- for the shelf rebuild; see CoverProgress.registerRecolour.
+            CoverProgress.registerRecolour(outlined, function(c)
+                return { halo = c.border, centre = c.bookmark }
+            end)
             local lift = _glyphTopLift(self.show_titles)
             -- Pin the below-card dangle to the UNSCALED footprint so a
             -- larger Cover badge size lifts the top inward and the bottom
@@ -851,15 +1307,35 @@ function SpineWidget:_renderShadowedCard(inner)
                 + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
             local y_offset = card_h
                 + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
-            local glyph_frame = FrameContainer:new{
-                bordersize   = 0,
-                padding      = 0,
-                padding_top  = y_offset - halo_w,
-                padding_left = _glyphLeftInset() - halo_w,
-                outlined,
-            }
-            children[#children + 1] = glyph_frame
-            -- Overhangs the card bottom: the opening effect repaints it on
+            if list_badges then
+                y_offset = y_offset - self:_listBadgeClearance(widget_h)
+            end
+            local glyph_frame
+            if glyph_top_left then
+                -- Top-left corner, star anchoring: 35% of the unscaled
+                -- footprint above the top edge, the rest draped onto the
+                -- artwork. Deferred so it paints over `inner`.
+                glyph_frame = FrameContainer:new{
+                    bordersize = 0,
+                    padding    = 0,
+                    outlined,
+                }
+                glyph_frame.overlap_offset = {
+                    _glyphLeftInset() - halo_w,
+                    -math.floor(base_widget_h * 0.35 + 0.5) - halo_w,
+                }
+                deferred_glyph = glyph_frame
+            else
+                glyph_frame = FrameContainer:new{
+                    bordersize   = 0,
+                    padding      = 0,
+                    padding_top  = y_offset - halo_w,
+                    padding_left = _glyphLeftInset() - halo_w,
+                    outlined,
+                }
+                children[#children + 1] = glyph_frame
+            end
+            -- Overhangs the card edge: the opening effect repaints it on
             -- top of the ring erase + flex (frame stamps its painted rect).
             self._overhang_glyph_widgets = self._overhang_glyph_widgets or {}
             table.insert(self._overhang_glyph_widgets, glyph_frame)
@@ -868,6 +1344,9 @@ function SpineWidget:_renderShadowedCard(inner)
 
     -- 3. Inner card (image or fallback) at (0,0)
     children[#children + 1] = inner
+    if deferred_glyph then
+        children[#children + 1] = deferred_glyph
+    end
 
     -- 3b. On-hold badge (IN FRONT of inner): a centred pause "button" drawn
     --     as a filled circle + two solid bars, sharing the page-count badge's
@@ -928,6 +1407,10 @@ function SpineWidget:_renderShadowedCard(inner)
                 colors.border,             -- halo (shared "Border color")
                 colors.complete_bookmark,  -- centre fill (user-tunable)
                 colors.shadow)             -- shadow (always dark on screen)
+            CoverProgress.registerRecolour(outlined, function(c)
+                return { halo = c.border, centre = c.complete_bookmark,
+                         shadow = c.shadow }
+            end)
             local lift = _glyphTopLift(self.show_titles)
             -- Same inward-growth anchor as the in-progress glyph: the
             -- below-card dangle is pinned to the unscaled footprint so a
@@ -942,13 +1425,31 @@ function SpineWidget:_renderShadowedCard(inner)
                 + GLYPH_DANGLE_GROWTH_SHARE * (widget_h - base_widget_h)
             local y_offset = card_h
                 + math.floor(dangle_h * (1 - lift) + 0.5) - widget_h
-            local glyph_frame = FrameContainer:new{
-                bordersize   = 0,
-                padding      = 0,
-                padding_top  = y_offset - halo_w,
-                padding_left = _glyphLeftInset() - halo_w,
-                outlined,
-            }
+            if list_badges then
+                y_offset = y_offset - self:_listBadgeClearance(widget_h)
+            end
+            local glyph_frame
+            if glyph_top_left then
+                -- Top-left corner on a shelf face-out (see the
+                -- glyphs_top_left note above); already after `inner`.
+                glyph_frame = FrameContainer:new{
+                    bordersize = 0,
+                    padding    = 0,
+                    outlined,
+                }
+                glyph_frame.overlap_offset = {
+                    _glyphLeftInset() - halo_w,
+                    -math.floor(base_widget_h * 0.35 + 0.5) - halo_w,
+                }
+            else
+                glyph_frame = FrameContainer:new{
+                    bordersize   = 0,
+                    padding      = 0,
+                    padding_top  = y_offset - halo_w,
+                    padding_left = _glyphLeftInset() - halo_w,
+                    outlined,
+                }
+            end
             children[#children + 1] = glyph_frame
             -- Same overhang-repaint note as the in-progress glyph above.
             self._overhang_glyph_widgets = self._overhang_glyph_widgets or {}
@@ -1020,7 +1521,10 @@ function SpineWidget:_renderShadowedCard(inner)
         local pill_h   = sz.h
         local bar_pad  = _barBottomPadding()
         local side     = _barSideMargin()
-        local pill_y   = card_h - CARD_BORDER - bar_pad - pill_h
+        local pill_y = card_h - CARD_BORDER - bar_pad - pill_h
+        if list_badges then
+            pill_y = pill_y - self:_listBadgeClearance(pill_h)
+        end
         local pill_x   = CARD_BORDER + side
         if pill_y < CARD_BORDER then pill_y = CARD_BORDER end
         children[#children + 1] = FrameContainer:new{
@@ -1121,6 +1625,86 @@ function SpineWidget:_renderShadowedCard(inner)
         end
     end
 
+    -- 5a. Downloaded tick (bottom-RIGHT, fully inside the cover). Marks an
+    --     OPDS catalog record whose file the user already has on disk. The
+    --     flag is set by the book repository from a stat of the opds_downloads
+    --     mapping, so it is read-side truth: deleting (or moving) the book
+    --     retires the tick with no bookkeeping pass. It is never set on a
+    --     local record, so this branch costs one nil test per ordinary cell.
+    --
+    --     Same halo + drop-shadow treatment and the same builder call as the
+    --     favourite heart/star above, so it inherits the Cover badge size
+    --     setting and resolvedColors() for free -- no new badge system, no new
+    --     painter, and no new setting: one indicator, always on for remote
+    --     records.
+    --
+    --     Bottom-right is the page-count pill's slot, but the pill needs
+    --     self.book.page_count, which is always nil on an OPDS record -- the
+    --     two can't collide. Guarded anyway rather than argued: the cost is a
+    --     boolean and the failure mode would be two badges stacked on one
+    --     corner.
+    --
+    --     Gated on self.show_progress like every other cover badge here: that
+    --     flag marks the GRID cell, which is the only surface OPDS records
+    --     render on. The hero card, folder cards and series stacks reuse
+    --     SpineWidget with it off, and their card_w is the SLOT rather than the
+    --     painted cover, so a right-anchored badge would hang off the artwork.
+    local pill_owns_corner = indicators.page_count and self.book and self.book.page_count
+    if self.show_progress and self.book and self.book.downloaded
+            and not pill_owns_corner
+            and not self.is_bulk_selected then
+        -- 70% of the status-glyph size, matching the favourite glyph: the
+        -- circled check is intrinsically wider than the bookmark at the same
+        -- point size, so equal nominal sizes read as unequal weight.
+        local base_h  = math.floor(_glyphSize(card_w) * 0.70)
+        local glyph_h = _badgeSize(base_h)
+        local glyph_w = self:_glyphWidth(glyph_h)
+        if glyph_w <= card_w * 0.4 then
+            local colors   = CoverProgress.resolvedColors()
+            local halo_w   = 1
+            -- Shadow extent must exceed halo_w to peek out from behind the
+            -- outline (same derivation as the favourite glyph).
+            local shadow_d = math.max(halo_w + 2, math.floor(glyph_h * 0.10))
+            -- Centre fill is badge_bg, the shared badge-surface colour: white
+            -- in day mode, and black in night mode so KOReader's framebuffer
+            -- inversion still displays it white. Reused rather than given its
+            -- own setting -- the tick is not a read status and does not earn a
+            -- colour row of its own.
+            local outlined = CoverProgress.buildHaloShadowedGlyphWidget(
+                CoverProgress.GLYPH_DOWNLOADED,
+                glyph_h,
+                halo_w,
+                shadow_d, shadow_d,  -- down-right
+                colors.border,          -- halo (shared "Border color")
+                colors.badge_bg,        -- centre fill
+                colors.shadow,          -- shadow (always dark on screen)
+                "symbols")
+            CoverProgress.registerRecolour(outlined, function(c)
+                return { halo = c.border, centre = c.badge_bg, shadow = c.shadow }
+            end)
+            -- True rendered height (memoized probe): the halo group's
+            -- synthetic dimen under-reports the paint footprint, and
+            -- Font:getFace at size N paints at ~N*1.35.
+            local widget_h = CoverProgress.glyphRenderedH(
+                CoverProgress.GLYPH_DOWNLOADED, glyph_h, "symbols")
+            -- Width comes from the glyph's nominal size plus the halo (the icon
+            -- is square in the face: 21x21 at 24px in the bundled symbols.ttf);
+            -- height from the MEASURED probe, because a symbols TextWidget is
+            -- ~1.35x its point size tall once ascent and descent are counted,
+            -- and anchoring the bottom on the nominal size would push the ink
+            -- past the cover's lower edge.
+            local tick_x, tick_y = SpineWidget.downloadedTickOffset(
+                card_w, card_h, glyph_w, widget_h, halo_w)
+            children[#children + 1] = FrameContainer:new{
+                bordersize   = 0,
+                padding      = 0,
+                padding_top  = tick_y,
+                padding_left = tick_x,
+                outlined,
+            }
+        end
+    end
+
     -- 6. Series-number badge. White rounded pill with "#N" at top-right,
     --    sitting proud of the cover by SHADOW_OFFSET -- matches the
     --    SeriesStack "xN" count badge style. Shown on any cover whose
@@ -1130,6 +1714,7 @@ function SpineWidget:_renderShadowedCard(inner)
     --        series stacks reuse SpineWidget but opt out).
     --      * Setting bookshelf_show_series_num (default ON).
     if self.show_progress and _showSeriesNum(self.in_series)
+            and not self.suppress_number_badges
             and self.book and self.book.series_num then
         local TextWidget     = require("ui/widget/textwidget")
         local colors        = CoverProgress.resolvedColors()
@@ -1242,6 +1827,13 @@ function SpineWidget:_renderShadowedCard(inner)
                     fav_color,              -- centre fill (per-icon, user-tunable)
                     colors.shadow,          -- shadow (always dark on screen)
                     "symbols")
+                -- The centre is per-icon, so the pick re-derives it rather
+                -- than capturing the colour this build happened to use.
+                CoverProgress.registerRecolour(outlined, function(c)
+                    return { halo = c.border, shadow = c.shadow,
+                             centre = fav_icon == "star"
+                                 and c.favorite_star or c.favorite_heart }
+                end)
                 -- 35% of the glyph hangs above the cover; 65% sits on the
                 -- artwork. More overhang than the previous 25% so the star
                 -- clearly nestles into the top edge rather than sitting on
@@ -1288,6 +1880,7 @@ function SpineWidget:_renderShadowedCard(inner)
         children[#children + 1] = CornerFlag:new{
             width  = card_w,
             height = card_h,
+            inset  = self.bulk_flag_inset or 0,
         }
     end
 
@@ -1308,7 +1901,39 @@ end
 -- account. Both _renderCover and _renderFallback must use this when
 -- sizing their inner card widget so the card doesn't overlap the
 -- dangle zone that _renderShadowedCard reserves on the bottom edge.
+-- #353. The grid and hero draw covers as cards: rounded corners and a drop
+-- shadow. Some readers want a flatter, crisper grid, so the two are settable
+-- separately -- square corners with the shadow kept is a coherent look, and so
+-- is the reverse. Resolved here rather than passed in because SpineWidget is
+-- built from six call sites (shelf rows, hero, folder and series stacks, list
+-- group, cover picker) and threading two more flags through all of them would
+-- be a lot of wiring for a preference the widget can just read, exactly as it
+-- already reads show_series_num and show_fav_badge.
+--
+-- flat_thumb still forces both: a list view's cover column is a table cell and
+-- has no room for chrome, whatever the user prefers elsewhere.
+function SpineWidget:_squareCorners()
+    if self.flat_thumb then return true end
+    return BookshelfSettings.read("cover_square_corners", false) == true
+end
+
+function SpineWidget:_noShadow()
+    if self.flat_thumb then return true end
+    return BookshelfSettings.read("cover_no_shadow", false) == true
+end
+
 function SpineWidget:_cardDimensions()
+    -- Flat thumbnails cast no shadow, so there is nothing to reserve for and
+    -- the card takes the whole slot. The reservation is the layout half of the
+    -- shadow -- leaving it in would keep charging a list row for chrome it
+    -- asked not to have.
+    -- flat_card is excluded on purpose: it suppresses the shadow but KEEPS the
+    -- reservation so a Text-style folder tile stays aligned with the cardboard
+    -- drawn around it. A global no-shadow preference must not move those.
+    if self.flat_thumb
+            or (self:_noShadow() and not self.flat_card and not self.force_shadow) then
+        return self.width, self.height
+    end
     -- Glyph is now fully INSIDE the card (no dangle), so no extra
     -- bottom-margin reservation needed.
     return self.width - SHADOW_OFFSET, self.height - SHADOW_OFFSET
@@ -1336,16 +1961,94 @@ function SpineWidget:_renderCover(bb)
     local external_cover = self.book and self.book.cover_image_path
 
     if external_cover then
-        local ok_img, ImageSource = pcall(require, "lib/bookshelf_image_source")
-        local external_bb = ok_img and ImageSource.loadImage(external_cover, img_w, img_h) or nil
-        if external_bb then
-            return self:_wrapCoverInCard(
-                ImageWidget:new{
-                    image            = external_bb,
+        -- Cache the scaled result, keyed on the SOURCE FILE's identity rather
+        -- than the book's path. Without this the image was decoded from disk on
+        -- every single render: measured on a PW5, the hero cover of a book with
+        -- a picked cover cost 361ms of a 496ms hero build, paid again on every
+        -- rebuild, chip switch and book close, because this branch sits above
+        -- the cache-first block below and never put anything back.
+        --
+        -- Why path+mtime+size instead of the book's filepath, which is what the
+        -- rest of the cache is keyed on: an external cover can be REPLACED at
+        -- any time (the cover picker, a Hardcover download), and nothing today
+        -- drops the cover cache when that happens -- it did not have to, since
+        -- this path never cached. Keying on the file's identity means a
+        -- replacement simply misses, instead of every writer having to remember
+        -- to invalidate and one that forgets showing the old cover forever now
+        -- that the cache is on disk. Costs one stat against a full decode.
+        local ck = SpineWidget.externalCoverKey(external_cover)
+        -- Same contract as the embedded cache-first path: usable only when the
+        -- cached bb covers the slot in both axes, and painted through
+        -- width/height so ImageWidget downscales (Kindle-safe direction).
+        if ck then
+            local cached = ScaledCoverCache:get(ck)
+            if cached
+                    and cached:getWidth()  >= img_w
+                    and cached:getHeight() >= img_h then
+                local img_args = {
+                    image            = cached,
                     image_disposable = false,
-                    scale_factor     = 1,
-                },
-                card_w, card_h, border)
+                    width            = img_w,
+                    height           = img_h,
+                }
+                if not self.cover_fill then img_args.scale_factor = 0 end
+                return self:_wrapCoverInCard(
+                    ImageWidget:new(img_args), card_w, card_h, border)
+            end
+        end
+        local ok_img, ImageSource = pcall(require, "lib/bookshelf_image_source")
+        local external_bb
+        if ok_img then
+            -- How big the file actually is, read from its header rather than
+            -- from a decode (ImageSource.probeSize). When it holds fewer
+            -- pixels than the slot wants, asking the renderer for slot-sized
+            -- output is an UPSCALE through MuPDF -- the direction that
+            -- corrupts on Kindle, which is why the embedded-cover path below
+            -- uses bb:scale instead -- and it invents no detail either way.
+            -- Load it at its own size and grow it the safe way.
+            local nat_w, nat_h = ImageSource.probeSize(external_cover)
+            if nat_w and nat_h and (nat_w < img_w or nat_h < img_h) then
+                local native = ImageSource.loadImageNative(external_cover)
+                if native then
+                    -- Owned by ImageSource's cache: copy it, never free it.
+                    local ok_g, grown = pcall(function()
+                        if self.cover_fill then
+                            return _coverFillBB(native, img_w, img_h)
+                        end
+                        local sw, sh = native:getWidth(), native:getHeight()
+                        local f = math.min(img_w / sw, img_h / sh)
+                        return native:scale(math.max(1, math.floor(sw * f)),
+                                            math.max(1, math.floor(sh * f)))
+                    end)
+                    if ok_g then external_bb = grown end
+                end
+            end
+            -- The file is big enough (or the header could not be read): the
+            -- renderer downscales, which is the safe direction.
+            if not external_bb then
+                external_bb = ImageSource.loadImage(external_cover, img_w, img_h)
+            end
+        end
+        if external_bb then
+            local paint_bb = external_bb
+            if ck then paint_bb = ScaledCoverCache:put(ck, external_bb) end
+            local img_args = {
+                image            = paint_bb,
+                image_disposable = false,
+            }
+            if paint_bb == external_bb then
+                -- Ours, loaded at exactly this slot's size.
+                img_args.scale_factor = 1
+            else
+                -- put() kept a bigger entry (a hero render seeded it). It is
+                -- not this slot's size, so it has to be fitted like a cache hit
+                -- rather than painted 1:1.
+                img_args.width  = img_w
+                img_args.height = img_h
+                if not self.cover_fill then img_args.scale_factor = 0 end
+            end
+            return self:_wrapCoverInCard(
+                ImageWidget:new(img_args), card_w, card_h, border)
         end
     end
 
@@ -1368,8 +2071,13 @@ function SpineWidget:_renderCover(bb)
     -- fall through to the source-bb path which uses bb:scale (Lua
     -- nearest-neighbour, corruption-free in both directions) and the
     -- result will replace the cache entry per the put policy.
+    -- Whatever the cache holds for this book, at any size: the decode
+    -- fallback below grows it rather than show a placeholder when BIM has
+    -- nothing to decode.
+    local cached_any
     if fp then
         local cached = ScaledCoverCache:get(fp)
+        cached_any = cached
         if cached
                 and cached:getWidth()  >= img_w
                 and cached:getHeight() >= img_h then
@@ -1389,6 +2097,33 @@ function SpineWidget:_renderCover(bb)
             return self:_wrapCoverInCard(
                 ImageWidget:new(img_args), card_w, card_h, border)
         end
+        -- NEAR-size cache entry: any layout change that grows the slot by a
+        -- few pixels (rows count, hero height, a new footer) used to strand
+        -- the WHOLE disk cache just under the strict >= test above, and
+        -- every cover on every fresh page fell through to a full BIM decode
+        -- (~37ms each on a PW5 -- the "covers feel slow vs spine/list"
+        -- report: 402 cached covers at 206x299 against a 210x303 slot).
+        -- Growing the cached bb by up to ~10% with bb:scale (Lua nearest-
+        -- neighbour, Kindle-safe in BOTH directions, unlike MuPDF upscale)
+        -- is imperceptible at these ratios and costs a fraction of the
+        -- decode. The grown bb replaces the cache entry (prefer-larger put,
+        -- with disk write-back), so each book heals once.
+        if cached and self.cover_fill
+                and cached:getWidth()  >= math.floor(img_w * 0.9)
+                and cached:getHeight() >= math.floor(img_h * 0.9) then
+            if bb and ((self.cover_bb == nil) or self.cover_bb_disposable) then
+                bb:free()
+            end
+            local grown = _coverFillBB(cached, img_w, img_h)
+            local effective = ScaledCoverCache:put(fp, grown)
+            return self:_wrapCoverInCard(
+                ImageWidget:new{
+                    image            = effective,
+                    image_disposable = false,   -- cache owns lifetime
+                    width            = img_w,
+                    height           = img_h,
+                }, card_w, card_h, border)
+        end
     end
 
     -- No usable cached bb. We need a source bb to scale or paint at
@@ -1398,13 +2133,63 @@ function SpineWidget:_renderCover(bb)
     -- We own the returned bb; mark img_disposable accordingly.
     local img_disposable = (self.cover_bb == nil) or self.cover_bb_disposable
     if not bb then
-        bb = fp and _getRepo().getCoverBB(fp)
+        -- Hero tier first, for HERO-sized consumers only: a hero-height
+        -- copy stashed when the shelf decoded this cover earlier. take()
+        -- transfers ownership, so it flows through the scale-and-free path
+        -- below like any source. Shelf-sized consumers skip it -- they'd
+        -- consume (and waste) the copy the hero is waiting for.
+        if fp and HeroTier.target_h
+                and img_h >= math.floor(HeroTier.target_h * 0.9) then
+            bb = HeroTier:take(fp)
+        end
         if not bb then
-            -- BIM has no usable cover row. Fall back to the no-cover
-            -- render so the slot doesn't crash on bb:getWidth() below.
+            bb = fp and _getRepo().getCoverBB(fp)
+        end
+        if not bb and cached_any then
+            -- BIM has nothing to decode for this book right now (row gone
+            -- after a re-sync, re-extraction pending or failed, cover
+            -- ignored) while the shelf still paints one from the cache. A
+            -- grown copy of that beats a placeholder (device report: covers
+            -- on the shelf, none in the hero). Owned by this widget and
+            -- never put in the cache: a real decode later must win, and
+            -- prefer-larger would otherwise pin the blurry copy for good.
+            local grown
+            local ok_g = pcall(function()
+                if self.cover_fill then
+                    grown = _coverFillBB(cached_any, img_w, img_h)
+                else
+                    local sw, sh = cached_any:getWidth(), cached_any:getHeight()
+                    local f = math.min(img_w / sw, img_h / sh)
+                    grown = cached_any:scale(math.max(1, math.floor(sw * f)),
+                                             math.max(1, math.floor(sh * f)))
+                end
+            end)
+            if ok_g and grown then
+                return self:_wrapCoverInCard(ImageWidget:new{
+                    image            = grown,
+                    image_disposable = true,
+                    width            = grown:getWidth(),
+                    height           = grown:getHeight(),
+                    scale_factor     = 1,
+                }, card_w, card_h, border)
+            end
+        end
+        if not bb then
+            -- BIM has no usable cover row and the cache has nothing either.
+            -- Fall back to the no-cover render so the slot doesn't crash on
+            -- bb:getWidth() below.
             return self:_renderFallback()
         end
         img_disposable = true
+    end
+    -- Fresh full-size source in hand: stash a hero-height copy so the
+    -- FIRST preview of this book skips its BIM decode (~90ms on a PW5).
+    -- One extra bb:scale on top of work that already paid the decode.
+    -- Skipped when this consumer is itself hero-sized -- its scaled
+    -- result lands in ScaledCoverCache and already serves repeats.
+    if fp and img_disposable and HeroTier.target_h
+            and img_h < math.floor(HeroTier.target_h * 0.9) then
+        HeroTier:noteSource(fp, bb)
     end
 
     -- ImageWidget's internal MuPDF scaler corrupts on UPSCALE on Kindle
@@ -1557,9 +2342,12 @@ function SpineWidget:_renderDraftCover(fp, img_w, img_h, card_w, card_h, border)
     -- cover_bb -- freeing that under a fetch-skip-reused record was the earlier
     -- segfault. No cached bitmap for this book -> placeholder. Correct-size
     -- covers land on the settle rebuild.
+    _draft_total = _draft_total + 1
     local src = fp and ScaledCoverCache:get(fp)
     if not src then return self:_renderFallback() end
     if src:getWidth() >= img_w and src:getHeight() >= img_h then
+        -- Identical to the non-draft cache-first path, so not a downgrade.
+        _draft_full = _draft_full + 1
         -- Cached bitmap is big enough: let ImageWidget MuPDF-downscale it at
         -- paint (fast C path; downscale is the Kindle-safe direction). The
         -- cache owns the bb and never frees it, and we add no free of our own,
@@ -1622,6 +2410,8 @@ function SpineWidget:_renderCoverAlignTop(card_w, card_h, border, img_w, img_h)
             -- Draft regrid: no decode. Align-top (folder/series) covers aren't
             -- in ScaledCoverCache, so with no in-hand cover_bb there's nothing
             -- to rescale -- show a placeholder; the settle rebuild decodes it.
+            -- Counted but never full: this one always needs the settle.
+            _draft_total = _draft_total + 1
             return self:_renderFallback()
         else
             bb, owned = fp and _getRepo().getCoverBB(fp), true
@@ -1654,18 +2444,18 @@ function SpineWidget:_wrapCoverInCard(cover_inner, card_w, card_h, border)
     -- background, no border, and no drop shadow (the shadow is skipped in
     -- the same condition in _renderShadowedCard). Gated on on_hold_fade,
     -- not the pause badge -- on_hold_display = "pause" keeps normal cover
-    -- chrome (issue #121). show_progress is set only on grid covers (the
-    -- hero / folder / series stacks reuse SpineWidget but clear it), so this
-    -- is grid-only by construction. Excluded while selected (current-book
-    -- ring) or bulk-selected, which own their cover chrome.
-    local on_hold_fade = self.show_progress
-        and not self.is_selected and not self.is_bulk_selected
-        and CoverProgress.decide(self.book).on_hold_fade or false
+    -- chrome (issue #121). _statusIndicators keeps this to the grid and the
+    -- list row (#365) -- the hero / folder / series stacks reuse SpineWidget
+    -- but set neither flag, so they stay clean by construction. Excluded
+    -- while selected (current-book ring) or bulk-selected, which own their
+    -- cover chrome.
+    local on_hold_fade = not self.is_selected and not self.is_bulk_selected
+        and self:_statusIndicators().on_hold_fade or false
     local cover_args = {
         inner       = cover_inner,
         width       = card_w,
         height      = card_h,
-        radius      = CARD_RADIUS,
+        radius      = self:_squareCorners() and 0 or CARD_RADIUS,
         border_size = border,
     }
     if on_hold_fade then
@@ -1692,10 +2482,24 @@ function SpineWidget:_wrapCoverInCard(cover_inner, card_w, card_h, border)
         -- (0..R, 0..R) corner squares for points OUTSIDE the radius-R
         -- arc, to fake rounded corners on top of a rectangular image.
         -- With the BorderOverlay backdrop those bg-white pixels poke
-        -- out into the black ring as four little white teeth. Invert
-        -- the mask color to match the backdrop so the corner squares
-        -- merge seamlessly with the surrounding black.
-        cover_args.bg_color = Blitbuffer.COLOR_BLACK
+        -- out into the ring as four little white teeth. Match the mask
+        -- color to the backdrop so the corner squares merge seamlessly
+        -- into it -- which means following the ring's own colour now that
+        -- it is user-settable (issue #199), not the black it used to be.
+        cover_args.bg_color = _selectionColor()
+    elseif self:_squareCorners() or (self:_noShadow() and not self.force_shadow) then
+        -- Square corners mean no corner mask runs at all, so there are no
+        -- masked pixels for a shadow to show through; no shadow means there is
+        -- nothing behind the card to restore. Either alone makes the shadow_*
+        -- fields inert, and both are left explicit rather than relying on
+        -- radius == 0 making them inert downstream.
+        --
+        -- force_shadow excepted (#362): a stack's front cover DOES have a
+        -- shadow behind it even with the global setting off, so its masked
+        -- corner has to restore that grey. Left out here, the mask painted the
+        -- corner page-white over the pile behind it -- the chipped corner the
+        -- issue reported. This is the branch that actually produced the white
+        -- pixels; the reservation and the arc were only what made room.
     else
         -- The card sits at (0, 0) in the OverlapGroup; the shadow paints
         -- at (SHADOW_OFFSET, SHADOW_OFFSET) with the same w/h and same
@@ -1751,15 +2555,88 @@ function SpineWidget:_renderFallback()
     local content_pad   = math.max(Screen:scaleBySize(4), math.floor(card_w * 0.04))
     local content_w     = outer_inset_w - border * 2 - content_pad * 2
 
+    -- Degenerate slot: the card's frame alone, no text.
+    --
+    -- Two ways in, and they are deliberately different questions.
+    --
+    -- 1. The caller ASKED for it (bare_placeholder). A list row draws this
+    --    placeholder at a row-height thumbnail and prints the title in its own
+    --    column, so text on the card would be a smaller, redundant copy. Intent
+    --    is the caller's to declare -- inferring it from a width instead cost
+    --    the cover grid its coverless folder labels at 6 columns, where the
+    --    stack style's inset leaves a card that is small but perfectly able to
+    --    carry a name.
+    --
+    -- 2. The text physically cannot render. TextBoxWidget re-wraps a line it is
+    --    about to ellipsis-truncate against `targeted_width - ellipsis_width`
+    --    (frontend/ui/widget/textboxwidget.lua:879) and aborts inside native
+    --    code -- no Lua traceback, the whole app goes down -- when that is not
+    --    strictly positive. So the floor is exactly the real failure condition,
+    --    measured against the face that is about to render, and no grid slot
+    --    that can hold a word ever trips it.
+    local function bareCard()
+        local plain = ColorSafeFrame:new{
+            bordersize = border,
+            color      = colors.border,
+            radius     = self:_squareCorners() and 0 or CARD_RADIUS,
+            padding    = 0,
+            background = outer_bg,
+            Widget:new{ dimen = Geom:new{
+                w = math.max(1, card_w - border * 2),
+                h = math.max(1, card_h - border * 2),
+            } },
+        }
+        self._cover_card = plain
+        return (self:_renderShadowedCard(plain))
+    end
+    if self.bare_placeholder then return bareCard() end
+
     -- Title text: cap height so a 4-line title still leaves room for
     -- the rule + author below.
     local title_text  = (self.book and self.book.title) or "?"
     local author_text = (self.book and self.book.author) or ""
 
+    -- Fonts grow to fill the slot rather than sitting at a fixed size that
+    -- looks tiny on a large or high-DPI cover (the whole point of this
+    -- placeholder is that there's no artwork to carry the card). fitFontSize
+    -- returns the largest size whose widest word still fits the width and
+    -- whose wrapped block still fits the height; at the floor it stops and
+    -- TextBoxWidget's ellipsis takes over, so text truncates before it shrinks
+    -- past legibility. Sizes are logical pt (BFont scales by DPI) so a title
+    -- fills the same FRACTION of the card at any DPI. The caps are kept fairly
+    -- tight on purpose: once a card is big enough to reach the cap the size
+    -- stops climbing, so the text stays a consistent, readable size across
+    -- screen sizes and grid settings instead of ballooning on large tiles (a
+    -- lone word filling the full tile width reads as too big). The floor sits
+    -- near the old fixed 13 so small covers keep their legibility.
     local title_max_h  = math.max(Screen:scaleBySize(20), math.floor(card_h * 0.40))
-    local title_face, title_bold = BFont:getFace("infofont", 13, { bold = true })
+    local title_size = TextFit.fitFontSize{
+        text = title_text, width = content_w, max_h = title_max_h,
+        lo = 12, hi = 22, bold = true,
+    }
+    local title_face, title_bold = BFont:getFace("infofont", title_size, { bold = true })
+    -- The hard floor described above, now that the face is known. The author
+    -- below renders at author_size <= title_size and unbolded, so its ellipsis
+    -- can never be the wider of the two -- one measurement covers both text
+    -- widgets. nil-safe: a stubbed or absent RenderText leaves the width at 0,
+    -- which only ever means "don't take this branch", never a crash of its own.
+    local ellipsis_w = 0
+    do
+        local ok_rt, RenderText = pcall(require, "ui/rendertext")
+        if ok_rt and RenderText and RenderText.getEllipsisWidth then
+            local ok_w, w = pcall(function()
+                return RenderText:getEllipsisWidth(title_face, title_bold)
+            end)
+            if ok_w and type(w) == "number" then ellipsis_w = w end
+        end
+    end
+    if content_w <= ellipsis_w then return bareCard() end
+    -- Balance a wrapping title so its last line isn't a lone word (same
+    -- treatment as the hero title). Line count is unchanged, so the fitted
+    -- height still holds. Skip when it stayed one line.
+    local title_render = TextFit.balanceLines(title_text, title_face, content_w, title_bold)
     local title = TextBoxWidget:new{
-        text                          = title_text,
+        text                          = title_render,
         face                          = title_face,
         bold                          = title_bold,
         fgcolor                       = Blitbuffer.COLOR_BLACK,
@@ -1770,7 +2647,12 @@ function SpineWidget:_renderFallback()
         bgcolor                       = inner_bg,
         width                         = content_w,
         alignment                     = "center",
+        -- height_adjust: report the fitted title's NATURAL height so the
+        -- centred stack stays compact (no dead gap above the rule on a big
+        -- card where the title doesn't need the full 40%); the height cap
+        -- still ellipsis-truncates at the floor when even 12pt overflows.
         height                        = title_max_h,
+        height_adjust                 = true,
         height_overflow_show_ellipsis = true,
     }
 
@@ -1787,30 +2669,143 @@ function SpineWidget:_renderFallback()
         }
     end
     local rule_gap = HorizontalSpan:new{ width = Size.padding.small }
-    local diamond_face, diamond_bold = BFont:getFace("infofont", 12)
+    -- Decorative glyph is a FIXED size so the divider motif reads the same on
+    -- every placeholder, rather than growing with the title (which made the
+    -- diamond jump between tiles of the same size as titles varied in length).
+    local diamond_face, diamond_bold = BFont:getFace("infofont", 13)
+    -- Divider motif: books keep the diamond; OPDS nav tiles show the feed's
+    -- own category icon when it sent one (Gutenberg's hearts and stars ride
+    -- the feed as tiny data: URIs), else a drill chevron; facet tiles a
+    -- filter triangle. The motif is the ONLY difference between the
+    -- placeholder kinds, so the shelf keeps one visual rhythm.
+    local band_h = math.max(Screen:scaleBySize(20), card_h * 0.10)
+    local motif
+    -- Artwork rather than a glyph, so the band knows to pad itself (below).
+    local motif_is_icon = false
+    if self.book and self.book.opds_icon then
+        -- Feed artwork renders SMOOTHLY scaled to a fixed display height a
+        -- little above the glyph band. Two device rounds got here: at glyph
+        -- size the detail was illegible, and nearest-neighbour integer
+        -- upscaling to 2x the band was big and blocky. Smooth interpolation
+        -- to one fixed slot reads cleanly and gives every catalogue's icons
+        -- the same footprint. iconFor is asked for the NATIVE buffer (nil
+        -- target skips the integer upscale); ImageWidget does the scaling.
+        local icon_disp_h = math.floor(band_h * 1.4)
+        local ok_i, OpdsIcon = pcall(require, "lib/bookshelf_opds_icon")
+        local icon_bb = ok_i and OpdsIcon.iconFor(self.book.opds_icon, nil) or nil
+        if icon_bb then
+            local ok_w, ImageWidget = pcall(require, "ui/widget/imagewidget")
+            if ok_w then
+                local iw, ih = icon_bb:getWidth(), icon_bb:getHeight()
+                if iw > 0 and ih > 0 then
+                    motif_is_icon = true
+                    motif = ImageWidget:new{
+                        image            = icon_bb,
+                        image_disposable = false,  -- cache-owned, never free
+                        alpha            = true,
+                        width            = math.max(1, math.floor(iw * icon_disp_h / ih)),
+                        height           = icon_disp_h,
+                    }
+                end
+            end
+        end
+    end
+    if not motif and self.book and self.book.is_facet then
+        -- Facet (filter) tiles: the nerd-font funnel, same face the icon
+        -- library renders glyph cells with. Falls through to the diamond
+        -- if the symbols face is unavailable.
+        -- 18, not the diamond's 13: nerd-font glyphs sit small in their
+        -- em-box, so matching point sizes rendered the funnel undersized.
+        local ok_f, Font = pcall(require, "ui/font")
+        local sym_face = ok_f and Font:getFace("symbols", 18) or nil
+        if sym_face then
+            motif = TextWidget:new{
+                text    = "\xEE\xA4\xB5",            -- U+E935 nf filter-variant
+                face    = sym_face,
+                fgcolor = Blitbuffer.COLOR_BLACK,
+            }
+        end
+    end
+    if not motif then
+        local motif_char = "\xE2\x9D\x96"           -- ❖ U+2756 book diamond
+        if self.book and (self.book.is_opds_nav or self.book.is_facet) then
+            motif_char = "\xE2\x9D\xAF"              -- ❯ U+276F drill chevron
+        end
+        motif = TextWidget:new{
+            text    = motif_char,
+            face    = diamond_face,
+            bold    = diamond_bold,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+    end
+    -- The band stretches to whatever the motif actually is (a 2x feed icon
+    -- is taller than the glyph line); glyph motifs keep the original height.
+    --
+    -- Artwork also gets breathing room above and below. A glyph carries its own
+    -- slack inside the em-box, so it never looked cramped; a bitmap is opaque
+    -- to its own edges, and stretching the band to exactly the image height put
+    -- it hard against the title above and the rule below. The centerer splits
+    -- the extra evenly, so padding the band is all this needs.
+    local motif_band_h = band_h
+    do
+        local ok_sz, sz = pcall(function() return motif:getSize() end)
+        if ok_sz and sz and sz.h then
+            local wanted = sz.h + (motif_is_icon and 2 * Size.padding.small or 0)
+            if wanted > motif_band_h then motif_band_h = wanted end
+        end
+    end
     local rule_centerer = CenterContainer:new{
-        dimen = Geom:new{ w = content_w, h = math.max(Screen:scaleBySize(20), card_h * 0.10) },
+        dimen = Geom:new{ w = content_w, h = motif_band_h },
         HorizontalGroup:new{
             align = "center",
             ruleLine(),
             rule_gap,
-            TextWidget:new{
-                text    = "\xE2\x9D\x96",  -- ❖ U+2756
-                face    = diamond_face,
-                bold    = diamond_bold,
-                fgcolor = Blitbuffer.COLOR_BLACK,
-            },
+            motif,
             HorizontalSpan:new{ width = Size.padding.small },
             ruleLine(),
         },
     }
 
-    -- Author region only renders if there's actually a name to show;
-    -- skipping it lets the title centre vertically when alone.
-    local stack_children = { align = "center", title, rule_centerer }
+    -- WHAT ACTUALLY FITS. The title, the rule and the author used to be
+    -- assembled unconditionally, on the reasoning that each region caps at a
+    -- FRACTION of card_h -- which holds until the floors bite. title_max_h is
+    -- `max(scaleBySize(20), card_h * 0.40)`, so on a short card the floor wins
+    -- and the title alone can claim most of it; the rule and the author are
+    -- then stacked on regardless and paint outside the card.
+    --
+    -- Nothing reached that before: a grid slot is portrait and tall. A LIST
+    -- ROW is neither -- a catalogue row draws this card at the full row width
+    -- and one line's height -- and there it overflowed into the row beneath,
+    -- which is what "it will need to collapse down to just the title (no
+    -- icon/subtitle) on smaller rows" is describing.
+    --
+    -- Measured, not predicted: `title` carries height_adjust, so its getSize
+    -- reports the height it actually took rather than its cap, and the same
+    -- goes for the author below. So the card drops decoration only when it
+    -- genuinely cannot hold it, and a tile that used to fit one is unchanged.
+    --
+    -- ORDER MATTERS: the rule goes before the author. The rule is decoration
+    -- and the author is information, but the author is also the thing that
+    -- makes a two-region card look like a card rather than a label -- and
+    -- dropping the rule alone recovers a whole band. Losing the motif first is
+    -- also what the maintainer asked for in as many words ("no icon/subtitle",
+    -- icon first).
+    local avail_h = outer_inset_h - border * 2 - content_pad * 2
+    local used_h  = title:getSize().h
+    local stack_children = { align = "center", title }
+    if used_h + band_h <= avail_h then
+        stack_children[#stack_children + 1] = rule_centerer
+        used_h = used_h + band_h
+    end
     if author_text ~= "" then
         local author_max_h = math.max(Screen:scaleBySize(14), math.floor(card_h * 0.20))
-        local author_face, author_bold = BFont:getFace("infofont", 10)
+        -- Author fits its own band but never outgrows the title (kept
+        -- subordinate in the hierarchy), floored a little below the title floor.
+        local author_size = TextFit.fitFontSize{
+            text = author_text, width = content_w, max_h = author_max_h,
+            lo = 10, hi = math.max(10, math.min(title_size, 15)), bold = false,
+        }
+        local author_face, author_bold = BFont:getFace("infofont", author_size)
         local author = TextBoxWidget:new{
             text                          = author_text,
             face                          = author_face,
@@ -1820,9 +2815,17 @@ function SpineWidget:_renderFallback()
             width                         = content_w,
             alignment                     = "center",
             height                        = author_max_h,
+            height_adjust                 = true,
             height_overflow_show_ellipsis = true,
         }
-        stack_children[#stack_children + 1] = author
+        if used_h + author:getSize().h <= avail_h then
+            stack_children[#stack_children + 1] = author
+        else
+            -- Built to be measured and not used. TextBoxWidget allocates a
+            -- bitmap at construction, so it is freed rather than left to the
+            -- collector -- this runs once per coverless tile per render.
+            author:free()
+        end
     end
     local stack = VerticalGroup:new(stack_children)
 
@@ -1830,8 +2833,13 @@ function SpineWidget:_renderFallback()
     -- second border is what makes it read as "ornate" vs a plain card.
     -- Border color follows the user's "Border color" setting so the
     -- placeholder cover ages with the rest of the chrome.
+    -- Flat: one uniform WHITE panel instead of the ornate double frame. The
+    -- inner border is dropped and both fills take the inner (brighter) tone -
+    -- white in day, the lighter grey in night - so the tile reads as a clean
+    -- button rather than the paper-tone card of a book placeholder.
+    if self.flat_card then outer_bg = inner_bg end
     local inner_frame = ColorSafeFrame:new{
-        bordersize = Size.border.thin,
+        bordersize = self.flat_card and 0 or Size.border.thin,
         color      = colors.border,
         background = inner_bg,
         padding    = content_pad,
@@ -1851,7 +2859,7 @@ function SpineWidget:_renderFallback()
     local card = ColorSafeFrame:new{
         bordersize = border,
         color      = colors.border,
-        radius     = CARD_RADIUS,
+        radius     = self:_squareCorners() and 0 or CARD_RADIUS,
         padding    = 0,
         background = outer_bg,
         VerticalGroup:new{
@@ -1911,12 +2919,24 @@ end
 SpineWidget.BorderOverlay   = BorderOverlay
 SpineWidget.SELECTED_BORDER = SELECTED_BORDER
 SpineWidget.CARD_RADIUS     = CARD_RADIUS
+-- The card's hairline frame thickness, so the list thumbnail's opening effect
+-- can inset past it and leave it alone. A grid cover's frame is part of the
+-- object swinging open and squeezes with the artwork; a list thumbnail's frame
+-- is the table cell's edge, and deforming it reads as the ROW bending.
+SpineWidget.CARD_BORDER     = CARD_BORDER
 -- Drop-shadow geometry + colour, so the opening-book effect can restore a
 -- selected cover's shadow after erasing its ring (a selected cover swaps its
 -- shadow for the ring, #271 follow-up). shadowGray() is a function: night mode
 -- picks a different grey.
 SpineWidget.SHADOW_OFFSET   = SHADOW_OFFSET
 SpineWidget.shadowGray      = _shadowGray
+-- Placeholder card backgrounds (outer band, inner face), as a function for the
+-- same reason shadowGray is one: night mode picks different greys, and a caller
+-- caching the value would invert. Used by the collage tile to fill a cell it
+-- has no cover for, so an incomplete collage matches the placeholder card a
+-- coverless book would show rather than inventing a third grey.
+SpineWidget.fallbackBgs     = _fallbackBgs
+
 
 -- Per-axis chrome overhead between the widget box (self.width/self.height)
 -- and the actual cover IMAGE: the drop-shadow offset plus the 1dp card
@@ -1925,9 +2945,95 @@ SpineWidget.shadowGray      = _shadowGray
 --   img_w = slot_w - COVER_CHROME ;  box_h = round(img_w * aspect) + COVER_CHROME
 SpineWidget.COVER_CHROME = SHADOW_OFFSET + 2 * CARD_BORDER
 
--- True-aspect ceiling: 2:3 + ~10% overshoot. ~98% of real covers render
--- untrimmed under it; taller freaks clamp here so they can't blow past the row.
-SpineWidget.COVER_ASPECT_CAP = 1.65
+-- True-aspect ceiling. Every cover taller than this clamps here rather than
+-- growing the row, so the cap is a straight trade: fidelity for a handful of
+-- covers against a whole row of shelf.
+--
+-- Measured against a real 291-cover library (2026-08-14): median ~1.51, and
+--   <= 1.50  33%      <= 1.60  93.5%
+--   <= 1.55  79%      <= 1.65  97.9%
+-- The tail is thin -- three covers above 1.68 -- but there is a cluster at
+-- 1.64-1.66 that the original 1.65 was chosen to clear.
+--
+-- 1.55 is set from measured DEVICE arithmetic, not taste (issue #329). On a
+-- PW5 at 5 columns: 202px slots, 1402px of shelf available, and a row costs
+-- slot_w * cap + 37px of padding. Four rows need row_h <= 350, so the cap has
+-- to be <= 313/202 = 1.55. At 1.60 the row came to 360 and the fourth row was
+-- lost by 38px, leaving 322px of slack spread as the large inter-row gaps
+-- that issue reports. The 21% of covers above 1.55 lose at most ~6% of their
+-- height -- a few pixels of crop -- to gain a whole row of shelf.
+SpineWidget.COVER_ASPECT_CAP = 1.55
+
+-- SpineWidget.coverAspectCap() -- the cap actually in force.
+--
+-- Settable since issue #330: a reader whose covers are genuinely taller than
+-- 1.55 sees them cropped, and the right cap depends on their column count and
+-- screen, which is exactly the arithmetic above. The constant stays as the
+-- DEFAULT, so it keeps documenting where 1.55 came from.
+--
+-- Read through here rather than off the field, because every caller has to
+-- agree: the row-count maths reserves height at this number and shelf_row
+-- sizes slots with it, and the two disagreeing is what made a previous retune
+-- shrink the covers without giving back the row it was tightened for.
+--
+-- Memoised on the settings generation because bookAspect calls this per cover
+-- per render. Clamped to a range that still produces a usable shelf: below
+-- ~1.2 covers stop looking like books, and above ~2.0 a row eats the screen.
+local _cap_cache, _cap_gen
+function SpineWidget.coverAspectCap()
+    local gen = BookshelfSettings.generation()
+    if _cap_cache and _cap_gen == gen then return _cap_cache end
+    local v = tonumber(BookshelfSettings.read("cover_aspect_cap"))
+    if not v or v < 1.2 or v > 2.0 then v = SpineWidget.COVER_ASPECT_CAP end
+    _cap_cache, _cap_gen = v, gen
+    return v
+end
+
+-- SpineWidget.downloadedTickOffset(card_w, card_h, glyph_w, widget_h, halo_w)
+-- -> x, y
+--
+-- Where the OPDS downloaded tick's halo group is pinned inside the card.
+-- Bottom-right, inset from the card's inside-border by the same margins the
+-- progress bar and the page-count pill use, so all three sit in one optical
+-- gutter; the vertical anchor is literally the pill's
+-- (card_h - CARD_BORDER - bar_pad - own_height), so a cover carrying both
+-- reads as a matched pair rather than two badges at two heights.
+--
+-- Pulled out of _renderShadowedCard purely so it can be unit-tested. This is
+-- the one corner badge with no pill frame around it, so an overhang reads as a
+-- clipping bug rather than as deliberate chrome (the bookmark and favourite
+-- glyphs dangle ON PURPOSE and are pinned by their own lift maths) -- worth a
+-- test that says so. Offsets become FrameContainer padding, so both are clamped
+-- to CARD_BORDER: a negative padding paints outside the parent.
+function SpineWidget.downloadedTickOffset(card_w, card_h, glyph_w, widget_h, halo_w)
+    local x = card_w - CARD_BORDER - _barSideMargin() - (glyph_w + 2 * halo_w)
+    local y = card_h - CARD_BORDER - _barBottomPadding() - widget_h
+    if x < CARD_BORDER then x = CARD_BORDER end
+    if y < CARD_BORDER then y = CARD_BORDER end
+    return x, y
+end
+
+-- SpineWidget.externalCoverKey(path) -- ScaledCoverCache key for an external
+-- cover FILE (a cover the user picked, or one an enricher downloaded), or nil
+-- when there is no such file to key on.
+--
+-- Deliberately not the book's filepath, which is what every other entry in
+-- that cache is keyed on. An external cover can be replaced at any time and
+-- nothing drops the cover cache when it is -- which was harmless while this
+-- path never cached, and would not be now that the cache reaches disk: one
+-- writer forgetting to invalidate would pin the old cover across restarts.
+-- Folding the file's mtime and size into the key means a replaced cover
+-- MISSES rather than needing anyone to remember. The old entry is left to
+-- ordinary LRU eviction and the disk sweep.
+function SpineWidget.externalCoverKey(path)
+    if type(path) ~= "string" or path == "" then return nil end
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not (ok_lfs and lfs) then return nil end
+    local a = lfs.attributes(path)
+    if type(a) ~= "table" then return nil end
+    return string.format("ext:%s:%s:%s", path,
+        tostring(a.modification or 0), tostring(a.size or 0))
+end
 
 -- SpineWidget.bookAspect(book) -- height/width ratio from BIM's cover_sizetag
 -- ("WxH", the ORIGINAL cover pixel size present on every record at layout
@@ -1941,7 +3047,8 @@ function SpineWidget.bookAspect(book)
         w, h = tonumber(w), tonumber(h)
         if w and h and w > 0 and h > 0 then
             local a = h / w
-            if a > SpineWidget.COVER_ASPECT_CAP then a = SpineWidget.COVER_ASPECT_CAP end
+            local cap = SpineWidget.coverAspectCap()
+            if a > cap then a = cap end
             if a < 0.5 then a = 0.5 end
             return a
         end
@@ -1991,6 +3098,26 @@ function SpineWidget.alignTopCoverHeight(img_w, book, img_h, min_img_h)
     if h > img_h then h = img_h end
     if h < 1 then h = 1 end
     return h
+end
+
+
+-- repaintOverhangGlyphs(spine, bb)
+-- Paint the cover's overhanging status glyphs (the in-progress ribbon and the
+-- finished tick hanging below the card, the favourite mark above it) once
+-- more, at the positions they were just painted at. Whatever was painted over
+-- them since -- a label plate under the cover, the ring erase and flex of the
+-- open-cover effect -- ends up beneath them again. The frames stamp their
+-- dimen when painted, so a glyph that has not been painted yet has none and
+-- is skipped. Tolerant of a spine that recorded no glyphs.
+function SpineWidget.repaintOverhangGlyphs(spine, bb)
+    local glyphs = spine and spine._overhang_glyph_widgets
+    if type(glyphs) ~= "table" then return end
+    for _i, gw in ipairs(glyphs) do
+        local gd = gw.dimen
+        if gd and gd.x and gd.y and gd.w and gd.w > 0 then
+            pcall(gw.paintTo, gw, bb, gd.x, gd.y)
+        end
+    end
 end
 
 return SpineWidget
