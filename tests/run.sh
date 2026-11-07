@@ -33,24 +33,19 @@ skip_reason() {
         # SQLite does. Run it with:
         #   /usr/lib/koreader/luajit tests/_test_book_facts_db.lua
         _test_book_facts_db.lua)  echo "needs KOReader luajit for sqlite";;
-        # Opt-in, not skipped for being awkward: this one is an EXHAUSTIVE
-        # sweep -- every device baseline crossed with every row height from 20
-        # to 1000 and every layout combination, ~23,000 cases -- and it costs
-        # about three and a half minutes, which was ~98% of the whole run.
-        #
-        # Thinning the sweep was the other option and was rejected: the file's
-        # entire argument is that the under-fill invariant must hold
-        # EVERYWHERE, and it documents having already been bitten once by a
-        # test that quietly covered less than it claimed. Sampling it would
-        # repeat that. So it runs in full, on demand and in CI:
+        # The ornament decks' store, the same way:
+        #   /usr/lib/koreader/luajit tests/_test_ornament_decks_db.lua
+        _test_ornament_decks_db.lua) echo "needs KOReader luajit for sqlite";;
+        # Slow, not broken: these fake the filesystem with one shell process
+        # per call (thousands of them; ~80s a run between them, most of the
+        # whole suite's time). Skipped by default so the gate stays quick;
+        # CI runs every file directly, and a release runs them with
         #   BOOKSHELF_SLOW_TESTS=1 sh tests/run.sh
-        #   lua tests/_test_list_row_budget.lua
-        _test_list_row_budget.lua)
-            if [ -n "$BOOKSHELF_SLOW_TESTS" ]; then
-                echo ""
-            else
-                echo "exhaustive sweep, ~3.5min; set BOOKSHELF_SLOW_TESTS=1"
-            fi;;
+        _test_editable_themes.lua|_test_colour_resolver.lua|_test_shelf_themes.lua|\
+        _test_panel_parts.lua|_test_quote_files.lua|_test_theme_packs.lua|\
+        _test_ornament_json.lua)
+            if [ "${BOOKSHELF_SLOW_TESTS:-}" = "1" ]; then echo ""
+            else echo "slow (shell-faked filesystem): BOOKSHELF_SLOW_TESTS=1 runs it"; fi;;
         *)                        echo "";;
     esac
 }
@@ -119,6 +114,22 @@ if [ -f tools/check_token_parity.sh ]; then
     else
         printf "ok    %-32s %s\n" "token parity vs bookends" \
             "$(printf '%s\n' "$parity_out" | grep -c '^ok') files identical"
+    fi
+fi
+
+# Same idea for the progress-bar painter copied out of bookends: the copied
+# regions of lib/bookshelf_bar_paint.lua (and the pacman sprite file) must
+# match bookends' source line for line.
+if [ -f tools/check_bar_parity.sh ]; then
+    bar_out=$(sh tools/check_bar_parity.sh 2>&1)
+    bar_code=$?
+    if [ "$bar_code" -ne 0 ]; then
+        printf "FAIL  %s\n" "bar painter parity vs bookends"
+        printf '%s\n' "$bar_out" | sed 's/^/      /'
+        fail_total=$((fail_total + 1))
+    else
+        printf "ok    %-32s %s\n" "bar painter parity vs bookends" \
+            "$(printf '%s\n' "$bar_out" | grep -c '^ok') regions identical"
     fi
 fi
 

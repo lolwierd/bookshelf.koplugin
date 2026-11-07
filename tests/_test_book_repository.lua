@@ -205,6 +205,59 @@ test("getRecent: an entry that fails to build does not inflate the total", funct
     assert(total == 2, "the ghost must not count: total " .. tostring(total))
 end)
 
+-- Issue 546: a Kobo store book's history entry and lastfile name the decrypted
+-- copy, /tmp/kobo.koplugin.cache/<ContentID>, which a restart removes (so
+-- ReadHistory dims it). It stays in Recent and the top panel as its Kobo record.
+local function withKoboStub(fn)
+    local saved = package.loaded["lib/bookshelf_kobo_source"]
+    package.loaded["lib/bookshelf_kobo_source"] = {
+        contentIdFromCachePath = function(fp)
+            return type(fp) == "string" and fp:match("/kobo%.koplugin%.cache/([^/]+)$") or nil
+        end,
+        recordForCachePath = function(fp)
+            local id = fp:match("/kobo%.koplugin%.cache/([^/]+)$")
+            if id ~= "k1" then return nil end
+            return { filepath = "KOBO_VIRTUAL://k1/Kobo Book.epub", title = "Kobo Book",
+                     is_kobo = true, kobo_book_id = "k1" }
+        end,
+        coverBB = function() return nil end,
+    }
+    local ok, err = pcall(fn)
+    package.loaded["lib/bookshelf_kobo_source"] = saved
+    if not ok then error(err, 0) end
+end
+
+test("getRecent: a Kobo store book's dimmed entry stays, as its Kobo record", function()
+    withKoboStub(function()
+        package.loaded["readhistory"].hist = {
+            { file = "/lib/real1.epub", time = 300 },
+            { file = "/tmp/kobo.koplugin.cache/k1", time = 250, dim = true },
+            { file = "/tmp/kobo.koplugin.cache/gone", time = 200, dim = true },
+            { file = "/lib/real2.epub", time = 100 },
+        }
+        _G._test_bim_data = {
+            ["/lib/real1.epub"] = { title = "Real One" },
+            ["/lib/real2.epub"] = { title = "Real Two" },
+        }
+        local out = Repo.getRecent(10, 0)
+        local titles = {}
+        for _i, b in ipairs(out) do titles[#titles + 1] = b.title end
+        assert(table.concat(titles, ",") == "Real One,Kobo Book,Real Two", table.concat(titles, ","))
+        assert(out[2].is_kobo and out[2].filepath == "KOBO_VIRTUAL://k1/Kobo Book.epub", "not the Kobo record")
+        assert(out[2].last_read_time == 250, "the history time was not kept")
+    end)
+end)
+
+test("getCurrent: a Kobo store book's lastfile gives the top panel its Kobo record", function()
+    withKoboStub(function()
+        _G._test_settings = { lastfile = "/tmp/kobo.koplugin.cache/k1" }
+        assert(Repo.currentFilepath() == "KOBO_VIRTUAL://k1/Kobo Book.epub", tostring(Repo.currentFilepath()))
+        local b = Repo.getCurrent()
+        assert(b and b.is_kobo and b.title == "Kobo Book", "the top panel lost the Kobo book")
+        _G._test_settings = nil
+    end)
+end)
+
 test("getLatest: orders by mtime desc, respects limit and depth", function()
     Repo.invalidateWalkCache()
     -- Stub a tiny directory walk via the lfs mock above.
@@ -948,6 +1001,122 @@ test("buildBook: forwards want_cover to BIM so callers can skip the decode", fun
     assert(seen[2] == false, "want_cover=false should reach BIM, got " .. tostring(seen[2]))
 end)
 
+test("page counts follow KOReader's Use stable page numbers for the book (#539)", function()
+    -- A book with a publisher page list: 569 printed pages, on printed page
+    -- 21, 718 screens at the reader's font, 4% in. KOReader keeps the
+    -- printed count in the sidecar either way; whether the reader USES it is
+    -- pagemap_use_page_labels. Bookshelf showed 21 / 569 while the reader,
+    -- with stable page numbers off, showed 718.
+    local function sidecar(use)
+        return { percent_finished = 0.04, pagemap_doc_pages = 569,
+                 pagemap_current_page_label = "21", stats = { pages = 718 },
+                 pagemap_use_page_labels = use,
+                 summary = { status = "reading" } }
+    end
+    local cases = {
+        { use = false, pages = 718, num = 29, src = "render" },
+        { use = true,  pages = 569, num = 21, src = "stable" },
+        { use = nil,   pages = 569, num = 21, src = "stable" },  -- never opened since: unchanged
+    }
+    for _, c in ipairs(cases) do
+        local fp = "/lib/victorious-" .. tostring(c.use) .. ".epub"
+        _G._test_docsettings_data = { [fp] = sidecar(c.use) }
+        _G._test_bim_data = { [fp] = { title = "Victorious" } }
+        Repo.invalidateProgressCache(fp)
+        local _pct, _st, _r, pages, num, src = Repo.readProgress(fp)
+        assert(pages == c.pages and num == c.num and src == c.src, string.format(
+            "readProgress use=%s: got %s / %s (%s), want %s / %s (%s)", tostring(c.use),
+            tostring(num), tostring(pages), tostring(src), c.num, c.pages, c.src))
+        Repo.invalidateProgressCache(fp)
+        local book = Repo.buildBook(fp)
+        assert(book.page_count == c.pages and book.page_num == c.num, string.format(
+            "buildBook use=%s: got %s / %s, want %s / %s", tostring(c.use),
+            tostring(book.page_num), tostring(book.page_count), c.num, c.pages))
+    end
+    _G._test_docsettings_data = nil
+    _G._test_bim_data = {}
+end)
+
+test("Home (folders) re-sorts by Added or opened after a book is closed (#519)", function()
+    -- getAll keeps its sorted listing in its own cache. Closing a book only
+    -- ran invalidateReadStateCache, which cleared the predicate path's cache
+    -- and not this one, so a Home shelf sorted by Added or opened (or Last
+    -- opened, progress, status, rating) kept the opened book where it was
+    -- until a refresh, the file poll or a restart.
+    Repo.invalidateWalkCache()
+    Repo.invalidateProgressCache()
+    local lfs_stub = package.loaded["libs/libkoreader-lfs"]
+    local prev = { dir = lfs_stub.dir, attributes = lfs_stub.attributes }
+    local mtimes = { ["/lib/new.epub"] = 2000, ["/lib/old.epub"] = 1000 }
+    lfs_stub.dir = function(path)
+        local entries = { ".", ".." }
+        if path == "/lib" then entries[3], entries[4] = "new.epub", "old.epub" end
+        local i = 0
+        return function() i = i + 1; return entries[i] end
+    end
+    lfs_stub.attributes = function(fp, key)
+        if fp == "/lib" then
+            local a = { mode = "directory", modification = 0 }
+            if key then return a[key] end
+            return a
+        end
+        if not mtimes[fp] then return nil end
+        local a = { mode = "file", modification = mtimes[fp], access = mtimes[fp], size = 1 }
+        if key then return a[key] end
+        return a
+    end
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 1 }
+    _G._test_bim_data = { ["/lib/new.epub"] = { title = "New" }, ["/lib/old.epub"] = { title = "Old" } }
+    package.loaded["readhistory"].hist = {}
+    local prio = { { key = "added_or_opened", reverse = true } }
+    local function first()
+        local out = Repo.getAll("/lib", 10, 0, prio)
+        return out[1] and out[1].filepath
+    end
+    assert(first() == "/lib/new.epub", "the newest file should lead, got " .. tostring(first()))
+    -- Open the old book now, then what Bookshelf:onCloseDocument runs.
+    package.loaded["readhistory"].hist = { { file = "/lib/old.epub", time = 3000 } }
+    Repo.invalidateProgressCache("/lib/old.epub")
+    Repo.invalidateReadStateCache()
+    assert(first() == "/lib/old.epub", "the book just opened did not move to the front, got "
+        .. tostring(first()))
+    -- A sort reading did not change keeps its cached listing.
+    local by_title = { { key = "title", reverse = false } }
+    local a1 = Repo.getAll("/lib", 10, 0, by_title)
+    Repo.invalidateReadStateCache()
+    local a2 = Repo.getAll("/lib", 10, 0, by_title)
+    assert(a1[1].filepath == a2[1].filepath, "title order changed")
+    package.loaded["readhistory"].hist = {}
+    lfs_stub.dir, lfs_stub.attributes = prev.dir, prev.attributes
+    _G._test_settings = {}
+    _G._test_bim_data = {}
+    Repo.invalidateWalkCache()
+end)
+
+test("effective rating: your own first, a Hardcover stand-in only when switched on (#538)", function()
+    local prev_hc = package.loaded["lib/bookshelf_hardcover"]
+    package.loaded["lib/bookshelf_hardcover"] = {
+        isAvailable = function() return true end,
+        getLink = function(fp) return fp == "/lib/linked.epub" and { book_id = 7 } or nil end,
+        getCachedRating = function(id) return id == 7 and 3.87 or nil end,
+    }
+    _G._test_settings = {}
+    assert(Repo.effectiveRating("/lib/linked.epub", 2) == 2, "your own rating must win")
+    assert(Repo.effectiveRating("/lib/linked.epub", nil) == nil, "the stand-in is off by default")
+    assert(Repo.effectiveRating("/lib/linked.epub", 0) == nil, "0 is no rating, not a rating")
+    _G._test_settings = { bookshelf_hardcover_rating_fallback = true }
+    assert(Repo.effectiveRating("/lib/linked.epub", nil) == 3.87, "the Hardcover average did not stand in")
+    assert(Repo.effectiveRating("/lib/linked.epub", 0) == 3.87, "0 should take the stand-in too")
+    assert(Repo.effectiveRating("/lib/other.epub", nil) == nil, "an unlinked book has no rating")
+    assert(Repo.effectiveRatingStars("/lib/linked.epub", nil) == 4, "3.87 rounds to 4 stars")
+    assert(Repo.effectiveRatingStars("/lib/linked.epub", 5) == 5)
+    package.loaded["lib/bookshelf_hardcover"].isAvailable = function() return false end
+    assert(Repo.effectiveRating("/lib/linked.epub", nil) == nil,
+        "with the Hardcover plugin gone nothing stands in")
+    package.loaded["lib/bookshelf_hardcover"] = prev_hc
+    _G._test_settings = {}
+end)
+
 test("buildBook: splits newline-separated authors and trims whitespace", function()
     -- BIM stores multiple authors newline-separated (see splitAuthors / #74).
     _G._test_bim_data = {
@@ -1238,6 +1407,36 @@ test("searchAll: returns empty result for blank query", function()
     assert(#(r.genres  or {}) == 0)
 end)
 
+test("an unpacked EPUB folder is not a folder of books (Reddit report)", function()
+    -- Chapter files (.xhtml/.html) pass the book test one by one, so an
+    -- unzipped EPUB filled the shelf with "books" called c01, c05... in a
+    -- section named OEBPS. A folder with "mimetype" beside META-INF is one.
+    Repo.invalidateWalkCache()
+    local listings = {
+        ["/lib"]              = { ".", "..", "dune.epub", "Unpacked" },
+        ["/lib/Unpacked"]     = { ".", "..", "mimetype", "META-INF", "OEBPS", "ch1.xhtml" },
+        ["/lib/Unpacked/OEBPS"] = { ".", "..", "c01.xhtml", "c05.html" },
+        ["/lib/Unpacked/META-INF"] = { ".", "..", "container.xml" },
+    }
+    local dirs = { ["/lib/Unpacked"] = true, ["/lib/Unpacked/OEBPS"] = true, ["/lib/Unpacked/META-INF"] = true }
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = listings[path] or {}
+        local i = 0; return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(fp, key)
+        local mode = dirs[fp] and "directory" or "file"
+        if key == nil then return { mode = mode, modification = 0 } end
+        if key == "mode" then return mode end
+        return 0
+    end
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 3 }
+    _G._test_bim_data = { ["/lib/dune.epub"] = { title = "Dune" } }
+    local fps = Repo.getAllFilepaths()
+    assert(#fps == 1 and fps[1] == "/lib/dune.epub", "got " .. table.concat(fps, ", "))
+    assert(Repo.findFirstBookIn("/lib/Unpacked", 3) == nil)
+    assert(Repo.folderHasBooks("/lib/Unpacked") == false)
+end)
+
 test("searchAll: matches books by title", function()
     Repo.invalidateWalkCache()
     package.loaded["libs/libkoreader-lfs"].dir = function(path)
@@ -1279,6 +1478,34 @@ test("searchAll: matches author groups by name", function()
     assert(r.authors[1].series_name == "Isaac Asimov",
         "expected Isaac Asimov got " .. tostring(r.authors[1].series_name))
     assert(#r.authors[1].books == 1)
+end)
+
+test("searchAll: genres match by default and can be switched off (issue 371)", function()
+    Repo.invalidateWalkCache()
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = (path == "/lib") and {".", "..", "dune.epub", "foundation.epub"} or {".", ".."}
+        local i = 0; return function() i = i+1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(fp, key)
+        if key == "mode" then return "file" end
+        return 0
+    end
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 1 }
+    _G._test_bim_data = {
+        ["/lib/dune.epub"]       = { title = "Dune", authors = "Frank Herbert", keywords = "Space opera" },
+        ["/lib/foundation.epub"] = { title = "Foundation", authors = "Isaac Asimov" },
+    }
+    Repo.invalidateSeriesCache()
+    local r = Repo.searchAll("opera")
+    assert(#r.books == 1 and r.books[1].title == "Dune", "genre match expected by default, got " .. #r.books)
+    assert(#r.genres == 1, "genre group expected by default, got " .. #r.genres)
+
+    _G._test_settings.bookshelf_search_include_genres = false
+    local r2 = Repo.searchAll("opera")
+    assert(#r2.books == 0, "no genre matches with the setting off, got " .. #r2.books)
+    assert(#r2.genres == 0, "no genre groups with the setting off, got " .. #r2.genres)
+    -- Titles and authors still match.
+    assert(#Repo.searchAll("dune").books == 1)
 end)
 
 test("searchAll: folder names off by default, matched with opt-in (#190)", function()
@@ -2524,6 +2751,34 @@ test("countByStatus: no Kindle chip leaves the tally exactly as it was", functio
     assert(counts.unread == 0, "the Kindle unread must not leak in, got " .. tostring(counts.unread))
 end)
 
+test("countByStatusStepper: counts a few books per step, same answer as countByStatus", function()
+    -- The Shelf size module runs the count in steps between UI ticks: a cold
+    -- count read every sidecar in one go and froze a first full-screen open
+    -- for 3 seconds on a PW5.
+    _setupWalk({ "a.epub", "b.epub", "c.epub", "d.epub", "e.epub" },
+               { ["a.epub"] = "complete", ["c.epub"] = "reading" }, true)
+    _fakeKindleSource({ { filepath = "/k/a.kfx", title = "A", _status = "finished" } })
+    local step = Repo.countByStatusStepper()
+    local steps, done, total, counts = 0, false, nil, nil
+    while not done do
+        steps = steps + 1
+        done, total, counts = step(2)
+        assert(steps < 10, "the stepper never finished")
+    end
+    -- A finished stepper answers again without counting anything twice.
+    local again, total2, counts2 = step(2)
+    local full_total, full_counts = Repo.countByStatus()
+    _teardownWalk()
+    assert(steps == 3, "5 books at 2 a step is 3 steps, got " .. steps)
+    assert(total == 6, "5 walked + 1 Kindle, got " .. tostring(total))
+    assert(counts.finished == 2 and counts.reading == 1 and counts.unread == 3,
+        "got finished=" .. tostring(counts.finished) .. " reading=" .. tostring(counts.reading)
+        .. " unread=" .. tostring(counts.unread))
+    assert(again and total2 == 6 and counts2.finished == 2, "a second call re-counted")
+    assert(full_total == total and full_counts.unread == counts.unread,
+        "countByStatus and the stepper disagree")
+end)
+
 test("countByStatus: an unreadable Kindle library leaves the tally alone", function()
     -- A chip carried over from another device, on hardware with no catalogue.
     _setupWalk({ "done.epub" }, { ["done.epub"] = "complete" }, true)
@@ -2531,6 +2786,36 @@ test("countByStatus: an unreadable Kindle library leaves the tally alone", funct
     local total = Repo.countByStatus()
     _teardownWalk()
     assert(total == 1, "unavailable source must contribute nothing, got " .. tostring(total))
+end)
+
+test("Ratings shelf: a linked book you have not rated files under its Hardcover stars (#538)", function()
+    local prev_hc = package.loaded["lib/bookshelf_hardcover"]
+    package.loaded["lib/bookshelf_hardcover"] = {
+        isAvailable = function() return true end,
+        getLink = function(fp) return fp == "/lib/linked.epub" and { book_id = 7 } or nil end,
+        getCachedRating = function(id) return id == 7 and 3.87 or nil end,
+    }
+    local function groupOf(fp)
+        Repo.invalidateWalkCache()
+        local groups = Repo.getRatings(20, 0)
+        for _i, g in ipairs(groups) do
+            for _j, b in ipairs(g.books_meta or g.books or {}) do
+                if b.filepath == fp then return g.series_name end
+            end
+        end
+    end
+    _setupWalk({ "linked.epub", "plain.epub" }, {}, false)
+    _G._test_settings.bookshelf_hardcover_rating_fallback = nil
+    local off = groupOf("/lib/linked.epub")
+    _G._test_settings.bookshelf_hardcover_rating_fallback = true
+    local on = groupOf("/lib/linked.epub")
+    local plain = groupOf("/lib/plain.epub")
+    _teardownWalk()
+    package.loaded["lib/bookshelf_hardcover"] = prev_hc
+    local four = ("\xE2\x98\x85"):rep(4)
+    assert(off == "Unrated", "with the stand-in off it is Unrated, got " .. tostring(off))
+    assert(on == four, "with it on it files under 4 stars, got " .. tostring(on))
+    assert(plain == "Unrated", "an unlinked book stays Unrated, got " .. tostring(plain))
 end)
 
 test("countFinishedBooks: a book finished on the Kindle counts as finished", function()
@@ -2708,6 +2993,70 @@ test("getBySource: status filter finds on-hold book when metadata is not in a si
     assert(total == 1, "expected 1 on-hold book, got " .. tostring(total))
     assert(list[1] and list[1].title == "Alpha",
         "expected Alpha, got " .. tostring(list[1] and list[1].title))
+end)
+
+test("getBySource: a filtered Recent or collection chip keeps books outside home (issue 305)", function()
+    -- Read or collected from outside the home folder: the plain chip showed
+    -- them, but a filter sent the chip through the library walk, which never
+    -- sees them.
+    _setupResolverLibrary()
+    _G._test_bim_data["/elsewhere/delta.epub"] = { title = "Delta" }
+    package.loaded["readhistory"].hist = {
+        { file = "/lib/comics/alpha.epub", time = 300 },
+        { file = "/elsewhere/delta.epub",  time = 200 },
+    }
+    _G._test_docsettings_data = {
+        ["/lib/comics/alpha.epub"] = { summary = { status = "reading" } },
+        ["/elsewhere/delta.epub"]  = { summary = { status = "reading" } },
+    }
+    local list, total = Repo.getBySource(
+        { kind = "recent" }, { statuses = { reading = true } }, nil, 0, 10)
+    local titles = {}
+    for _i, b in ipairs(list) do titles[#titles + 1] = b.title end
+    table.sort(titles)
+    package.loaded["readcollection"].coll.wishlist[2] = { file = "/elsewhere/delta.epub" }
+    local clist = Repo.getBySource({ kind = "collection", id = "wishlist" },
+        { statuses = { reading = true } }, nil, 0, 10)
+    package.loaded["readhistory"].hist = {}
+    _teardownResolverLibrary()
+    _G._test_docsettings_data = nil
+    assert(total == 2, "expected both reading books, got " .. tostring(total))
+    assert(table.concat(titles, ",") == "Alpha,Delta", "got " .. table.concat(titles, ","))
+    assert(#clist == 2, "collection lost the book outside home: " .. #clist)
+end)
+
+test("getBySource: a sorted Recent chip still shows only books, not KOReader's own files", function()
+    -- The default Recent chip carries a sort, so every reader takes the list
+    -- path; KOReader's history also holds opened images and its quickstart
+    -- guide, which the library walk never showed.
+    _setupResolverLibrary()
+    local prev_ds = package.loaded["datastorage"]
+    package.loaded["datastorage"] = { getDataDir = function() return "/ko" end,
+                                      getSettingsDir = function() return "/ko/settings" end }
+    _G._test_bim_data["/elsewhere/delta.epub"] = { title = "Delta" }
+    _G._test_bim_data["/ko/help/quickstart-en.html"] = { title = "Quickstart" }
+    _G._test_bim_data["/elsewhere/photo.png"] = { title = "Photo" }
+    package.loaded["readhistory"].hist = {
+        { file = "/elsewhere/delta.epub", time = 3 },
+        { file = "/ko/help/quickstart-en.html", time = 2 },
+        { file = "/elsewhere/photo.png", time = 1 },
+    }
+    local list = Repo.getBySource({ kind = "recent" }, nil,
+        { { key = "last_opened", reverse = true } }, 0, 10)
+    -- A home of "/" contains everything: still no reason to keep KOReader's files.
+    _G._test_settings.home_dir = "/"
+    Repo.invalidateWalkCache()
+    local root_list = Repo.getBySource({ kind = "recent" }, nil,
+        { { key = "last_opened", reverse = true } }, 0, 10)
+    for _i, b in ipairs(root_list) do
+        assert(b.title ~= "Quickstart", "home_dir = / let KOReader's quickstart through")
+    end
+    package.loaded["readhistory"].hist = {}
+    package.loaded["datastorage"] = prev_ds
+    _teardownResolverLibrary()
+    local titles = {}
+    for _i, b in ipairs(list) do titles[#titles + 1] = b.title end
+    assert(table.concat(titles, ",") == "Delta", "got " .. table.concat(titles, ","))
 end)
 
 test("getBySource: rating filter finds rated book when metadata is not in a sibling .sdr", function()
@@ -3609,6 +3958,76 @@ test("getSeriesGroups: other dimensions still filter standalones under 'both' (#
         { series_membership = "both", statuses = { finished = true } })
     assert(total == 1, "only the finished standalone should survive, got " .. tostring(total))
     assert(items[1] and items[1].title == "Standalone")
+    _G._test_docsettings_data = nil
+end)
+
+-- Issue 486: "Show text below covers: Author" names a series stack's author,
+-- so the hydrated stack carries one. Taken from the cached members, which
+-- know every member's author: books[2..n] are bare filepath stubs, so reading
+-- them (or books[1] alone) would answer the first volume's author.
+local function seriesAuthorFixture()
+    Repo.invalidateWalkCache()
+    package.loaded["readhistory"].hist = {}
+    _G._test_bim_data = {
+        -- Long Earth: a guest first author on volume 1, then two by Baxter.
+        ["/lib/le1.epub"] = { title = "LE1", series = "Long Earth #1", authors = "Terry Pratchett" },
+        ["/lib/le2.epub"] = { title = "LE2", series = "Long Earth #2", authors = "Stephen Baxter" },
+        ["/lib/le3.epub"] = { title = "LE3", series = "Long Earth #3", authors = "Stephen Baxter" },
+        -- A tie: the first-seen member's author wins, never pairs() order.
+        ["/lib/t1.epub"]  = { title = "T1", series = "Tied #1", authors = "Ann Leckie" },
+        ["/lib/t2.epub"]  = { title = "T2", series = "Tied #2", authors = "Iain M. Banks" },
+        -- No author anywhere: nothing to name.
+        ["/lib/n1.epub"]  = { title = "N1", series = "Nobody #1" },
+        ["/lib/n2.epub"]  = { title = "N2", series = "Nobody #2" },
+    }
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 1 }
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files = (path == "/lib")
+            and { ".", "..", "le1.epub", "le2.epub", "le3.epub", "t1.epub", "t2.epub",
+                  "n1.epub", "n2.epub" }
+            or {}
+        local i = 0
+        return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(_fp, key)
+        if key == "mode" then return "file" end
+        if key == "modification" then return 0 end
+    end
+end
+
+local function bySeries(items)
+    local out = {}
+    for _i, it in ipairs(items) do if it.series_name then out[it.series_name] = it end end
+    return out
+end
+
+test("getSeriesGroups: a stack carries its members' modal author (#486)", function()
+    seriesAuthorFixture()
+    local items = Repo.getSeriesGroups(10)
+    local g = bySeries(items)
+    assert(g["Long Earth"], "Long Earth stack missing")
+    assert(g["Long Earth"].stack_author == "Stephen Baxter",
+        "expected the modal member author, got " .. tostring(g["Long Earth"].stack_author))
+    assert(g["Tied"].stack_author == "Ann Leckie",
+        "a tie goes to the first-seen member, got " .. tostring(g["Tied"].stack_author))
+    assert(g["Nobody"].stack_author == nil, "no member author, no stack author")
+    -- Not `author`: the sort engine and the book checks read that field.
+    assert(g["Long Earth"].author == nil, "the stack must not pose as a book")
+    -- The cache HIT path hydrates the same way.
+    local g2 = bySeries(Repo.getSeriesGroups(10))
+    assert(g2["Long Earth"].stack_author == "Stephen Baxter", "cache hit lost the author")
+end)
+
+test("getSeriesGroups: a filtered stack names the author of the books it shows (#486)", function()
+    seriesAuthorFixture()
+    _G._test_docsettings_data = {
+        ["/lib/le1.epub"] = { summary = { status = "complete" } },
+    }
+    local items = Repo.getSeriesGroups(10, 0, nil, { statuses = { finished = true } })
+    local g = bySeries(items)
+    assert(g["Long Earth"], "the finished volume's stack is missing")
+    assert(g["Long Earth"].stack_author == "Terry Pratchett",
+        "expected the shown member's author, got " .. tostring(g["Long Earth"].stack_author))
     _G._test_docsettings_data = nil
 end)
 
@@ -5095,22 +5514,78 @@ test("getBySource(kindle): a rating-only filter does NOT pay for enrichment", fu
     assert(calls == 0, "a rating filter must not enrich the whole list, got " .. calls .. " calls")
 end)
 
-test("kindleFilepaths: lists the catalogue, and is EMPTY without a Kindle library", function()
+test("getBySource: a plugin's registered source is filtered, sorted and paged (issue 452)", function()
+    local Sources = require("lib/bookshelf_sources")
+    Sources.register("demo", {
+        api = 1,
+        label = function() return "Demo" end,
+        available = function() return true end,
+        list = function()
+            return {
+                { title = "Cherry", filepath = "demo://c", rating = 5 },
+                { title = "Apple",  filepath = "demo://a", rating = 5 },
+                { title = "Banana", filepath = "demo://b", rating = 2 },
+            }
+        end,
+    })
+    local list, total = Repo.getBySource({ kind = "demo" }, { ratings = { ["5"] = true } },
+        { { key = "title", reverse = false } }, 0, 1)
+    Sources.unregister("demo")
+    assert(total == 2, "the rating filter keeps two, got " .. tostring(total))
+    assert(#list == 1 and list[1].title == "Apple", "sorted by title and paged to one")
+    assert(list[1].source_kind == "demo", "records are stamped with their source")
+end)
+
+test("getBySource: an unregistered or failing source is an empty shelf, not an error", function()
+    local Sources = require("lib/bookshelf_sources")
+    Sources.register("flaky", {
+        label = function() return "Flaky" end,
+        available = function() return true end,
+        list = function() error("server unreachable") end,
+    })
+    local list, total = Repo.getBySource({ kind = "flaky" }, nil, nil, 0, 10)
+    Sources.unregister("flaky")
+    assert(#list == 0 and total == 0, "a throwing list must read as empty")
+end)
+
+test("getBySource: a fetch-mode source keeps its own order and pages itself", function()
+    local Sources = require("lib/bookshelf_sources")
+    local asked
+    Sources.register("pager", {
+        label = function() return "Pager" end,
+        available = function() return true end,
+        fetch = function(src, drill, off, lim)
+            asked = { drill = src.drill, off = off, lim = lim }
+            local out = {}
+            for i = 1, lim do out[i] = { title = "Z" .. (off + i), filepath = "pager://" .. (off + i) } end
+            return out, nil   -- the server does not know its total yet
+        end,
+        remote_prefix = "pager://",
+    })
+    local list, total = Repo.getBySource({ kind = "pager", drill = { series = 3 } },
+        { ratings = { ["5"] = true } }, { { key = "title", reverse = false } }, 10, 5)
+    Sources.unregister("pager")
+    assert(asked.drill.series == 3 and asked.off == 10 and asked.lim == 5, "drill/offset/limit reach fetch")
+    assert(#list == 5 and list[1].title == "Z11", "server order and paging, no local filter or sort")
+    assert(total == 16, "an unknown total offers one more page: got " .. tostring(total))
+end)
+
+test("librarySourceFilepaths: lists the catalogue, and is EMPTY without a Kindle library", function()
     package.loaded["lib/bookshelf_kindle_source"] = nil
-    assert(#Repo.kindleFilepaths() == 0, "no Kindle source must yield no paths")
+    assert(#Repo.librarySourceFilepaths() == 0, "no Kindle source must yield no paths")
 
     package.loaded["lib/bookshelf_kindle_source"] = {
         isAvailable = function() return false end,
         listBooks = function() error("must not be called when unavailable") end,
     }
-    assert(#Repo.kindleFilepaths() == 0, "an unavailable source must yield no paths")
+    assert(#Repo.librarySourceFilepaths() == 0, "an unavailable source must yield no paths")
 
     stub_kindle_source({
         { title = "A", filepath = "/k/a.kfx" },
         { title = "B", filepath = "/k/b.kfx" },
         { title = "No path" },
     })
-    local paths = Repo.kindleFilepaths()
+    local paths = Repo.librarySourceFilepaths()
     table.sort(paths)
     assert(#paths == 2 and paths[1] == "/k/a.kfx" and paths[2] == "/k/b.kfx",
         "expected the two real paths, got " .. table.concat(paths, ","))
@@ -5485,13 +5960,27 @@ end)
 -- there too, or the scan shows up in the spine widths -- which read the store
 -- directly -- and nowhere else.
 
+-- counts: fp -> pages (a "print" count) or {pages, tag}. shownPages is the
+-- real one's rule, restated: only print / stable / render counts are shown.
 local function with_scan_store(counts, fn)
     local previous = package.loaded["lib/bookshelf_spine_shelf"]
+    local function entry(fp)
+        local c = counts[fp]
+        if type(c) == "table" then return c[1], c[2] end
+        return c, c and "print" or nil
+    end
     package.loaded["lib/bookshelf_spine_shelf"] = {
         cachedProgress = function(fp)
-            local n = counts[fp]
+            local n, tag = entry(fp)
             if not n then return nil, nil, false end
-            return n, nil, false
+            return n, nil, false, tag, false
+        end,
+        shownPages = function(fp)
+            local n, tag = entry(fp)
+            if tag == "print" or tag == "user" or tag == "stable" or tag == "render" then
+                return n
+            end
+            return nil
         end,
     }
     local ok, err = pcall(fn)
@@ -5523,6 +6012,33 @@ test("the HERO's record gets the scanned count too", function()
     end)
 end)
 
+test("a layout render is never shown as the book's page count", function()
+    -- Reddit report: extracted counts "way off, like a factor of 4". A render
+    -- at crengine's default layout is a spine-width scale, not the book's
+    -- length; nor is a legacy "scan" count, which could be one.
+    _G._test_docsettings_data = nil
+    _G._test_bim_data = { ["/lib/layout.epub"] = { title = "L" } }
+    with_scan_store({ ["/lib/layout.epub"] = { 1600, "layout" },
+                      ["/lib/legacy.epub"] = { 1600, "scan" } }, function()
+        local _pct, _st, _r, pages = Repo.progressFor("/lib/layout.epub")
+        assert(pages == nil, "progressFor showed a layout count: " .. tostring(pages))
+        local b = Repo.buildBook("/lib/layout.epub")
+        assert(b and b.page_count == nil,
+            "the hero showed a layout count: " .. tostring(b and b.page_count))
+        assert(Repo.pageCountFor("/lib/legacy.epub", nil) == nil,
+            "a legacy scan count was shown")
+        assert(Repo.pageCountFor("/lib/legacy p(90).epub", nil) == 90,
+            "the filename marker still answers")
+    end)
+end)
+
+test("a render at the reader's layout IS shown", function()
+    _G._test_docsettings_data = nil
+    with_scan_store({ ["/lib/user.epub"] = { 852, "user" } }, function()
+        assert(Repo.pageCountFor("/lib/user.epub", nil) == 852)
+    end)
+end)
+
 test("BIM's own count still wins over the scan store", function()
     -- The store is a fallback, not an override: a book BIM has counted knows
     -- better than a scan estimate.
@@ -5544,7 +6060,7 @@ test("one function owns the end of the page-count ladder", function()
             "what the caller already knows wins")
         assert(Repo.pageCountFor("/lib/x.epub", nil) == 300, "then the store")
         assert(Repo.pageCountFor("/lib/y p(88).epub", nil) == 88,
-            "and the filename marker comes before the store")
+            "and the filename marker answers when the store does not")
         assert(Repo.pageCountFor("/lib/z.epub", 0) == nil,
             "a zero is not a count")
         assert(Repo.pageCountFor(nil, nil) == nil, "no path, no answer")
@@ -5564,12 +6080,18 @@ test("an opened book with no committed total still gets the marker", function()
     _G._test_docsettings_data = nil
 end)
 
-test("a filename marker still outranks the scan store", function()
-    -- p(N) in the name is free and authoritative; the store often holds a
-    -- persisted echo of that same number.
+test("a scanned count outranks a filename marker; the marker is the fallback", function()
+    -- The maintainer: a p(N) set by Calibre "won't be as accurate as ours",
+    -- and a reader with those in their file names may want to override them.
+    -- A scan that keeps file names as a source stores the marker's own
+    -- number, so for that reader nothing changes.
     with_scan_store({ ["/lib/marked p(250).epub"] = 999 }, function()
         local _p, _s, _r, pages = Repo.progressFor("/lib/marked p(250).epub")
-        assert(pages == 250, "expected the filename marker, got " .. tostring(pages))
+        assert(pages == 999, "expected the scan's count, got " .. tostring(pages))
+    end)
+    with_scan_store({}, function()
+        local _p, _s, _r, pages = Repo.progressFor("/lib/unscanned p(250).epub")
+        assert(pages == 250, "an unscanned book lost its marker: " .. tostring(pages))
     end)
 end)
 
@@ -6055,6 +6577,55 @@ test("getFolderSections: a one-book folder folds into its parent's run", functio
     assert(out[2].shelf_section == "Banks", "got " .. tostring(out[2].shelf_section))
 end)
 
+test("getFolderSections: status and Opened sorts order books inside a section", function()
+    -- #534: the light records carry no sidecar status and no history time, so
+    -- "Reading 1st" or "Opened" on a spine Home shelf compared nil with nil and
+    -- left each folder's books in walk order.
+    Repo.invalidateWalkCache()
+    Repo.invalidateProgressCache()
+    package.loaded["libs/libkoreader-lfs"].dir = function(path)
+        local files
+        if path == "/lib" then files = { ".", "..", "Mix" }
+        elseif path == "/lib/Mix" then
+            files = { ".", "..", "a.epub", "b.epub", "c.epub" }
+        else files = {} end
+        local i = 0
+        return function() i = i + 1; return files[i] end
+    end
+    package.loaded["libs/libkoreader-lfs"].attributes = function(fp, key)
+        if key == "modification" then return 100
+        elseif key == "mode" then return fp == "/lib/Mix" and "directory" or "file" end
+    end
+    _G._test_settings = { home_dir = "/lib", bookshelf_latest_walk_depth = 3 }
+    _G._test_bim_data = {
+        ["/lib/Mix/a.epub"] = { title = "A" },
+        ["/lib/Mix/b.epub"] = { title = "B" },
+        ["/lib/Mix/c.epub"] = { title = "C" },
+    }
+    _G._test_docsettings_data = {
+        ["/lib/Mix/a.epub"] = { summary = { status = "complete" }, percent_finished = 1 },
+        ["/lib/Mix/c.epub"] = { summary = { status = "reading" }, percent_finished = 0.4 },
+    }
+    local out = Repo.getFolderSections(20, 0, { { key = "read_status_active" } })
+    local order = {}
+    for i = 1, #out do order[i] = out[i].filepath:match("([^/]+)$") end
+    assert(table.concat(order, ",") == "c.epub,b.epub,a.epub",
+        "Reading 1st: reading, unread, finished; got " .. table.concat(order, ","))
+
+    package.loaded["readhistory"].hist = {
+        { file = "/lib/Mix/a.epub", time = 300 },
+        { file = "/lib/Mix/c.epub", time = 200 },
+    }
+    out = Repo.getFolderSections(20, 0, { { key = "last_opened", reverse = true } })
+    order = {}
+    for i = 1, #out do order[i] = out[i].filepath:match("([^/]+)$") end
+    assert(order[1] == "a.epub" and order[2] == "c.epub",
+        "Opened, newest first; got " .. table.concat(order, ","))
+    package.loaded["readhistory"].hist = {}
+    _G._test_docsettings_data = nil
+    Repo.invalidateProgressCache()
+end)
+
 test("allHasBooks: the whole cached set of a path, nil when nothing is cached", function()
     -- The shelf asks this after a windowed fetch whose page showed folders
     -- only: does the SET hold a book anywhere, so the label strip is decided
@@ -6183,6 +6754,85 @@ test("invalidateWalkCache clears _meta_record_cache; invalidateBookCache keeps i
     Repo.invalidateBookCache("test")
     assert(Repo._shapeCacheCounts().meta > 0,
         "invalidateBookCache must keep the last-good records for the refresh cycle")
+end)
+
+-- ============================================================================
+-- Formats registered by other plugins' document providers
+-- ============================================================================
+
+test("isBookFile: a plugin-registered extension is a book, core rules unchanged", function()
+    local PF = require("lib/bookshelf_plugin_formats")
+    local saved = package.loaded["document/documentregistry"]
+    package.loaded["document/documentregistry"] = {
+        image_ext = { png = true },
+        providers = {
+            { extension = "epub",    provider = { provider = "crengine" } },
+            { extension = "zip",     provider = { provider = "mupdf" } },
+            { extension = "meguru",  provider = { provider = "meguru" } },
+            { extension = "foo.zip", provider = { provider = "someplugin" } },
+            { extension = "png",     provider = { provider = "someplugin" } },
+        },
+    }
+    PF._reset()
+    assert(Repo.isBookFile("/books/Vol 1.meguru"), ".meguru should be a book")
+    assert(Repo.isBookFile("/books/VOL 1.MEGURU"), "extension match is case-insensitive")
+    assert(Repo.isBookFile("/books/x.foo.zip"), "plugin compound .zip form")
+    assert(not Repo.isBookFile("/books/x.zip"), "bare .zip is still not a book")
+    assert(not Repo.isBookFile("/books/cover.png"), "images stay excluded")
+    assert(not Repo.isBookFile("/books/notes.xml"), "core-only formats stay curated")
+    assert(Repo.isBookFile("/books/a.epub"))
+    -- Plugin-format files are the ones the shelf never fetches a cover for.
+    assert(Repo.isPluginFormatFile("/books/Vol 1.meguru"), ".meguru is a plugin format")
+    assert(Repo.isPluginFormatFile("/books/x.foo.zip"), "so is a plugin's compound form")
+    assert(not Repo.isPluginFormatFile("/books/a.epub"), "a core format is not")
+    assert(not Repo.isPluginFormatFile("/books/notes.xml"), "nor is a file that is not a book")
+    package.loaded["document/documentregistry"].providers[6] =
+        { extension = "cbz", provider = { provider = "meguru" } }
+    PF._reset()
+    assert(not Repo.isPluginFormatFile("/books/c.cbz"),
+        "a core format a plugin ALSO provides keeps its covers")
+    package.loaded["document/documentregistry"] = saved
+    PF._reset()
+    assert(not Repo.isBookFile("/books/Vol 1.meguru"), "gone once no plugin provides it")
+end)
+
+-- Issue 524: a sidecar with progress but no summary.status is a book being
+-- read, as KOReader counts it; bookshelf drew it as unread, with no bar. A
+-- "new" status (bookshelf's Mark as unread) and no sidecar stay unread.
+test("readProgress: progress without a status reads as reading (issue 524)", function()
+    _G._test_docsettings_data = {
+        ["/books/nostatus.epub"] = { percent_finished = 0.12 },
+        ["/books/marked_new.epub"] = { summary = { status = "new" } },
+        ["/books/rated_only.epub"] = { summary = { rating = 4 } },
+        ["/books/finished.epub"] = { percent_finished = 1, summary = { status = "complete" } },
+    }
+    Repo.invalidateProgressCache()
+    local pct, status = Repo.readProgress("/books/nostatus.epub")
+    assert(pct == 0.12 and status == "reading", tostring(pct) .. " " .. tostring(status))
+    local _p2, s2 = Repo.readProgress("/books/marked_new.epub")
+    assert(s2 == "new", "Mark as unread stays unread: " .. tostring(s2))
+    local _p3, s3 = Repo.readProgress("/books/rated_only.epub")
+    assert(s3 == nil, "rated, never opened: no progress, no status: " .. tostring(s3))
+    local _p4, s4 = Repo.readProgress("/books/finished.epub")
+    assert(s4 == "finished", tostring(s4))
+    _G._test_docsettings_data = nil
+    Repo.invalidateProgressCache()
+end)
+
+-- Page count > Printed page counts first reads only layout-free counts.
+test("printedPageCount: stable numbers or a p(N) name, never the render", function()
+    _G._test_docsettings_data = {
+        ["/books/stable.epub"] = { pagemap_doc_pages = 406, stats = { pages = 1272 } },
+        ["/books/rendered.epub"] = { stats = { pages = 512 } },
+    }
+    Repo.invalidateProgressCache()
+    assert(Repo.printedPageCount("/books/stable.epub") == 406)
+    assert(Repo.printedPageCount("/books/rendered.epub") == nil,
+        "KOReader's count at the reader's layout is not printed")
+    assert(Repo.printedPageCount("/books/Title p(320).epub") == 320)
+    assert(Repo.printedPageCount(nil) == nil)
+    _G._test_docsettings_data = nil
+    Repo.invalidateProgressCache()
 end)
 
 -- ============================================================================

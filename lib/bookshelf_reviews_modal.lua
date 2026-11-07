@@ -28,33 +28,21 @@ local LineWidget      = require("ui/widget/linewidget")
 local OverlapGroup    = require("ui/widget/overlapgroup")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size            = require("ui/size")
-local TextWidget      = require("ui/widget/textwidget")
+local TextWidget      = require("lib/bookshelf_colour_text")
 local TitleBar        = require("ui/widget/titlebar")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local Store           = require("lib/bookshelf_settings_store")
 local BFont           = require("lib/bookshelf_fonts")
-local TextSegments    = require("lib/bookshelf_text_segments")
 local GestureZones    = require("lib/bookshelf_gesture_zones")
 local logger          = require("logger")
+local Space           = require("lib/bookshelf_space")
 local Screen          = Device.screen
 local _               = require("lib/bookshelf_i18n").gettext
 
 -- Shared wall-clock for [bookshelf perf] timestamps (and elapsed-time
 -- bookkeeping); see lib/bookshelf_gettime.lua for the fallback contract.
 local _gettime = require("lib/bookshelf_gettime")
-
--- FrameContainer that pixel-inverts its own rect after painting (selected
--- chips). Renders black-on-white then flips via a blitbuffer primitive so the
--- inversion is device-independent -- some Kindle builds don't honour TextWidget
--- fgcolor. Mirrors the nav chip bar's InvertedFrame.
-local InvertedFrame = FrameContainer:extend{}
-function InvertedFrame:paintTo(bb, x, y)
-    FrameContainer.paintTo(self, bb, x, y)
-    if self._invert and self.dimen then
-        bb:invertRect(x, y, self.dimen.w, self.dimen.h)
-    end
-end
 
 -- Reader-adjustable font size for each tab's body (Edit buttons, Description
 -- HTML, Reviews HTML, Tags pills). Stored as a base point size and run through
@@ -165,13 +153,15 @@ local TabBar = InputContainer:extend{
     left_inset  = nil,   -- x of the first tab; align with the body text's left
     font_size   = nil,   -- base point size before Screen:scaleBySize; default below
     on_select   = nil,
+    band        = nil,   -- a colour: the strip's ground (the book menu's header
+                         -- band), its cells white on it; nil leaves it white
 }
 
 function TabBar:init()
-    self.left_inset = self.left_inset or Screen:scaleBySize(10)
-    self.top_pad    = Screen:scaleBySize(12)   -- gap above the tabs (below title bar)
-    self.pad_h      = Screen:scaleBySize(14)
-    self.pad_v      = Screen:scaleBySize(6)
+    self.left_inset = self.left_inset or Space.px(10)
+    self.top_pad    = Space.px(12)   -- gap above the tabs (below title bar)
+    self.pad_h      = Space.px(14)
+    self.pad_v      = Space.px(6)
     self.border     = Size.border.thin         -- segmented-control frame + separators
     self.sep_w      = Size.border.thin
     -- UNSCALED. Font:getFace runs Screen:scaleBySize over its size argument
@@ -181,7 +171,40 @@ function TabBar:init()
     -- about 2, which put these labels at 56px beside a UI using 31
     -- (maintainer: "our tabs are huge apparently by default", from several
     -- screenshots -- it was every larger screen, not one device).
-    self.face       = Font:getFace("cfont", self.font_size or 13)
+    -- One row, whatever the screen: when the labels do not fit at the chosen
+    -- size, narrow the tabs' side padding first, then step the font down (to
+    -- no less than 60% of it) until they do (maintainer: "scale the tabs down
+    -- as well, when there's not enough space, so they never wrap"). The
+    -- wrapping below stays as a last resort, so a tab can never be clipped.
+    local size = self.font_size or 13
+    do
+        local avail   = self.width - 2 * self.left_inset
+        local n       = #self.tabs
+        local min_pad = Space.px(6)
+        local function textWidth(sz)
+            local face, total = BFont:getFace("cfont", sz), 0
+            for _i, label in ipairs(self.tabs) do
+                local tw = TextWidget:new{ text = label, face = face }
+                total = total + tw:getSize().w
+                tw:free()
+            end
+            return total
+        end
+        local text_w = textWidth(size)
+        if text_w + 2 * self.pad_h * n > avail and n > 0 then
+            local pad = math.floor((avail - text_w) / (2 * n))
+            if pad >= min_pad then
+                self.pad_h = pad
+            else
+                self.pad_h = min_pad
+                local floor_size = size * 0.6
+                while size - 1 >= floor_size and textWidth(size) + 2 * min_pad * n > avail do
+                    size = size - 1
+                end
+            end
+        end
+    end
+    self.face       = BFont:getFace("cfont", size)
 
     -- Pack tabs into rows that fit self.width, wrapping when the next tab would
     -- overflow (so a narrow screen / high DPI keeps every tab reachable instead
@@ -206,6 +229,30 @@ function TabBar:init()
         if sz.h > label_h then label_h = sz.h end
     end
     self._n_rows = row
+    -- Each row spans the strip, inset alike at both ends: its spare width is
+    -- shared among its tabs. Packed at their natural widths, the tabs stopped
+    -- short of the right edge, under a baseline and a body that run the full
+    -- width (book popup redesign).
+    local right = self.width - self.left_inset
+    for r = 1, row do
+        local idx, used = {}, 0
+        for i = 1, #self.tabs do
+            if self._tab_row[i] == r then
+                idx[#idx + 1] = i
+                used = used + self._tab_w[i]
+            end
+        end
+        local spare = right - self.left_inset - used
+        if spare > 0 and #idx > 0 then
+            local each, extra = math.floor(spare / #idx), spare % #idx
+            local tx = self.left_inset
+            for k, i in ipairs(idx) do
+                self._tab_w[i] = self._tab_w[i] + each + (k <= extra and 1 or 0)
+                self._tab_x[i] = tx
+                tx = tx + self._tab_w[i]
+            end
+        end
+    end
     self._row_h  = label_h + 2 * self.pad_v
     self.dimen = Geom:new{
         x = 0, y = 0,
@@ -215,11 +262,12 @@ function TabBar:init()
         -- white gap between the baseline and the body's heading bar.
         h = self.top_pad + self._n_rows * self._row_h,
     }
-    if Device:isTouchDevice() then
-        self.ges_events = {
-            TapTab = { GestureRange:new{ ges = "tap", range = self.dimen } },
-        }
-    end
+    -- On every device, not only touch ones: on a keys-only device Press on a
+    -- focused tab arrives as FocusManager's synthetic tap, and this is what
+    -- turns it into the switch (GitHub issue 361).
+    self.ges_events = {
+        TapTab = { GestureRange:new{ ges = "tap", range = self.dimen } },
+    }
 
     -- Per-tab focus cells for the modal's dpad FocusManager. Each is a virtual
     -- focus target (never painted itself): on Focus it sets _focused_idx so
@@ -247,6 +295,17 @@ function TabBar:paintTo(bb, x, y)
     local sep_w   = self.sep_w
     local box_top = y + self.top_pad
 
+    -- On a band: its ground down to the baseline, and each cell white, so the
+    -- labels and the inverted active cell read as before.
+    if self.band then
+        local base_y0 = box_top + self._n_rows * self._row_h - Screen:scaleBySize(2)
+        bb:paintRect(x, y, self.dimen.w, base_y0 - y, self.band)
+        for i = 1, #self._labels do
+            bb:paintRect(x + self._tab_x[i], box_top + (self._tab_row[i] - 1) * self._row_h,
+                self._tab_w[i], self._row_h, Blitbuffer.COLOR_WHITE)
+        end
+    end
+
     -- Labels first (black text on the white background); pin each focus cell's
     -- dimen to its tab rect for FocusManager. The active cell is inverted after,
     -- flipping its background to black and its label to white.
@@ -254,7 +313,8 @@ function TabBar:paintTo(bb, x, y)
         local rr = self._tab_row[i]
         local tx = x + self._tab_x[i]
         local ty = box_top + (rr - 1) * self._row_h
-        tw:paintTo(bb, tx + self.pad_h, ty + self.pad_v)
+        -- Centred: a row's spare width widens its cells (init).
+        tw:paintTo(bb, tx + math.floor((self._tab_w[i] - tw:getSize().w) / 2), ty + self.pad_v)
         if self.focus_cells and self.focus_cells[i] then
             self.focus_cells[i].dimen = Geom:new{
                 x = tx, y = ty, w = self._tab_w[i], h = self._row_h }
@@ -311,15 +371,19 @@ function TabBar:paintTo(bb, x, y)
     local base_y = box_top + self._n_rows * self._row_h - base_h
     bb:paintRect(x, base_y, self.dimen.w + Size.border.window, base_h, Blitbuffer.COLOR_BLACK)
 
-    -- dpad focus highlight: a thin inner inversion, skipped on the active cell
-    -- (already inverted) so focus reads as distinct from selection.
-    if self._focused_idx and self._focused_idx ~= self.active and self._tab_x[self._focused_idx] then
+    -- The keys' focus: the kit's ring set in from the cell, as on a
+    -- segmented control (maintainer: like the reading status), on any tab,
+    -- the active one too. An inverted cell read as a second tab picked.
+    if self._focused_idx and self._tab_x[self._focused_idx] then
+        local Kit = require("lib/bookshelf_popup_kit")
         local fr = self._tab_row[self._focused_idx]
-        bb:invertRect(
-            x + self._tab_x[self._focused_idx] + border,
-            box_top + (fr - 1) * self._row_h + border,
-            self._tab_w[self._focused_idx] - 2 * border,
-            self._row_h - 2 * border)
+        local inset = border + Space.px(3)
+        Kit.invertRing(bb,
+            x + self._tab_x[self._focused_idx] + inset,
+            box_top + (fr - 1) * self._row_h + inset,
+            self._tab_w[self._focused_idx] - 2 * inset,
+            self._row_h - 2 * inset,
+            Kit.focusWidth(), Space.px(4))
     end
 end
 
@@ -375,8 +439,12 @@ function ReviewsModal:init()
     local _perf_init_t0 = _gettime()
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     -- Near-fullscreen with the standard screen-edge inset (matches TextViewer).
-    self.width  = self.width  or (screen_w - Screen:scaleBySize(30))
-    self.height = self.height or (screen_h - Screen:scaleBySize(30))
+    self.width  = self.width  or (screen_w - Space.px(30))
+    self.height = self.height or (screen_h - Space.px(30))
+    -- The header band: with a cover header (the book menu), the header and
+    -- the tabs sit on a light grey, a shade darker than the strips some tabs
+    -- open with (STRIP_BG, 0xEE), so the two read apart (maintainer).
+    self._band = self.header_builder and Blitbuffer.COLOR_GRAY_D or nil
 
     -- Source tabs (e.g. File vs Hardcover description). Only meaningful with 2+.
     self._tabs = (type(self.tabs) == "table" and #self.tabs > 0) and self.tabs or nil
@@ -406,7 +474,7 @@ function ReviewsModal:init()
     -- Horizontal content inset, shared by the HTML body's CSS padding, the tab
     -- strip's left inset, the tag tab's pill inset, and the header's L/R + top
     -- padding -- so tabs, bodies and header all line up.
-    self._side_pad = Screen:scaleBySize(28)
+    self._side_pad = Space.px(28)
 
     -- ADD to key_events, don't replace it: FocusManager:_init already populated
     -- it with the focus-move (arrow) + Press bindings we rely on for dpad nav.
@@ -563,8 +631,16 @@ function ReviewsModal:init()
     -- floating inward. Top/bottom padding too, so text doesn't hug the title
     -- bar / footer line.
     local h_pad = self._side_pad
-    local v_pad = Screen:scaleBySize(28)
+    local v_pad = Space.px(28)
     css = css .. string.format("\nbody { padding: %dpx %dpx; }", v_pad, h_pad)
+    -- The UI font, so the description reads in the same typeface as the
+    -- rest of the modal and the shelf (issue 284). Skipped, leaving MuPDF's
+    -- sans-serif, when the font cannot be found on disk.
+    local ok_f, Fonts = pcall(require, "lib/bookshelf_fonts")
+    local ui_css = ok_f and Fonts.uiFontCss and Fonts.uiFontCss("bsui") or ""
+    if ui_css ~= "" then
+        css = ui_css .. css .. '\nbody { font-family: "bsui", sans-serif; }'
+    end
     -- Kept so _changeFontSize can re-render via htmlbox_widget:setContent
     -- without rebuilding the @font-face rule.
     self._css = css
@@ -585,15 +661,12 @@ function ReviewsModal:init()
         html_body         = self:_activeHtml(),
         css               = css,
         default_font_size = Screen:scaleBySize(self.font_size),
-        -- +1px width paired with +1px scroll_bar_width extends ONLY the
-        -- scrollbar's right edge into the popup frame's own border (leaving
-        -- the text area's width, and the scrollbar's left edge, unchanged) --
-        -- so the scrollbar's own thin border and the frame's border occupy
-        -- the same pixels on the right/top/bottom instead of sitting as two
-        -- adjacent but visually distinct lines, and only the scrollbar's
-        -- left edge (facing the text, nothing to merge with) stays visible.
-        width             = self.width + 1,
-        scroll_bar_width  = Screen:scaleBySize(6) + 1,
+        -- Full width, the bar at its right edge against the frame's border.
+        -- The bar is a rail (see _scroller) with no right edge of its own, so
+        -- the old +1px trick that overlapped a boxed bar's border with the
+        -- frame's is gone.
+        width             = self.width,
+        scroll_bar_width  = require("lib/bookshelf_snug_scroll").scroll_bar_width,
         height            = html_h,
         dialog            = self,
     }
@@ -648,7 +721,7 @@ function ReviewsModal:handleEvent(event)
         return InputContainer.handleEvent(self, event)
     end
     if InputContainer.handleEvent(self, event) then return true end
-    return GestureZones.forwardToFM(event, self)
+    return GestureZones.forwardToLive(event, self)
 end
 
 -- Build a FRESH footer ButtonTable (zoom -/+, Close, optional Refresh) from the
@@ -656,12 +729,16 @@ end
 function ReviewsModal:_buildButtons()
     local bt = ButtonTable:new{
         width       = self.width,
-        buttons     = { self._button_row },
+        buttons     = require("lib/bookshelf_popup_kit").uiFontButtons({ self._button_row }),
         show_parent = self,
     }
     -- Keep a handle on the live table so the Open flow can find the Open
     -- button's painted rect for its pressed-state fill.
     self._footer_buttons = bt
+    -- The keys' focus as the kit's ring, not the button inverted (which
+    -- reads as "on").
+    local Kit = require("lib/bookshelf_popup_kit")
+    Kit.ringFocusTable(bt, { Space.px(10), Space.px(4) }, Kit.RADIUS)
     return bt
 end
 
@@ -678,7 +755,7 @@ function ReviewsModal:_buildHeader()
     -- as _owned_cover_bb); we free it once in onCloseWidget.
     if self._header_widget then return self._header_widget end
     local pad = self._side_pad  -- L/R + top match the tabs / body inset
-    local inner = self.header_builder(self.width - 2 * pad)
+    local inner = self.header_builder(self.width - 2 * pad, self._band)
     if not inner then return nil end
     self._owned_cover_bb = inner._owned_cover_bb
     -- The header's cover frame (stamps its painted dimen): the Open button
@@ -690,7 +767,7 @@ function ReviewsModal:_buildHeader()
         padding_left   = pad,
         padding_right  = pad,
         padding_top    = pad,
-        padding_bottom = Screen:scaleBySize(8),  -- tight to the tab bar below
+        padding_bottom = Space.px(8),  -- tight to the tab bar below
         inner,
     }
     -- Top-right close icon. The old title bar that carried one was removed in
@@ -705,12 +782,13 @@ function ReviewsModal:_buildHeader()
     -- every other stock TitleBar-based dialog use for their close button).
     local DGENERIC_ICON_SIZE = G_defaults:readSetting("DGENERIC_ICON_SIZE")
     local icon_size = Screen:scaleBySize(DGENERIC_ICON_SIZE * 0.6)
-    local side_m = Screen:scaleBySize(8)
-    local top_m  = Screen:scaleBySize(6)
+    local side_m = Space.px(8)
+    local top_m  = Space.px(6)
     local x_box = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE, bordersize = 0, margin = 0,
+        background = self._band or Blitbuffer.COLOR_WHITE, bordersize = 0, margin = 0,
         padding = Screen:scaleBySize(4),  -- small tap target around the icon
-        IconWidget:new{ icon = "close", width = icon_size, height = icon_size },
+        IconWidget:new{ icon = "close", width = icon_size, height = icon_size,
+            alpha = self._band and true or false },   -- on the band, not a white square (no == nil: cdata)
     }
     local x_btn = InputContainer:new{
         dimen = Geom:new{ w = x_box:getSize().w, h = x_box:getSize().h }, x_box }
@@ -723,6 +801,24 @@ function ReviewsModal:_buildHeader()
         frame,
         x_btn,
     }
+    -- The header band (maintainer: it separates the header and tabs from the
+    -- tab's page): its ground under the header, the window's top corners
+    -- rounded as the window's are inside its border.
+    if self._band then
+        local band, hw = self._band, self._header_widget
+        local r = math.max(0, Space.radius.window - Size.border.window)
+        local paint = hw.paintTo
+        hw.paintTo = function(w, bb, x, y)
+            local sz = w:getSize()
+            if r > 0 then
+                bb:paintRoundedRect(x, y, sz.w, math.min(sz.h, 2 * r), band, r)
+                bb:paintRect(x, y + r, sz.w, sz.h - r, band)
+            else
+                bb:paintRect(x, y, sz.w, sz.h, band)
+            end
+            return paint(w, bb, x, y)
+        end
+    end
     return self._header_widget
 end
 
@@ -770,89 +866,52 @@ function ReviewsModal:_activeBody()
         -- Multi-source body: a chip bar above its own HTML scroller (built fresh
         -- here so a chip switch / font change rebuilds it). Treated like an HTML
         -- tab for cropping (the scroller manages its own painting).
-        return self:_buildSourcedBody(tab, self.width, self._body_h), false, nil
+        local body = self:_buildSourcedBody(tab, self.width, self._body_h)
+        -- The source switch's cells as the body's focus row: a fresh table
+        -- each time, as merging takes a child's layout away and the body is
+        -- kept between switches.
+        -- (mergeLayoutInVertical calls disableFocusManagement on it.)
+        local focus = body.seg_rows and { layout = { body.seg_rows[1] },
+            disableFocusManagement = function() end } or nil
+        return body, false, focus
     end
     self.scroll_html = self.scroll_html or self:_makeScrollHtml()
     return self.scroll_html, false, nil
 end
 
--- A small "EMBEDDED | HARDCOVER" segmented control toggling a tab's active HTML
--- source -- same style as the nav chip bar: uppercase labels, square corners,
--- cells butted together with thin separators inside one bordered frame, the
--- selected cell inverted. Built fresh each assemble; tapping an inactive chip
--- switches the source and reassembles. Left-inset to align with the body text.
+-- An "Embedded | Hardcover" segmented control toggling a tab's active HTML
+-- source: the popup's rounded control (lib/bookshelf_popup_kit), the selected
+-- source filled black. Built fresh each assemble; tapping an inactive source
+-- switches it and reassembles. Left-inset to align with the body text.
 function ReviewsModal:_buildSourceChips(tab)
-    local sep_w   = Size.border.thin
-    local h_pad   = Size.padding.large
-    local v_pad   = Size.padding.small
-    -- Match the main bookshelf nav chip bar exactly: a logical 16pt label scaled
-    -- by the user's chip-font setting. NOT Screen:scaleBySize (the font layer
-    -- scales that again) -- keeps these source chips smaller than the tab bar.
-    -- Through BandMetrics on CHIP_KEY, the one place that derivation lives.
-    local BandMetrics = require("lib/bookshelf_band_metrics")
-    local size    = BandMetrics.fontSize(BandMetrics.CHIP_KEY)
-
-    -- Build the label widgets first (uppercased, UTF-8-aware so accented
-    -- letters fold correctly -- issue #130) to find a uniform cell height.
-    local labels, cell_h = {}, 0
+    local PopupKit = require("lib/bookshelf_popup_kit")
+    local items = {}
     for i, src in ipairs(tab.sources) do
-        local face, bold = BFont:getFace("infofont", size, { bold = true })
-        labels[i] = TextWidget:new{
-            text    = TextSegments.upper(src.label or tostring(i)),
-            face    = face,
-            bold    = bold,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }
-        cell_h = math.max(cell_h, labels[i]:getSize().h)
+        items[i] = { key = i, label = src.label or tostring(i) }
     end
-    cell_h = cell_h + 2 * v_pad
-
-    local row = HorizontalGroup:new{ align = "center" }
-    for i, src in ipairs(tab.sources) do
-        if i > 1 then
-            row[#row + 1] = LineWidget:new{
-                background = Blitbuffer.COLOR_BLACK,
-                dimen = Geom:new{ w = sep_w, h = cell_h },
-            }
-        end
-        local cell_w = labels[i]:getSize().w + 2 * h_pad
-        local body = InvertedFrame:new{
-            _invert    = (i == tab._active_source),
-            bordersize = 0, margin = 0, padding = 0,
-            background = Blitbuffer.COLOR_WHITE,
-            CenterContainer:new{
-                dimen = Geom:new{ w = cell_w, h = cell_h },
-                labels[i],
-            },
-        }
-        local chip = InputContainer:new{
-            dimen = Geom:new{ w = cell_w, h = cell_h }, body }
-        chip.ges_events = { Tap = { GestureRange:new{ ges = "tap", range = chip.dimen } } }
-        chip.onTap = function()
-            if i ~= tab._active_source then
-                tab._active_source = i
-                self:_assemble()
-                UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
+    local seg, seg_rows = PopupKit.segmented{
+        items = items, active = tab._active_source,
+        face  = PopupKit.sourceFace(self.font_size),
+        pad_v = PopupKit.SOURCE_PAD_V,
+        on_pick = function(i)
+            tab._active_source = i
+            -- The keys' cursor stays on the cell picked, not back to the first.
+            local sel = Device:hasDPad() and self.selected and { x = self.selected.x, y = self.selected.y }
+            self:_assemble()
+            if sel and self.layout[sel.y] and self.layout[sel.y][sel.x] then
+                self:moveFocusTo(sel.x, sel.y, FocusManager.FORCED_FOCUS)
             end
-            return true
-        end
-        row[#row + 1] = chip
-    end
-    local framed = FrameContainer:new{
-        bordersize = Size.border.thin, margin = 0, padding = 0, row }
-    return FrameContainer:new{
-        bordersize = 0, margin = 0,
-        padding_left = self._side_pad, padding_right = self._side_pad,
-        -- Symmetric: the description content below drops its own top padding
-        -- when chips show (see _buildSourcedBody), so the chip bar owns the gap.
-        -- -2px (not the full 16) on each side: measured on a real PW5, this
-        -- header came out 104px vs the Reviews tab's native header at 100px
-        -- (lib/bookshelf_widget.lua's _buildReviewsHeader) -- the two tabs'
-        -- hairlines must land at the identical Y or switching tabs visibly
-        -- shifts the scroll boundary. -2/-2 brings this to the same 100px.
-        padding_top = Screen:scaleBySize(16) - 2, padding_bottom = Screen:scaleBySize(16) - 2,
-        framed,
+            UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
+        end,
     }
+    -- On the tab's controls strip; .seg lets a tab with its own button (My
+    -- review's Edit, Hardcover's Refresh) build one strip holding both.
+    local strip = PopupKit.headerRow{ width = self.width, inset = self._side_pad, left = seg }
+    strip.seg = seg
+    -- Its cells, for the keys (the body's focus row): left out, Embedded /
+    -- Hardcover could not be reached by key (maintainer, desktop).
+    strip.seg_rows = seg_rows
+    return strip
 end
 
 -- Free every cached sourced-description body (their MuPDF docs + bbs).
@@ -893,38 +952,28 @@ function ReviewsModal:_buildSourcedBody(tab, w, h)
     self._sourced_cache = self._sourced_cache or {}
     if self._sourced_cache[idx] then return self._sourced_cache[idx] end
 
+    -- No rule under the chips: the popup draws lines only in its frame.
     local chips  = self:_buildSourceChips(tab)
     local chip_h = chips:getSize().h
-    -- Hairline marking the top of the scrollable area -- same construction as
-    -- the Reviews tab's own (lib/bookshelf_widget.lua's _buildReviewsTab), and
-    -- landing at the identical Y (the padding fix on _buildSourceChips above
-    -- makes chip_h == that tab's header_h) so switching tabs doesn't visibly
-    -- shift the boundary line.
-    local hairline = LineWidget:new{
-        background = Blitbuffer.COLOR_DARK_GRAY,
-        dimen = Geom:new{ w = w, h = Size.line.medium },
-    }
-    local hairline_h = hairline:getSize().h
     local src    = tab.sources[idx] or tab.sources[1]
     -- Shrink (not drop) the body's top padding to a small residual: the chip
-    -- bar's own bottom padding plus the hairline already supply most of the
-    -- gap, but the text needs a little breathing room below the hairline
-    -- rather than hugging it -- same value and reasoning as the Reviews tab's
-    -- own header+hairline gap (lib/bookshelf_widget.lua's _buildReviewsTab).
+    -- bar's own bottom padding already supplies most of the gap -- same value
+    -- as the Reviews tab's own header gap (lib/bookshelf_widget.lua's
+    -- _headedHtmlBody).
     -- (A later rule overrides just padding-top from the shared `body { padding }`.)
-    local css = self._css .. string.format("\nbody { padding-top: %dpx; }", Screen:scaleBySize(8))
+    local css = self._css .. string.format("\nbody { padding-top: %dpx; }", Space.px(8))
     local scroller = self:_scroller{
         html_body         = (src and src.html) or "<p></p>",
         css               = css,
         default_font_size = Screen:scaleBySize(self.font_size),
-        -- See the identical +1px pairing on self.scroll_html above -- extends
-        -- only the scrollbar's right edge into the frame's own border.
-        width             = w + 1,
-        scroll_bar_width  = Screen:scaleBySize(6) + 1,
-        height            = math.max(Screen:scaleBySize(80), h - chip_h - hairline_h),
+        -- As self.scroll_html above: full width, a rail against the border.
+        width             = w,
+        scroll_bar_width  = require("lib/bookshelf_snug_scroll").scroll_bar_width,
+        height            = math.max(Screen:scaleBySize(80), h - chip_h),
         dialog            = self,
     }
-    local body = VerticalGroup:new{ align = "left", chips, hairline, scroller }
+    local body = VerticalGroup:new{ align = "left", chips, scroller }
+    body.seg_rows = chips.seg_rows
     self._sourced_cache[idx] = body
     return body
 end
@@ -955,8 +1004,22 @@ function ReviewsModal:_assemble()
     local _t2 = _gettime()
     self._tab_body = body
     -- Crop inner self-repaints (pill tap-feedback inverts) to the native scroll
-    -- body when it's active; HTML tabs manage their own painting.
-    self.cropping_widget = is_native and body or nil
+    -- body when it's active; HTML tabs manage their own painting. KOReader
+    -- repaints the crop at its dimen, and a tab body that is a bare
+    -- VerticalGroup (the Cover tab) never gets one: a page chevron's tap
+    -- highlight crashed on it (issue 585). A borderless frame around the
+    -- body records its dimen when painted, whatever the tab builds. A body
+    -- that is a scroll container already is the crop, as KOReader expects;
+    -- the frame also answers getCropRegion, which an icon button's tap flash
+    -- (UIManager:widgetInvert) asks for.
+    local crop
+    if is_native and not body.getCropRegion then
+        crop = FrameContainer:new{
+            bordersize = 0, margin = 0, padding = 0, body,
+            getCropRegion = function(f) return f.dimen end,
+        }
+    end
+    self.cropping_widget = is_native and (crop or body) or nil
     local buttons = self:_buildButtons()
     local _t3 = _gettime()
     local vg = VerticalGroup:new{ align = "left" }
@@ -967,13 +1030,13 @@ function ReviewsModal:_assemble()
         vg[#vg + 1] = self._tab_row
         self._tabrow_pos = #vg
     end
-    vg[#vg + 1] = body
+    vg[#vg + 1] = crop or body
     vg[#vg + 1] = self._button_separator
     vg[#vg + 1] = buttons
     self._vgroup = vg
     self.frame = FrameContainer:new{
         background  = Blitbuffer.COLOR_WHITE,
-        radius      = Size.radius.window,
+        radius      = Space.radius.window,
         bordersize  = Size.border.window,
         padding     = 0,
         vg,
@@ -1005,6 +1068,9 @@ function ReviewsModal:_assemble()
         end
     end
     local had_body = #self.layout >= body_start
+    -- The body's rows, for bringing a focused one into view in its scroll.
+    self._body_rows = had_body and { from = body_start, to = #self.layout } or nil
+    self._focus_scroll = type(body) == "table" and body.focus_scroll or nil
     self:mergeLayoutInVertical(buttons)
     -- Default focus into the body when it has buttons (e.g. the Edit tab opens
     -- ready to act); otherwise the first row (tabs if present, else footer).
@@ -1024,6 +1090,38 @@ function ReviewsModal:_assemble()
         .. " buildButtons=%.0fms buildHeader=%.0fms layout=%.0fms TOTAL=%.0fms",
         (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
         (_t4 - _t3) * 1000, (_t5 - _t4) * 1000, (_t5 - _t0) * 1000))
+end
+
+-- onFocusMove: FocusManager's, then the focused row brought into view in
+-- the body's scroll: the keys reached rows below the fold with no way to see
+-- them (maintainer, desktop).
+function ReviewsModal:onFocusMove(args)
+    local r = FocusManager.onFocusMove(self, args)
+    self:_scrollFocusIntoView()
+    return r
+end
+
+-- _scrollFocusIntoView(): scroll the body so the focused row shows whole,
+-- by as little as that takes, with a margin. Its rect is where it was last
+-- painted: inside the scroll a row paints at its place less the offset, so
+-- it is off the view when it is above or below the scroll's own rect.
+function ReviewsModal:_scrollFocusIntoView()
+    local scroll, rows = self._focus_scroll, self._body_rows
+    if not (scroll and rows and scroll._is_scrollable and scroll.dimen and scroll.dimen.y) then return end
+    local sel = self.selected
+    if not (sel and sel.y >= rows.from and sel.y <= rows.to) then return end
+    local item = self.layout[sel.y] and self.layout[sel.y][sel.x]
+    local d = item and item.dimen
+    if not (d and d.y and d.h) then return end
+    local top, bottom = scroll.dimen.y, scroll.dimen.y + scroll.dimen.h
+    local margin = Space.px(12)
+    local dy = 0
+    if d.y < top then
+        dy = d.y - top - margin
+    elseif d.y + d.h > bottom then
+        dy = d.y + d.h - bottom + margin
+    end
+    if dy ~= 0 then scroll:_scrollBy(0, dy) end
 end
 
 -- _fontSizeKey(): the Store key for the currently active tab's font size.
@@ -1119,32 +1217,24 @@ function ReviewsModal:_buildTabRow()
         left_inset  = self._side_pad,
         font_size   = TAB_LABEL_FONT_BASE * label_scale / 100,
         on_select   = function(i) self:_switchTab(i) end,
+        band        = self._band,
     }
-end
-
--- setTabHtml(i, html): replace a tab's content after construction (used for an
--- async tab, e.g. Hardcover reviews that load after the popup is shown). Updates
--- the stored html and, if that tab is the active one, re-renders in place. Safe
--- to call after dismiss -- it no-ops once the widget is gone.
-function ReviewsModal:setTabHtml(i, html)
-    if self._dismissed then return end
-    if self._tabs and self._tabs[i] then
-        self._tabs[i].html = html
-        if i == self._active_tab then
-            self:_renderHtml(self:_activeHtml())
-            UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
-        end
-    elseif i == 1 and not self._tabs then
-        -- Single-source modal (no tab bar): the body is html_body.
-        self.html_body = html
-        self:_renderHtml(html)
-        UIManager:setDirty(self, function() return "ui", self.frame.dimen end)
-    end
 end
 
 -- rebuildTab(): reassemble in place (rebuilds the active body fresh). Used by
 -- the Edit tab after an immediate action so its buttons re-read live state
 -- (status tick, rating stars, favourite +/-). No-ops safely after dismiss.
+-- dropHeader(): the kept header goes (its own cover freed), so the next
+-- assemble builds it again: what it says changed (the reading line after a
+-- status change).
+function ReviewsModal:dropHeader()
+    if self._owned_cover_bb and self._owned_cover_bb.free then
+        pcall(function() self._owned_cover_bb:free() end)
+    end
+    self._owned_cover_bb = nil
+    self._header_widget = nil
+end
+
 function ReviewsModal:rebuildTab()
     if self._dismissed then return end
     self:_assemble()
@@ -1229,10 +1319,12 @@ function ReviewsModal:onCloseWidget()
         pcall(function() self._owned_cover_bb:free() end)
         self._owned_cover_bb = nil
     end
-    -- Reclaim the popup's churned Lua garbage now: modal close is an infrequent,
+    -- Reclaim the popup's churned Lua garbage: modal close is an infrequent,
     -- natural boundary, and the book-detail popup allocates a fair amount per
     -- tab/chip/rating interaction. Native resources are already freed above.
-    collectgarbage("collect")
+    -- A second later, not now: a full collect of the PW5's ~100 MB heap was
+    -- ~190 ms of the close, ahead of the shelf's repaint under the popup.
+    UIManager:scheduleIn(1, function() collectgarbage("collect") end)
     UIManager:setDirty(nil, function()
         return "ui", self.frame.dimen
     end)
@@ -1244,8 +1336,9 @@ end
 -- Two tiers: bookshelf's own footer corner buttons (start menu,
 -- micro-modules grid -- plain child Buttons of BookshelfWidget, not FM
 -- zones, so hit-tested against their already-stored dimens directly), then
--- any FileManager-registered system zone (brightness, KOReader menu,
--- third-party corner gestures, user-configured Gestures-plugin bindings).
+-- any system zone on the live host (brightness, KOReader menu, third-party
+-- corner gestures, user-configured Gestures-plugin bindings): FileManager,
+-- or the parked reader while a closed book is still parked.
 -- See docs/superpowers/specs/2026-07-02-book-detail-gesture-passthrough-design.md.
 function ReviewsModal:_tryPassthrough(ev)
     if self.bw and ev and ev.pos then
@@ -1258,8 +1351,7 @@ function ReviewsModal:_tryPassthrough(ev)
             return true
         end
     end
-    local fm = require("apps/filemanager/filemanager").instance
-    return fm ~= nil and GestureZones.tryFMZones(ev, fm)
+    return GestureZones.tryLiveZones(ev)
 end
 
 -- #171: any multiswipe closes, mirroring KOReader's fullscreen widgets where
@@ -1284,6 +1376,13 @@ end
 -- the last page, which is the wrong surprise.
 function ReviewsModal:_scroller(opts)
     local w = ScrollHtmlWidget:new(opts)
+    -- The same rail as every other scrollbar here (lib/bookshelf_snug_scroll):
+    -- a left rule the text area's full height and a grey thumb to the frame's
+    -- border, instead of the stock black box with a top and bottom of its own.
+    local ok_s, Snug = pcall(require, "lib/bookshelf_snug_scroll")
+    if ok_s and Snug and Snug._railPaint and w.v_scroll_bar then
+        w.v_scroll_bar.paintTo = Snug._railPaint
+    end
     local orig = w.onScrollText
     w.onScrollText = function(w_self, arg, ges)
         if ges and ges.direction == "south"
@@ -1383,7 +1482,7 @@ function ReviewsModal:_paintOpenFeedback()
 end
 
 function ReviewsModal:onClose()
-    self._dismissed = true  -- so a late async tab fill (setTabHtml) no-ops
+    self._dismissed = true  -- a live preview (the modal-tab font scale) checks it
     UIManager:close(self)
     -- Report the tab being viewed at dismiss time (once), so the caller can
     -- adopt that source. Independent of the Refresh-suppress flag.

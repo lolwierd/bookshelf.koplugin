@@ -48,6 +48,8 @@ package.loaded["lib/bookshelf_spine_widget"] = {
 -- proportion as a 264dpi Paperwhite, so the floor the tests assert against is
 -- the one the device computes.
 package.loaded["ui/size"] = { padding = { large = 21, small = 4, default = 14 } }
+package.loaded["lib/bookshelf_space"] = { padding = { large = 21, small = 4, default = 14 },
+    px = function(v) return math.ceil(v * 2) end }
 package.loaded["lib/bookshelf_folder_card"] = { SHADOW_OFFSET = 8 }
 package.loaded["lib/bookshelf_folder_stack"] = {
     new = function(_self, t) return t end,
@@ -166,6 +168,27 @@ t.test("a count switched off costs no folder walk", function()
     STORE["stack_count_badge_mode"] = "off"
     Group.countText(folder("/f", 200), nil)
     eq(walks, 0, "the recursive walk must not run for a count nobody asked for")
+end)
+
+t.test("a shelf of shelves' tile counts the books it brings (issue 527)", function()
+    reset()
+    STORE["stack_count_badge_mode"]   = "all"
+    STORE["stack_count_badge_format"] = "finished_total"
+    PROGRESS["/x/1.epub"] = { status = "finished" }
+    local tile = { kind = "folder", label = "Favs", subshelf_id = "s1",
+                   member_fps = { "/x/1.epub", "/x/2.epub", "/x/3.epub" } }
+    eq(Group.countText(tile, nil), "1 of 3 finished")
+    eq(walks, 0, "a sub-shelf tile has no path to walk")
+end)
+
+t.test("a sub-shelf tile follows the folder setting", function()
+    reset()
+    local tile = { kind = "folder", label = "Favs", subshelf_id = "s1",
+                   member_fps = { "/x/1.epub" } }
+    STORE["stack_count_badge_mode"] = "groups"
+    assert(Group.countText(tile, nil) == nil, "groups-only must leave it uncounted")
+    STORE["stack_count_badge_mode"] = "folders"
+    eq(Group.countText(tile, nil), "1 book")
 end)
 
 t.test("one book is not '1 books'", function()

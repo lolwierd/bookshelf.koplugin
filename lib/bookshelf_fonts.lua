@@ -94,22 +94,45 @@ function M.setUIFontFace(face)
     Settings.flush()
 end
 
+-- Defined further down, with the MuPDF file helpers.
+local facePath
+
+-- A derived sibling is only a guess at a file name, and many families have no
+-- such file (CJK fonts ship no italic). Font:getFace on a missing file logs an
+-- ERROR on every call before the caller falls back, so a font with no italic
+-- filled crash.log with one line per italic render. Check the disk instead,
+-- once per name: getFace is on the render path.
+local _sibling_on_disk = {}
+local function on_disk(name)
+    local hit = _sibling_on_disk[name]
+    if hit == nil then
+        hit = facePath(name) ~= nil
+        _sibling_on_disk[name] = hit
+    end
+    return hit
+end
+
 -- Derive the bold sibling of a regular font_face ("-Regular." -> "-Bold."),
--- mirroring KOReader's own bold-variant convention. nil if no substitution.
+-- mirroring KOReader's own bold-variant convention. nil if no substitution,
+-- or if no such file is installed.
 local function bold_sibling(face)
     local b, n = face:gsub("%-Regular%.", "-Bold.", 1)
-    if n > 0 then return b end
+    if n > 0 and on_disk(b) then return b end
     return nil
 end
 
 -- Derive the italic sibling: check bundled table first (explicit italic field),
--- then fall back to the "-Regular." -> "-Italic." name convention.
+-- then fall back to the "-Regular." -> "-Italic." name convention. nil if no
+-- such file is installed.
 local function italic_sibling(face)
     for _, b in pairs(M.BUNDLED) do
-        if b.regular == face and b.italic then return b.italic end
+        if b.regular == face and b.italic then
+            if on_disk(b.italic) then return b.italic end
+            return nil
+        end
     end
     local it, n = face:gsub("%-Regular%.", "-Italic.", 1)
-    if n > 0 then return it end
+    if n > 0 and on_disk(it) then return it end
     return nil
 end
 
@@ -289,6 +312,82 @@ function M:getFace(face_name, size, opts)
     return Font:getFace(face_name, size), opts.bold           -- unresolvable -> native (no crash)
 end
 
+-- ── The UI font as FILES, for MuPDF's HTML engine ────────────────────────
+--
+-- Issue 284: the book modal's description and reviews are HTML, rendered by
+-- MuPDF, which has its own font stack and never sees KOReader's named faces.
+-- Its "sans-serif" was a font of MuPDF's choosing, so the one long passage of
+-- text in the modal was in a different typeface from everything around it.
+-- MuPDF does load an @font-face that points at a file by absolute path (the
+-- modal's star glyphs already come in that way), so the UI font is handed
+-- over as files.
+--
+-- uiFontFiles() -> { regular = path, bold = path|nil, italic = path|nil }, or
+-- nil when the font cannot be found on disk. The Bookshelf UI font when one is
+-- chosen, else KOReader's own UI font (cfont), so the modal matches the rest
+-- of the screen in follow mode too. Memoised per face name.
+local _files_face, _files
+-- absolute(path) -> the path made absolute, or nil if it is not a file. MuPDF
+-- resolves a relative url against the document, not KOReader's working
+-- directory, and KOReader's own font paths are relative ("./fonts/noto/...").
+local function absolute(path)
+    if type(path) ~= "string" or lfs.attributes(path, "mode") ~= "file" then return nil end
+    if path:sub(1, 1) == "/" then return path end
+    local ok_u, ffiutil = pcall(require, "ffi/util")
+    local real = ok_u and ffiutil.realpath and ffiutil.realpath(path)
+    return (type(real) == "string" and real:sub(1, 1) == "/") and real or nil
+end
+facePath = function(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    if name:find("/", 1, true) then return absolute(name) end
+    local ok, FontList = pcall(require, "fontlist")
+    if not (ok and FontList) then return nil end
+    local bundled = FontList.fontdir and absolute(FontList.fontdir .. "/" .. name)
+    if bundled then return bundled end
+    -- The same search Font:getFace falls back to: any scanned font folder.
+    for _i, f in ipairs(FontList:getFontList() or {}) do
+        if f:sub(-#name - 1) == "/" .. name then return absolute(f) end
+    end
+    return nil
+end
+
+function M.uiFontFiles()
+    local face = M.getUIFontFace() or (Font.fontmap and Font.fontmap.cfont)
+    if face == _files_face then return _files end
+    _files_face, _files = face, nil
+    local regular = facePath(face)
+    if not regular then return nil end
+    -- variantOf matches by file name against FontList's own paths, which are
+    -- relative, hence absolute() on what it finds.
+    local bold = absolute(M.variantOf(face, true, false) or "")
+    local sib = not bold and bold_sibling(face)
+    if sib then bold = facePath(sib) end
+    local italic = absolute(M.variantOf(face, false, true) or "")
+    sib = not italic and italic_sibling(face)
+    if sib then italic = facePath(sib) end
+    _files = { regular = regular, bold = bold, italic = italic }
+    return _files
+end
+
+-- uiFontCss(family) -> @font-face rules naming the UI font `family`, or "".
+-- Descriptors for weight and style, so <b> and <i> pick the real files rather
+-- than MuPDF synthesising them.
+function M.uiFontCss(family)
+    local f = M.uiFontFiles()
+    if not f then return "" end
+    local function q(path) return (path:gsub('"', '\\"')) end
+    local out = { string.format('@font-face { font-family: "%s"; src: url("%s"); }', family, q(f.regular)) }
+    if f.bold then
+        out[#out + 1] = string.format(
+            '@font-face { font-family: "%s"; font-weight: bold; src: url("%s"); }', family, q(f.bold))
+    end
+    if f.italic then
+        out[#out + 1] = string.format(
+            '@font-face { font-family: "%s"; font-style: italic; src: url("%s"); }', family, q(f.italic))
+    end
+    return table.concat(out, "\n") .. "\n"
+end
+
 -- Writable, KOReader-scanned user font dir per platform.
 local function user_font_dir()
     local ok_dev, Device = pcall(require, "device")
@@ -360,6 +459,11 @@ function M.maybeSeedFreshInstall()
         -- installs only -- existing users keep their placement (unset -> "hero"
         -- via Store.microPlacement, the prior behaviour).
         Settings.save("micro_modules_placement", "fullscreen")
+        -- Series numbers only inside a series (drilled series stack or a
+        -- single-series shelf): on mixed shelves the "#N" badges in every
+        -- corner read as noise. New installs only -- existing users keep
+        -- theirs (unset -> "always").
+        Settings.save("show_series_num", "in_series")
         local ok, Regions = pcall(require, "lib/bookshelf_hero_regions")
         if ok and Regions and Regions.applyFreshInstallDefaults then
             Regions.applyFreshInstallDefaults()
@@ -423,6 +527,34 @@ function M.resolveFontNameToFile(name)
     end
     _font_name_cache[name] = result or false
     return result
+end
+
+-- displayName(path) -> a font as people know it: the family name from the
+-- font itself ("Roboto Condensed"), as KOReader's own font menu shows it, not
+-- the file name ("RobotoCondensed-Regular", user test). The bold/italic
+-- variant is said too, since the family alone would name the regular face.
+-- Falls back to the file name, without its folder and extension.
+function M.displayName(path)
+    local base = tostring(path):gsub("^.*/", ""):gsub("%.%w+$", "")
+    local ok, FontList = pcall(require, "fontlist")
+    if not (ok and FontList) then return base end
+    if not FontList.fontinfo then pcall(FontList.getFontList, FontList) end
+    local info = FontList.fontinfo and FontList.fontinfo[path]
+    if not info and FontList.fontinfo then
+        -- The setting holds the name Font:getFace takes, which is not always
+        -- the full path FontList keys on: match the file name instead.
+        local file = "/" .. tostring(path):gsub("^.*/", "")
+        for f, arr in pairs(FontList.fontinfo) do
+            if f:sub(-#file) == file then info = arr; break end
+        end
+    end
+    local i1 = info and info[1]
+    if not (i1 and type(i1.name) == "string" and i1.name ~= "") then return base end
+    local _ = require("lib/bookshelf_i18n").gettext
+    if i1.bold and i1.italic then return i1.name .. " " .. _("Bold Italic") end
+    if i1.bold then return i1.name .. " " .. _("Bold") end
+    if i1.italic then return i1.name .. " " .. _("Italic") end
+    return i1.name
 end
 
 return M

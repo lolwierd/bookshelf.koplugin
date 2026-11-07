@@ -103,8 +103,22 @@ function SeriesStack:init()
     -- as shelf_row does for a book. Without this the card kept the capped
     -- height and the cover stretched to fill it -- tall and narrow on device.
     local card_y = 0
+    -- Custom stack image (#70 extension), resolved here rather than where it
+    -- is drawn (below) because it decides the card's shape as well.
+    local custom_image_path
+    if want_art and stack_kind and stack_name ~= "" then
+        custom_image_path = ImageSource.resolveStackImage(stack_kind, stack_name)
+    end
     if BookshelfSettings.isTrue("true_cover_aspect") and not show_cardboard then
-        local _front = front
+        -- A stack with its own image takes that image's shape rather than its
+        -- front book's, as a folder does (issue 402).
+        -- An author's photo is the exception: it is cropped to a book
+        -- cover's 2:3 (no size tag), so every author card is one shape.
+        local tag = custom_image_path and stack_kind ~= "author"
+                    and ImageSource.imageSizeTag
+                    and ImageSource.imageSizeTag(custom_image_path)
+        local _front = (custom_image_path and stack_kind == "author") and {}
+                       or (tag and { cover_sizetag = tag }) or front
         if _front then
             art_h = SpineWidget.trueAspectBoxHeight(art_w, _front, art_h)
         end
@@ -128,10 +142,6 @@ function SeriesStack:init()
     -- cardboard overlay. The cover_bb is owned by ImageSource's
     -- cache; pass cover_bb_disposable=false so SpineWidget doesn't
     -- free it on teardown.
-    local custom_image_path
-    if want_art and stack_kind and stack_name ~= "" then
-        custom_image_path = ImageSource.resolveStackImage(stack_kind, stack_name)
-    end
 
     -- Built up front so cover_floor -- the slot-local y where the cardboard
     -- body begins -- is known before the representative cover renders.
@@ -162,7 +172,16 @@ function SeriesStack:init()
     if custom_image_path then
         local slot_w = self.width - FolderCard.SHADOW_OFFSET
         local slot_h = self.height - FolderCard.SHADOW_OFFSET
-        local bb = ImageSource.loadImage(custom_image_path, slot_w, slot_h)
+        local bb
+        if stack_kind == "author" then
+            -- An author's photo is cropped to the card, a book cover's
+            -- shape (ImageSource.loadImageCover), built at the card's box so
+            -- the card does not stretch it again.
+            bb = ImageSource.loadImageCover(custom_image_path,
+                art_w - FolderCard.SHADOW_OFFSET, art_h - FolderCard.SHADOW_OFFSET)
+        else
+            bb = ImageSource.loadImage(custom_image_path, slot_w, slot_h)
+        end
         if bb then
             book_widget = SpineWidget:new{
                 force_shadow     = (display_mode == StackDisplay.STACK) or nil,

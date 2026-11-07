@@ -28,11 +28,13 @@
 -- double-border rather than a seamless join — still readable.
 
 local FrameContainer = require("ui/widget/container/framecontainer")
+local Gestures = require("lib/bookshelf_gestures")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local HorizontalGroup= require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
-local TextWidget     = require("ui/widget/textwidget")
+local TextWidget     = require("lib/bookshelf_colour_text")
+local CapCentre = require("lib/bookshelf_cap_centre")
 local CenterContainer= require("ui/widget/container/centercontainer")
 local OverlapGroup   = require("ui/widget/overlapgroup")
 local Widget         = require("ui/widget/widget")
@@ -49,6 +51,7 @@ local TextSegments   = require("lib/bookshelf_text_segments")
 local Pages          = require("lib/bookshelf_chip_pages")
 local PageWipe       = require("lib/bookshelf_page_wipe")
 local BandMetrics    = require("lib/bookshelf_band_metrics")
+local Space          = require("lib/bookshelf_space")
 
 -- Tab-bar font size scale (percent). 100 = built-in baseline; nudge dialog
 -- accepts 50-300.
@@ -147,9 +150,22 @@ end
 
 local function _chipThemeFlips() return _memoised("theme_flips", _chipThemeFlipsRaw) end
 
+-- _panelChipInk() -> Colors > Panel text (or the text a panel colour
+-- brings) when the shelf menu has no bar, so its labels stand on the panel;
+-- nil with the bar, whose own colour (Shelf menu background) they stand on.
+local function _panelChipInk()
+    local ok_tp, TP = pcall(require, "lib/bookshelf_theme_pack")
+    if not (ok_tp and TP and TP.partRead) then return nil end
+    if TP.partRead("chip_bar_transparent") ~= true then return nil end
+    local ok, CP = pcall(require, "lib/bookshelf_cover_progress")
+    return ok and CP and CP.panelInk and CP.panelInk() or nil
+end
+
 local function _chipInkRaw()
     local ok, CP = pcall(require, "lib/bookshelf_cover_progress")
     if not (ok and CP and CP.theme and CP.ink) then return Blitbuffer.COLOR_BLACK end
+    local panel = _panelChipInk()
+    if panel then return panel end
     local ok_t, dark, inverting = pcall(CP.theme)
     if not ok_t then return Blitbuffer.COLOR_BLACK end
     if (dark and true or false) == (inverting and true or false) then
@@ -160,9 +176,68 @@ end
 
 local function _chipInk() return _memoised("chip_ink", _chipInkRaw) end
 
-local function _buildLabelContent(label, size, max_w, ink)
+-- ── SVG/PNG icons in a label (GitHub issue 469) ────────────────────────────
+-- "[icon=NAME]" (TextSegments) draws KOReader's icon of that name -- the
+-- reader's own koreader/icons folder first, as IconWidget looks -- a square
+-- the height of the label's text. Black line art takes the label's ink, so it
+-- reads as the text does on every chip (the selected chip's inversion, a
+-- custom chip colour, a dark shelf); a coloured icon keeps its colours, in
+-- the selected chip and in night mode alike (maintainer: never invert a
+-- coloured SVG's colours). A name with no file draws nothing.
+local _side_memo = {}
+local function _iconSide(size)
+    if _side_memo[size] then return _side_memo[size] end
+    local f, b = BFont:getFace("infofont", size, { bold = true })
+    local tw = TextWidget:new{ text = "M", face = f, bold = b }
+    local h = tw:getSize().h
+    tw:free()
+    local side = math.max(8, math.floor(h * 0.9))
+    _side_memo[size] = side
+    return side
+end
+
+-- inverted: the chip paints this and then inverts its own rect (the default
+-- selected chip, InvertedFrame), so a coloured icon is pre-inverted to come
+-- out as drawn.
+local function _imageSegment(name, size, ink, inverted)
+    local side = _iconSide(size)
+    local IconWidget = require("ui/widget/iconwidget")
+    local ok, icon = pcall(function()
+        return IconWidget:new{ icon = name, width = side, height = side, alpha = true }
+    end)
+    if not ok or type(icon) ~= "table" or type(icon.file) ~= "string"
+            or (icon.file:find("notice%-warning") and name ~= "notice-warning") then
+        return HorizontalSpan:new{ width = 0 }
+    end
+    local ok_w, Wallpaper = pcall(require, "lib/bookshelf_wallpaper")
+    if not ok_w then return icon end
+    if Wallpaper.iconHasColour and Wallpaper.iconHasColour(icon) then
+        -- The panel inverts in night mode as the chip does when selected;
+        -- once each, or not at all, and the colours land as drawn.
+        local night = Screen.night_mode and true or false
+        if (inverted and true or false) ~= night then
+            pcall(function()
+                if not icon._bb then icon:_render() end
+                local copy = icon._bb:copy()
+                copy:invertRect(0, 0, copy:getWidth(), copy:getHeight())
+                if icon._bb_disposable then icon._bb:free() end
+                icon._bb = copy
+                icon._bb_disposable = true
+            end)
+        end
+        return icon
+    end
+    -- Line art in black ink is already the label's colour (the selected chip
+    -- inverts it with the text); any other ink tints it.
+    if ink and ink ~= Blitbuffer.COLOR_BLACK and Wallpaper.mask then
+        return Wallpaper.mask(true, icon, ink)
+    end
+    return icon
+end
+
+local function _buildLabelContent(label, size, max_w, ink, inverted, own_case, face)
     ink = ink or _chipInk()
-    local segments = TextSegments.labelSegments(_chipCase(label))
+    local segments = TextSegments.labelSegments(own_case and label or _chipCase(label))
     if #segments == 0 then
         local empty_face, empty_bold = BFont:getFace("infofont", size)
         return TextWidget:new{
@@ -172,20 +247,26 @@ local function _buildLabelContent(label, size, max_w, ink)
             fgcolor = ink,
         }
     end
+    if #segments == 1 and segments[1].class == "image" then
+        return _imageSegment(segments[1].name, size, ink, inverted)
+    end
     if #segments == 1 then
         local one_face, one_bold
         if segments[1].class == "text" then
-            one_face, one_bold = BFont:getFace("infofont", size, { bold = true })
+            if face then one_face = face else one_face, one_bold = BFont:getFace("infofont", size, { bold = true }) end
         else
             one_face, one_bold = _iconFace(size)
         end
-        return TextWidget:new{
+        local one = TextWidget:new{
             text      = segments[1].text,
             face      = one_face,
             bold      = one_bold,
             fgcolor   = ink,
             max_width = _maxWidthOrNil(max_w),
         }
+        -- Capitals centred, not the line box (lib/bookshelf_cap_centre).
+        if segments[1].class == "text" then CapCentre.centre(one) end
+        return one
     end
     -- Mixed: HorizontalGroup. Icons (class != "text") render at their
     -- natural width — truncating mid-glyph reads badly. Text segments
@@ -197,7 +278,9 @@ local function _buildLabelContent(label, size, max_w, ink)
     -- inter-segment spacing have claimed their natural widths.
     local icon_w = 0
     for _i, seg in ipairs(segments) do
-        if seg.class ~= "text" then
+        if seg.class == "image" then
+            icon_w = icon_w + _iconSide(size)
+        elseif seg.class ~= "text" then
             local iw_face, iw_bold = _iconFace(size)
             local tw = TextWidget:new{
                 text = seg.text,
@@ -208,16 +291,21 @@ local function _buildLabelContent(label, size, max_w, ink)
             tw:free()
         end
     end
-    local text_budget = math.max(0, max_w - icon_w)
+    -- No max_w (the breadcrumb pill): no limit; arithmetic on nil crashed
+    -- KOReader opening a folder on an icon-named shelf (PW5).
+    local text_budget = max_w and math.max(0, max_w - icon_w)
     local hg = HorizontalGroup:new{ align = "center" }
     for _i, seg in ipairs(segments) do
         local is_text = (seg.class == "text")
         local seg_face, seg_bold
         if is_text then
-            seg_face, seg_bold = BFont:getFace("infofont", size, { bold = true })
+            if face then seg_face = face else seg_face, seg_bold = BFont:getFace("infofont", size, { bold = true }) end
         else
             seg_face, seg_bold = _iconFace(size)
         end
+        if seg.class == "image" then
+            hg[#hg + 1] = _imageSegment(seg.name, size, ink, inverted)
+        else
         hg[#hg + 1] = TextWidget:new{
             text      = seg.text,
             face      = seg_face,
@@ -225,6 +313,8 @@ local function _buildLabelContent(label, size, max_w, ink)
             fgcolor   = ink,
             max_width = is_text and _maxWidthOrNil(text_budget) or nil,
         }
+        if is_text then CapCentre.centre(hg[#hg]) end
+        end
     end
     return hg
 end
@@ -237,6 +327,10 @@ local function _measureLabel(label, size)
     local segments = TextSegments.labelSegments(_chipCase(label))
     for _i, seg in ipairs(segments) do
         local m_face, m_bold
+        if seg.class == "image" then
+            total = total + _iconSide(size)
+            goto continue
+        end
         if seg.class == "text" then
             m_face, m_bold = BFont:getFace("infofont", size, { bold = true })
         else
@@ -249,6 +343,7 @@ local function _measureLabel(label, size)
         }
         total = total + tw:getSize().w
         tw:free()
+        ::continue::
     end
     return total
 end
@@ -288,14 +383,15 @@ local function _modeSuffix()
 end
 
 local function _readBarColor(base_key)
-    local suffix = _modeSuffix()
-    if suffix ~= "" then
-        -- Night overrides do NOT inherit the day value (same reasoning as
-        -- _readModeColor in bookshelf_cover_progress): inheriting a day colour
-        -- into night showed the inverted day appearance, not the night theme.
-        return BookshelfSettings.read(base_key .. suffix)
-    end
-    return BookshelfSettings.read(base_key)
+    -- As everywhere else the shelf paints (bookshelf_theme_pack.colour: the
+    -- defaults on Plain, the theme's colours, the reader's edit or own).
+    -- Night overrides do NOT inherit the day value (same reasoning as
+    -- _readModeColor in bookshelf_cover_progress): inheriting a day colour
+    -- into night showed the inverted day appearance, not the night theme.
+    local k = base_key .. _modeSuffix()
+    local ok_t, TP = pcall(require, "lib/bookshelf_theme_pack")
+    if ok_t and TP and TP.colour then return TP.colour(k) end
+    return BookshelfSettings.read(k)
 end
 
 -- Returns fill, ink (Blitbuffer colours) or nil when the chip should invert.
@@ -317,6 +413,21 @@ local function _separatorOnFill(fill)
     local lum = ok and c8 and c8.a or nil
     if type(lum) ~= "number" then return Blitbuffer.COLOR_WHITE end
     return lum < 128 and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+end
+
+-- _lineOnFill(fill, ink) -> the line between two chips of a custom fill: the
+-- bar's own line colour (ink) where it shows against the fill, so it
+-- matches the bar's other borders; else whichever of white or black does
+-- (_separatorOnFill). A mid-dark grey fill (Sewing Room on a PW5) took a
+-- white line beside Home while every other border was black (maintainer).
+local function _lineOnFill(fill, ink)
+    local function lum(c)
+        local ok, c8 = pcall(function() return c:getColor8() end)
+        return ok and c8 and type(c8.a) == "number" and c8.a or nil
+    end
+    local lf, li = lum(fill), lum(ink)
+    if lf and li and math.abs(lf - li) >= 64 then return ink end
+    return _separatorOnFill(fill)
 end
 
 -- _stripGround() -> the strip's own fill, for a rule that has to merge into
@@ -363,8 +474,11 @@ local function _selectedChipColors()
     -- A fill with no ink set (or vice versa) still needs a readable pair, so
     -- fall back to the inverted-default equivalents: white text on the fill,
     -- black text on the default (white) background.
-    local fill = raw_bg and Color.parseColorValue(raw_bg, is_color) or nil
-    local ink  = raw_fg and Color.parseColorValue(raw_fg, is_color) or nil
+    -- resolvePicked, not a bare parse: a stored pick needs the palette's
+    -- frame correction, or a pinned shelf theme shows it as its opposite.
+    local CP = require("lib/bookshelf_cover_progress")
+    local fill = raw_bg and CP.resolvePicked(raw_bg) or nil
+    local ink  = raw_fg and CP.resolvePicked(raw_fg) or nil
     if fill and not ink then ink = Blitbuffer.COLOR_WHITE end
     if ink and not fill then fill = Blitbuffer.COLOR_BLACK end
     if not fill or not ink then return nil end
@@ -389,6 +503,16 @@ end
 local function _activeChipColors()
     local fill, ink = _selectedChipColors()
     if type(fill) ~= "nil" then return fill, ink end
+    -- No bar, on a coloured panel: the panel's ink as fill, lettered in the
+    -- panel's colour (the bar's colour was black on black over a pale one).
+    local panel_ink = _panelChipInk()
+    if type(panel_ink) ~= "nil" then
+        local ok, CP = pcall(require, "lib/bookshelf_cover_progress")
+        local ok_c, colors = pcall(function() return CP.resolvedColors() end)
+        if ok and ok_c and colors and type(colors.panel_tint) ~= "nil" then
+            return panel_ink, colors.panel_tint
+        end
+    end
     if not _chipThemeFlips() then return nil end
     local ok, CP = pcall(require, "lib/bookshelf_cover_progress")
     if not (ok and CP and CP.resolvedColors) then return nil end
@@ -402,6 +526,10 @@ local ChipBar = InputContainer:extend{
     has_wallpaper = false,
     -- Paint an opaque ground behind the strip? See ChipBar:paintTo.
     solid_ground = false,
+    -- Is anything painted behind the shelf at all (a wallpaper, a page
+    -- colour, the top panel's tint)? The FACT, where has_wallpaper is the
+    -- reader's choice of transparent buttons. See flashPending.
+    painted_ground = false,
     chips             = nil,   -- list of { key, label } (chips mode)
     active            = nil,   -- key of the currently-selected chip
     selected_key      = nil,   -- the active chip key for pagination; defaults to self.active
@@ -680,13 +808,13 @@ local function arrowPillFrame(label, h, chained, glyph)
             fgcolor = Blitbuffer.COLOR_BLACK,
         }
         local lbl_face, lbl_bold = BFont:getFace("infofont", _scaled(16), { bold = true })
-        local text_tw = TextWidget:new{
+        local text_tw = CapCentre.centre(TextWidget:new{
             text    = _chipCase(label),
             face    = lbl_face,
             bold    = lbl_bold,
             fgcolor = Blitbuffer.COLOR_BLACK,
-        }
-        local gap = Size.padding.default
+        })
+        local gap = Space.padding.default
         content_widget = HorizontalGroup:new{
             align = "center",
             icon_tw,
@@ -704,18 +832,24 @@ local function arrowPillFrame(label, h, chained, glyph)
             label_text = _chipCase(label)
             face, bold = BFont:getFace("infofont", _scaled(16), { bold = true })
         end
+        if not glyph and label_text:find("[icon=", 1, true) then
+            -- A shelf label with an SVG/PNG icon in it (issue 469).
+            content_widget = _buildLabelContent(label, _scaled(16), nil, Blitbuffer.COLOR_BLACK)
+        else
         content_widget = TextWidget:new{
             text    = label_text,
             face    = face,
             bold    = bold,
             fgcolor = Blitbuffer.COLOR_BLACK,
         }
+        if not glyph then CapCentre.centre(content_widget) end
+        end
         content_w = content_widget:getSize().w
         content_h = content_widget:getSize().h
     end
     local text_w = content_w  -- keep historical names so the layout maths below stay readable
     local text_h = content_h
-    local h_pad  = Size.padding.large
+    local h_pad  = Space.padding.large
     local tip_w  = math.floor(h * 0.4)
     -- For chained pills the body has a TRIANGULAR NOTCH carved into
     -- its LEFT side (matching the previous pill's tip shape) AND extra
@@ -829,8 +963,9 @@ end
 -- chrome_bg is 0xFF in both modes and night inverts the frame, so this is a
 -- white bar by day and a black one at night, with no branch here.
 --
--- Skipped entirely at Transparent, which means "let the picture through": a
--- solid bar is exactly what that reader asked not to have.
+-- Skipped when Shelf menu background is Transparent (solid_ground false),
+-- which means "let the picture through": a solid bar is exactly what that
+-- reader asked not to have. Panel shading no longer decides it.
 -- Shared with the page wipe, which composes into its OWN buffer and paints
 -- self[1] directly rather than going through paintTo -- so a ground that
 -- lived only in paintTo vanished for the length of every swipe.
@@ -846,8 +981,10 @@ function ChipBar:_paintGround(bb, x, y, w, h)
     if not (ok and CoverProgress and CoverProgress.resolvedColors) then return false end
     local ok_c, colors = pcall(CoverProgress.resolvedColors)
     if not (ok_c and colors and colors.chrome_bg) then return false end
+    -- Color.paintRect, not bb:paintRect: a picked Shelf menu background is a
+    -- colour, and paintRect would flatten it to its grey.
     return pcall(function()
-        bb:paintRect(x, y, w or 0, h or 0, colors.chrome_bg)
+        require("lib/bookshelf_color").paintRect(bb, x, y, w or 0, h or 0, colors.chrome_bg)
     end)
 end
 
@@ -895,7 +1032,7 @@ local CHEVRON_NEXT = "\xEF\x81\x94"
 -- Measure the natural pixel width of a flex chip (no max_width constraint).
 -- Used both for pagination planning and proportional flex allocation.
 local function measureNatural(chip, height, scaled_fn)
-    local pad = Size.padding.large
+    local pad = Space.padding.large
     if chip.nerd_glyph then
         local ng_face, ng_bold = _iconFace(scaled_fn(18))
         local tw = TextWidget:new{
@@ -917,14 +1054,6 @@ function ChipBar:_initChips()
     self._chip_dimens = {}
 
     local paper       = Blitbuffer.COLOR_WHITE
-    -- With a wallpaper behind the strip, an inactive chip's white fill reads
-    -- as a card floating over the image; its border already separates it from
-    -- whatever is behind. The ACTIVE chip keeps a real fill: its selected look
-    -- is an INVERSION of the frame, so it needs an opaque ground to invert --
-    -- inverting the wallpaper instead would give a negative-photo chip. A chip
-    -- with a custom colour keeps that colour for the same reason.
-    local chip_paper = paper
-    if self.has_wallpaper then chip_paper = nil end
     local LineWidget  = require("ui/widget/linewidget")
     local separator_w = Size.border.thin
 
@@ -1167,7 +1296,11 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
         return c.key == self.active
     end
 
-    local row = HorizontalGroup:new{}
+    -- Left to right whatever the language. KOReader reverses a HorizontalGroup
+    -- in a right-to-left UI (Arabic), but a tap is matched to a chip by the
+    -- offsets recorded below, and so are the pending flash, the roof and the
+    -- focus ring: mirrored, a tap opened the chip across the bar (issue 559).
+    local row = HorizontalGroup:new{ allow_mirroring = false }
     self._chip_dimens = {}
 
     -- A chip that draws an outline of its own. Its neighbours need to know:
@@ -1209,7 +1342,9 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
             -- way round the two are painted.
             local function _touchesTap(c)
                 if not c then return false end
-                return c.key == self._pending_key or c.key == self.focused_key
+                -- Only the loading ring: the key focus is a ring set inside
+                -- the chip, clear of the column.
+                return c.key == self._pending_key
             end
             local sep_color
             if _touchesTap(render_chips[i - 1]) or _touchesTap(chip) then
@@ -1238,7 +1373,7 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
                 -- solve exactly that, one per kind of fill.
                 local custom = _selectedChipColors()
                 sep_color = (type(custom) ~= "nil")
-                            and _separatorOnFill(custom)
+                            and _lineOnFill(custom, _stripInk())
                             or  _stripGround()
             elseif prev_filled or cur_filled then
                 sep_color = _stripGround()
@@ -1257,10 +1392,13 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
         -- Custom colour (#294) only applies to the SELECTED state -- that is
         -- the black fill the request is about; unselected chips already render
         -- as plain black-on-paper and need no colour work.
-        local is_cursor_pre = (self.focused_key == chip.key)
-        local want_custom = is_active and not is_cursor_pre
+        -- The keys' cursor is a ring inside the chip (below), drawn over its
+        -- look: the selected chip keeps its fill under it. It used to clear
+        -- that fill and draw the thick loading ring, so the selected chip
+        -- went white under the cursor (maintainer).
+        local has_focus = (self.focused_key == chip.key)
         local fill_c, ink_c
-        if want_custom then fill_c, ink_c = _activeChipColors() end
+        if is_active then fill_c, ink_c = _activeChipColors() end
         -- Plain boolean, NOT `fill_c == nil`: Blitbuffer colours are ffi cdata
         -- with an __eq metamethod, and comparing one to nil routes through it
         -- and crashes indexing the nil operand (same trap bookshelf_color's
@@ -1292,10 +1430,11 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
             cell_content = _buildLabelContent(
                 chip.label or "",
                 _scaled(16),
-                w - 2 * Size.padding.small,
-                ink)
+                w - 2 * Space.padding.small,
+                ink,
+                -- The default selected chip inverts itself (InvertedFrame below).
+                is_active and not has_custom)
         end
-        local is_cursor = is_cursor_pre
         -- An action chip that points at the hero (currently reading, micro
         -- modules) is a BUTTON, and the breadcrumb layout draws that same
         -- button inside a frame of its own. Here it had none: on a
@@ -1332,8 +1471,8 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
                 w       = w,
                 h       = self.height,
                 fill    = has_custom and fill_c
-                          or ((is_active and not is_cursor) and paper or chip_paper),
-                invert  = is_active and not is_cursor and not has_custom,
+                          or (is_active and paper or nil),
+                invert  = is_active and not has_custom,
                 border  = has_custom and Blitbuffer.COLOR_BLACK or _stripInk(),
                 -- Top and bottom always touch the strip's edge; left only for
                 -- the first chip and right only for the last. Anywhere else a
@@ -1367,14 +1506,23 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
             chip_body = InvertedFrame:new{
                 -- A custom colour is painted for real, so the inversion that
                 -- normally produces the selected look must be off for this chip.
-                _invert    = is_active and not is_cursor and not has_custom,
+                _invert    = is_active and not has_custom,
                 bordersize = 0,
                 margin     = 0,
                 padding    = 0,
-                -- paper (opaque) for the active chip, which inverts; chip_paper
-                -- (nothing, under a wallpaper) for the rest.
+                -- An inactive chip has no fill: the strip's ground shows
+                -- through, a wallpaper included. The ACTIVE chip keeps a real
+                -- one: its selected look is an INVERSION of the frame, so it
+                -- needs an opaque ground to invert -- inverting the wallpaper
+                -- would give a negative-photo chip. A custom colour is kept
+                -- for the same reason.
+                --
+                -- (a99989f meant inactive chips to stay white off a wallpaper,
+                -- through a local of _initChips; the split into _buildChipRow
+                -- in 95e7496 left it out of scope, so since v5.1.2 they have
+                -- had no fill everywhere, and later work was tuned to that.)
                 background = has_custom and fill_c
-                             or ((is_active and not is_cursor) and paper or chip_paper),
+                             or (is_active and paper or nil),
                 CenterContainer:new{
                     dimen = Geom:new{ w = w, h = self.height },
                     cell_content,
@@ -1382,7 +1530,31 @@ function ChipBar:_buildChipRow(flex_indices, flex_naturals, action_w, separator_
             }
         end
         local chip_slot = chip_body
-        if is_pending or is_cursor then
+        if has_focus and not is_pending then
+            local Kit = require("lib/bookshelf_popup_kit")
+            local Color = require("lib/bookshelf_color")
+            local inset = Size.border.thin + Space.px(3)
+            -- In the chip's own text colour, which always stands out on its
+            -- fill: a coloured selected chip's ink, the inverse of the
+            -- strip's ink on the default selected chip (it inverts itself),
+            -- else the strip's ink. Inverting what is under the ring gave a
+            -- green ring on a purple chip (rig, Macabre).
+            local ring_c
+            if is_active and has_custom then ring_c = ink_c
+            elseif is_active then ring_c = ink:invert()
+            else ring_c = ink end
+            local ring = Widget:new{ dimen = Geom:new{ w = w, h = self.height } }
+            function ring:paintTo(bb, x, y)
+                -- As the book popup's tabs (STYLE.md): set in, rounded.
+                Color.paintBorder(bb, x + inset, y + inset, w - 2 * inset, self.dimen.h - 2 * inset,
+                    Kit.focusWidth(), ring_c, Space.px(4))
+            end
+            chip_slot = OverlapGroup:new{
+                dimen = Geom:new{ w = w, h = self.height },
+                chip_body,
+                ring,
+            }
+        elseif is_pending then
             local pb = Size.border.thick
             local rb = Size.border.thin
             -- The "we heard you" ring while a chip loads. It has to be seen,
@@ -1704,11 +1876,13 @@ function ChipBar:_initBreadcrumb()
             face    = face_text,
             bold    = face_text_bold,
             -- Themed, now this sits on the panel rather than on a white bar:
-            -- hard black would vanish on a dark shelf.
+            -- hard black would vanish on a dark shelf. The panel's ink first
+            -- (Panel text, or what a panel colour brings), as the footer's:
+            -- the page's was black on a dark panel (PW5, Sewing Room).
             fgcolor = (function()
                 local ok, CP = pcall(require, "lib/bookshelf_cover_progress")
                 if ok and CP and CP.ink then
-                    local c = CP.ink()
+                    local c = (CP.panelInk and CP.panelInk()) or _panelChipInk() or CP.ink()
                     if c then return c end
                 end
                 return Blitbuffer.COLOR_BLACK
@@ -1727,7 +1901,10 @@ function ChipBar:_initBreadcrumb()
         -- crumb is NOT in it -- it is the name of where you are, not another
         -- control, and the maintainer asked for it to sit on the shelf the
         -- way the status line does rather than on a slab of its own.
-        local band   = HorizontalGroup:new{}
+        -- Not mirrored in a right-to-left UI, as the chips row (issue 559):
+        -- the zones are left-to-right offsets, and each pill's tip overhangs
+        -- the pill to its right.
+        local band   = HorizontalGroup:new{ allow_mirroring = false }
         local row    = band
         local zones  = {}
         local cursor = 0
@@ -1753,13 +1930,13 @@ function ChipBar:_initBreadcrumb()
             cursor = cursor + cp.width
         end
         local band_w = cursor             -- where the trail ends
-        local outer = HorizontalGroup:new{ band }
+        local outer = HorizontalGroup:new{ allow_mirroring = false, band }
         if deepest_widget then
             -- Plain text for the active folder. Gap = tip_w + large
             -- inset so the text sits well clear of the last pill's
             -- tip apex, mirroring the breathing room a chained pill
             -- gives its own text via the extra-tip_w left padding.
-            local gap_w = pill_tip_w + Size.padding.large
+            local gap_w = pill_tip_w + Space.padding.large
             outer[#outer + 1] = HorizontalSpan:new{ width = gap_w }
             cursor = cursor + gap_w
             outer[#outer + 1] = deepest_widget
@@ -1767,7 +1944,8 @@ function ChipBar:_initBreadcrumb()
             -- behaviour left it inert (depth = #path was a no-op for
             -- _drillBackTo), but search mode now uses this as a second
             -- "edit query" affordance alongside the chip pill.
-            zones[#zones + 1] = { x = cursor, w = deepest_w, depth = n }
+            -- plain: text with no pill of its own (the ring goes round it).
+            zones[#zones + 1] = { x = cursor, w = deepest_w, depth = n, plain = true }
             cursor = cursor + deepest_w
         end
         -- the band's width, so paintTo can keep its ground off the crumb
@@ -1802,20 +1980,27 @@ function ChipBar:_initBreadcrumb()
         first_visible = first_visible + 1
     end
 
-    -- D-pad focus ring: overlay a thick border on the focused zone.
-    -- The ring is a transparent-interior FrameContainer placed via
-    -- overlap_offset so it doesn't alter layout dimensions.
+    -- D-pad focus ring over the focused zone, placed via overlap_offset so
+    -- it doesn't alter layout dimensions.
     if self.focused_depth ~= nil then
         for _i, z in ipairs(zones) do
             if z.depth == self.focused_depth then
-                local pb = Size.border.thick
-                local ring = FrameContainer:new{
-                    bordersize = pb,
-                    color      = Blitbuffer.COLOR_BLACK,
-                    margin     = 0, padding = 0,
-                    Widget:new{ dimen = Geom:new{ w = z.w - 2*pb, h = band_h - 2*pb } },
-                }
-                ring.overlap_offset = { z.x, 0 }
+                -- As the chips' (STYLE.md): a rounded ring set in from the
+                -- crumb, not a thick square box (black on a dark strip too).
+                -- It inverts what is under it: the crumbs are black or pale.
+                local Kit = require("lib/bookshelf_popup_kit")
+                local inset = Size.border.thin + Space.px(3)
+                -- A pill: inside its edges. Plain text (the deepest crumb,
+                -- a search's words): round it, room either side; set in, a
+                -- short word left no room and the ring covered it (rig).
+                local dx = z.plain and -Space.px(8) or inset
+                local zw = z.w - 2 * dx
+                local ring = Widget:new{ dimen = Geom:new{ w = zw, h = band_h } }
+                function ring:paintTo(bb, x, y)
+                    Kit.invertRing(bb, x, y + inset, zw, band_h - 2 * inset,
+                        Kit.focusWidth(), Space.px(4))
+                end
+                ring.overlap_offset = { z.x + dx, 0 }
                 row = OverlapGroup:new{
                     dimen = Geom:new{ w = self.width, h = band_h },
                     row, ring,
@@ -1876,7 +2061,24 @@ function ChipBar:flashPending(key)
     -- The roof does not need it anyway: it appears when the chip's selected
     -- state changes, which is the rebuild's business, not this flash's.
     local b = Size.border.thin
-    UIManager:setDirty(self.show_parent, "fast", Geom:new{
+    -- "fast" is A2: two tones, nothing in between. Over plain paper that is
+    -- the point -- the ring is pure black -- but over a wallpaper, a page
+    -- colour or the panel's tint, the chip's own interior is in the refreshed
+    -- rect too, and A2 snaps its greys to black and white until the rebuild
+    -- repaints them (maintainer: "with wallpaper, taps on the shelf bar does
+    -- a flash glitch ... inside the border flashes"). The framebuffer is
+    -- right the whole time; it is the waveform. So A2 only where the strip
+    -- behind the chip is plain black or white, "ui" (greys kept) otherwise.
+    local mode = "fast"
+    if self.painted_ground then
+        local plain = false
+        if self.solid_ground then
+            local ok, lum = pcall(function() return _stripGround():getColor8().a end)
+            plain = ok and (lum == 0xFF or lum == 0x00)
+        end
+        if not plain then mode = "ui" end
+    end
+    UIManager:setDirty(self.show_parent, mode, Geom:new{
         x = self.dimen.x + d.x,          -- cell x, less the outline's border
         y = self.dimen.y,                -- the strip's own top edge
         w = d.w + 2 * b,
@@ -1925,9 +2127,16 @@ end
 
 function ChipBar:focusCrumb(depth)
     if not self._breadcrumb_zones then return end
+    local prev_depth = self.focused_depth
     self.focused_depth = depth
     self:_initBreadcrumb()
     if not self.show_parent or not self.dimen then return end
+    -- As focusCursor (issue #124): unchanged focus, no refresh. Every page
+    -- turn clears the d-pad focus (_clearDpadFocus), so on a breadcrumb strip
+    -- (a shelf inside a Shelf of shelves) this sent a full-screen refresh
+    -- right behind the page wipe, every turn; on the PW5 the shelf and the
+    -- footer showed white before they painted in (maintainer, By author).
+    if prev_depth == depth then return end
     UIManager:setDirty(self.show_parent, "ui")
 end
 
@@ -1978,10 +2187,15 @@ function ChipBar:onTapStrip(_, ges)
                     -- have nothing to clear it.
                     if self.on_change then self.on_change(chip.key) end
                 elseif chip.key == self.active then
-                    -- Tapping the already-active chip does nothing. Editing is
-                    -- long-press only (on_hold); a stray tap on the focused
-                    -- chip used to open the editor, which was easy to trigger
-                    -- by accident (#224). Consume the tap so it's a clean no-op.
+                    -- The current shelf's button: its editor, as a long-press
+                    -- opens it (maintainer: one tap away). A tap meant to
+                    -- switch shelves that landed here opened it by accident
+                    -- (issue 224), so it has a switch of its own (Bookshelf
+                    -- gestures); off, the tap is consumed and does nothing.
+                    local Gestures = require("lib/bookshelf_gestures")
+                    if Gestures.on("edit_shelf_tap") and self.on_hold then
+                        self.on_hold(chip.key, true)   -- from a tap: its own switch said yes
+                    end
                 else
                     -- Switch to a different tab.
                     if self.on_change then
@@ -1997,6 +2211,7 @@ function ChipBar:onTapStrip(_, ges)
 end
 
 function ChipBar:onSwipeStrip(_, ges)
+    if not Gestures.on("shelf_buttons_swipe") then return false end
     -- Only intercept swipes when there is more than one page of chips.
     if not (self._pages and self._pages.multi) then return false end
     local dir = ges.direction
@@ -2044,6 +2259,20 @@ function ChipBar:onHoldStrip(_, ges)
         end
     end
     return false
+end
+-- buildLabel(label, size, max_w, ink) -> a widget drawing a shelf label as a
+-- chip does -- text, icon glyphs and [icon=NAME] pictures -- in the label's
+-- own case (not the chips' case setting). For headings elsewhere, such as the
+-- Shelf micro-module. face: the text's font, for a heading in another face
+-- (a title bar's); the chips' font when nil.
+function ChipBar.buildLabel(label, size, max_w, ink, face)
+    return _buildLabelContent(label, size, max_w, ink, false, true, face)
+end
+-- buildChipLabel(label, size, max_w, ink, inverted) -> the same, in the
+-- chips' case (the Uppercase labels setting): a shelf named as the bar names
+-- it, for the shelf editor's Shelf order page.
+function ChipBar.buildChipLabel(label, size, max_w, ink, inverted)
+    return _buildLabelContent(label, size, max_w, ink, inverted, false)
 end
 
 return ChipBar

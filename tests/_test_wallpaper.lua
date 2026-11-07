@@ -74,7 +74,7 @@ local lfs_shim = {
             if sh("test -e " .. q .. " && echo f"):match("f") then return "file" end
             return nil
         elseif attr == "modification" then
-            return tonumber(sh("stat -c %Y " .. q))
+            return tonumber(sh(dofile("tests/_helpers.lua").statCmd("mtime", q)))
         end
     end,
     mkdir = function(path) return os.execute("mkdir -p '" .. path .. "'") end,
@@ -119,6 +119,11 @@ local function fakeBB(w, h)
     function bb:fill(c) self.filled = c; self.ops[#self.ops+1] = "fill" end
     function bb:invertRect() self.inverted = true; self.ops[#self.ops+1] = "invert" end
     function bb:free() self.freed = true end
+    function bb:getType() return 1 end
+    function bb:blitFrom(src, dx, dy, sx, sy, w, h)
+        self.blits = self.blits or {}
+        self.blits[#self.blits + 1] = { src = src, dx = dx, dy = dy, sx = sx, sy = sy, w = w, h = h }
+    end
     return bb
 end
 
@@ -246,6 +251,35 @@ t.test("other folders: a file added there appears without a restart", function()
     eq(#W.list(), 0)
     touch(d .. "/Wallpapers", "new.png")
     eq(#W.list(), 1, "the other folder is part of the cache key")
+    os.execute("rm -rf '" .. d .. "'")
+end)
+
+t.test("a wallpaper folder of the reader's own is listed and resolves (issue 419)", function()
+    local W = fresh()
+    local d = scratch()
+    W._data_dir = d; W._lfs = lfs_shim
+    local kv = {}
+    package.loaded["lib/bookshelf_settings_store"] = {
+        read = function(k) return kv[k] end,
+        save = function(k, v) kv[k] = v end,
+        delete = function(k) kv[k] = nil end,
+        flush = function() end,
+    }
+    W.ensureDir()
+    os.execute("mkdir -p '" .. d .. "/mine'")
+    touch(d .. "/mine", "fern.jpg")
+    eq(#W.list(), 0, "not read before it is chosen")
+    W.setUserDir(d .. "/mine/")
+    eq(W.userDir(), d .. "/mine", "stored without the trailing slash")
+    local list = W.list()
+    eq(#list, 1)
+    eq(list[1].name, "mine:fern.jpg")
+    eq(W.pathFor("mine:fern.jpg"), d .. "/mine/fern.jpg")
+    W.setUserDir(nil)
+    eq(kv[W.USER_DIR_SETTING], nil)
+    eq(#W.list(), 0, "gone again once cleared")
+    eq(W.pathFor("mine:fern.jpg"), nil, "and a selection from it reads as none")
+    package.loaded["lib/bookshelf_settings_store"] = nil
     os.execute("rm -rf '" .. d .. "'")
 end)
 
@@ -694,6 +728,30 @@ t.test("restore: refuses an offscreen target rather than pasting the wrong pixel
     assert(W.restore(small, 0, 0, 4, 4) == false, "an offscreen target is refused")
 end)
 
+-- PW5 2026-10-31: on a shelf with no wallpaper, opening a book flashed the
+-- previous shelf's picture behind the row. The decoded picture is kept for
+-- going back to that shelf, and restore() put it back from there. A shelf
+-- without a picture says so (setShowing), and nothing paints the kept one.
+t.test("a kept picture is not put back on a shelf that has none", function()
+    local W = fresh()
+    W._bg = { bb = {}, w = 100, h = 100, paintTo = function() error("painted the kept picture") end }
+    local screen = { getWidth = function() return 100 end, getHeight = function() return 100 end,
+                     blitFrom = function() error("blitted the kept picture") end }
+    W.setShowing(false)
+    eq(W.isShowing(), false, "a kept picture counts as on screen")
+    eq(W.restore(screen, 0, 0, 10, 10), false)
+    eq(W.patch(screen, 0, 0, 0, 0, 10, 10), false)
+    eq(W.backdrop(screen), false)
+    -- Back on a shelf with a picture: it is there again.
+    W.setShowing(true)
+    eq(W.isShowing(), true)
+    -- The shelf is what knows: its wallpaper decision tells the module.
+    local src = io.open("lib/bookshelf_widget.lua"):read("*a")
+    local b = assert(src:match("\nfunction BookshelfWidget:_wallpaperWidget%(%)\n(.-)\nend\n"))
+    assert(b:find('require("lib/bookshelf_wallpaper").setShowing(w ~= nil)', 1, true),
+        "the shelf does not say whether it has a picture")
+end)
+
 t.test("unfill: survives nils, non-tables and widgets with no frame", function()
     -- Callers pass whatever a build produced, and a build can legitimately
     -- produce nil (a button that is not shown in this state).
@@ -1104,6 +1162,145 @@ t.test("without the C blitter, a translucent scrim falls back to an opaque fill"
     package.loaded["ffi/blitbuffer"] = nil
 end)
 
+t.test("software night mode blends the inverted tint through C, not a solid fill", function()
+    -- Night mode on a device without hardware inversion (every PocketBook)
+    -- sets the buffer's invert flag; the C blitter ignores it, so the panels
+    -- went solid there. With the flag off for the blend and the colour
+    -- inverted, the stored pixels get exactly the blend the screen should show.
+    local W = fresh()
+    package.loaded["ffi/blitbuffer"] = {
+        ColorRGB32 = function(r, g, b, a) return { r = r, g = g, b = b, a = a,
+            getR = function() return r end, getG = function() return g end,
+            getB = function() return b end } end }
+    local calls, inverse = {}, 1
+    local bb = {
+        getInverse     = function() return inverse end,
+        setInverse     = function(_, v) inverse = v end,
+        canUseCbb      = function() return inverse == 0 end,
+        paintRect      = function() calls[#calls + 1] = { op = "paint" } end,
+        blendRectRGB32 = function(_, _x, _y, _w, _h, c)
+            calls[#calls + 1] = { op = "blend", c = c, inv = inverse } end,
+    }
+    local colour = { getColorRGB32 = function(self) return self end,
+                     getR = function() return 200 end, getG = function() return 100 end,
+                     getB = function() return 40 end }
+    eq(W.scrim(bb, 0, 0, 10, 10, colour, 0.6), true)
+    assert(#calls > 0, "nothing was painted at all")
+    for _, c in ipairs(calls) do
+        eq(c.op, "blend", "the panel was painted solid")
+        eq(c.inv, 0, "the C blend ran with the invert flag still set")
+        eq(c.c.r, 55); eq(c.c.g, 155); eq(c.c.b, 215)
+        eq(c.c.a, math.floor(255 * 0.6 + 0.5))
+    end
+    eq(inverse, 1, "the invert flag was not put back")
+    -- C blitter off for another reason: still the solid fallback.
+    calls, inverse = {}, 1
+    bb.canUseCbb = function() return false end
+    eq(W.scrim(bb, 0, 0, 10, 10, colour, 0.6), true)
+    for _, c in ipairs(calls) do eq(c.op, "paint") end
+    eq(inverse, 1)
+    package.loaded["ffi/blitbuffer"] = nil
+end)
+
+t.test("on the screen itself a translucent panel is blended in a copy", function()
+    -- A blend on a Kindle's framebuffer reads every pixel back from slow
+    -- memory: the micro-modules view's full-screen panel and the layout
+    -- editor's fade cost ~650 ms on a PW5, where the same blend in a copy is
+    -- 23 ms (rig device/editdrive.koplugin). The area is read once, blended
+    -- in memory and written back.
+    local W = fresh()
+    local made = {}
+    package.loaded["ffi/blitbuffer"] = {
+        ColorRGB32 = function(r, g, b, a) return { r = r, g = g, b = b, a = a } end,
+        new = function(w, h)
+            local c = { w = w, h = h, ops = {} }
+            function c:blitFrom(_s, ...) self.ops[#self.ops + 1] = { "read", ... } end
+            function c:blendRectRGB32(x, y, bw, bh) self.ops[#self.ops + 1] = { "blend", x, y, bw, bh } end
+            function c:free() self.freed = true end
+            made[#made + 1] = c
+            return c
+        end }
+    local calls = {}
+    local screen = {
+        getType = function() return 1 end, getInverse = function() return 0 end,
+        canUseCbb = function() return true end,
+        paintRect = function() calls[#calls + 1] = "paint" end,
+        blendRectRGB32 = function() calls[#calls + 1] = "blend on screen" end,
+        blitFrom = function(_self, _src, x, y) calls[#calls + 1] = "write " .. x .. "," .. y end,
+    }
+    package.loaded["device"] = { screen = { bb = screen } }
+    local colour = { getColorRGB32 = function(self) return self end,
+                     getR = function() return 0 end, getG = function() return 0 end,
+                     getB = function() return 0 end }
+    eq(W.scrim(screen, 100, 200, 400, 300, colour, 0.4), true)
+    eq(#made, 1, "no copy was made")
+    eq(made[1].w, 400); eq(made[1].h, 300)
+    eq(made[1].ops[1][1], "read")
+    eq(made[1].ops[2][1], "blend"); eq(made[1].ops[2][2], 0); eq(made[1].ops[2][3], 0)
+    eq(table.concat(calls, "|"), "write 100,200", "blended on the screen, or not written back")
+    assert(made[1].freed, "the copy was kept")
+    -- Not the screen (a scratch buffer of the shelf's own): blended in place.
+    calls, made = {}, {}
+    local other = { getType = function() return 1 end, getInverse = function() return 0 end,
+        canUseCbb = function() return true end,
+        blendRectRGB32 = function() calls[#calls + 1] = "blend" end }
+    eq(W.scrim(other, 0, 0, 400, 300, colour, 0.4), true)
+    eq(#made, 0); eq(calls[1], "blend")
+    package.loaded["device"] = nil
+    package.loaded["ffi/blitbuffer"] = nil
+end)
+
+-- Issue 520: KOReader turns the C blitter off on 24-bit PocketBooks (the Era
+-- Color), and every panel was then painted solid, by day as well as at night.
+-- _lutBlend blends the bytes itself. Needs LuaJIT's ffi for a real buffer.
+t.test("without the C blitter, the panel is blended byte by byte, not painted solid", function()
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if not ok_ffi then return end   -- plain Lua: the luajit run covers it
+    local W = fresh()
+    local TYPE_BB8, TYPE_RGB24 = 1, 4
+    package.loaded["ffi/blitbuffer"] = {
+        TYPE_BB8 = TYPE_BB8, TYPE_BBRGB24 = TYPE_RGB24, TYPE_BBRGB32 = 5,
+        ColorRGB32 = function(r, g, b, a) return { getR = function() return r end,
+            getG = function() return g end, getB = function() return b end,
+            getColor8 = function() return { a = math.floor((r + g + b) / 3) } end } end }
+    local function buffer(typ, w, h, fill, inverse)
+        local bpp = typ == TYPE_BB8 and 1 or 3
+        local data = ffi.new("uint8_t[?]", w * h * bpp, fill)
+        return {
+            data = data, stride = w * bpp, painted = 0,
+            getType = function() return typ end,
+            getInverse = function() return inverse and 1 or 0 end,
+            canUseCbb = function() return false end,
+            blendRectRGB32 = function() error("C blend called with no C blitter") end,
+            paintRect = function(self) self.painted = self.painted + 1 end,
+            getBoundedRect = function(_, x, y, bw, bh) return x, y, bw, bh end,
+            getPhysicalRect = function(_, x, y, bw, bh) return x, y, bw, bh end,
+        }, data, bpp
+    end
+    local colour = { getColorRGB32 = function(self) return self end,
+                     getR = function() return 200 end, getG = function() return 100 end,
+                     getB = function() return 40 end }
+    -- RGB24, day: grey 0x40 under a 0.35 tint of (200, 100, 40).
+    local bb, data = buffer(TYPE_RGB24, 8, 4, 0x40)
+    eq(W.scrim(bb, 2, 1, 4, 2, colour, 0.35), true)
+    eq(bb.painted, 0, "the panel was painted solid")
+    local a = math.floor(255 * 0.35 + 0.5)
+    local function want(v, c) return math.floor((v * (255 - a) + c * a) / 255 + 0.5) end
+    local p = (1 * 8 + 2) * 3
+    eq(data[p], want(0x40, 200)); eq(data[p + 1], want(0x40, 100)); eq(data[p + 2], want(0x40, 40))
+    eq(data[0], 0x40, "outside the panel was touched")
+    eq(data[(1 * 8 + 6) * 3], 0x40, "the row past the panel was touched")
+    -- Night, software inversion: the buffer holds 255 - shown.
+    local nb, ndata = buffer(TYPE_RGB24, 8, 4, 255 - 0x40, true)
+    W.scrim(nb, 2, 1, 4, 2, colour, 0.35)
+    eq(255 - ndata[p], want(0x40, 200), "the night blend shows a different colour")
+    -- Greyscale buffer: one byte a pixel, the tint's grey.
+    local gb, gdata = buffer(TYPE_BB8, 8, 4, 0x40)
+    W.scrim(gb, 2, 1, 4, 2, colour, 0.35)
+    eq(gdata[1 * 8 + 2], want(0x40, math.floor((200 + 100 + 40) / 3)))
+    package.loaded["ffi/blitbuffer"] = nil
+end)
+
 -- ── shade, and the direct form the recess painter uses ──────────────────
 t.test("shadeRect darkens by day and lightens at night, with no wrapping", function()
     -- The recess painter issues ~2000 of these per paint of a spine page,
@@ -1210,7 +1407,10 @@ t.test("the scrim blends, except at full strength", function()
     local body = scrim_src:match("function M%.scrim%(bb.-\nend")
     assert(body:match("blendRectRGB32"),
         "the scrim no longer blends -- it is a solid fill again")
-    assert(body:match("alpha >= 255"),
+    -- The opaque decision is shared with the blur's dithered panel
+    -- (_scrimOpaque), so the two agree on when a panel is solid.
+    local opaque = scrim_src:match("function M%._scrimOpaque%(bb.-\nend")
+    assert(body:match("_scrimOpaque%(bb, alpha%)") and opaque and opaque:match("alpha >= 255"),
         "full strength should take the cheaper opaque path")
 end)
 
@@ -1768,6 +1968,14 @@ t.test("a wallpaper name that no longer resolves reads as none", function()
         BookshelfSettings = { read = function() return "screensavers:bg_ss27.png" end },
         Wallpaper = { pathFor = function() return nil end },
         type = type,
+        -- A pack's wallpaper is named by its pack (5.3); these names are not.
+        require = function(m)
+            if m == "lib/bookshelf_theme_pack" then
+                return { isPackName = function() return false end, partEdited = function() return false end,
+                         partRead = function() return "screensavers:bg_ss27.png" end }
+            end
+            return require(m)
+        end,
     }
     local fn = assert(load("return function(setting, fallback)\n" .. body .. "\nend",
         "label", "t", env))
@@ -1776,6 +1984,183 @@ t.test("a wallpaper name that no longer resolves reads as none", function()
     env.Wallpaper.pathFor = function() return "/somewhere/bg_ss27.png" end
     eq(fn()("wallpaper_default", "NONE"), "screensavers:bg_ss27",
         "a resolvable name should still show, extension trimmed")
+end)
+
+local function twoSetup(keep)
+    local W = fresh()
+    installBlitbufferStub({})
+    W._lfs = lfs_shim
+    local d = scratch()
+    W._data_dir = d; W.ensureDir(); touch(W.dir(), "a.png"); touch(W.dir(), "b.png")
+    local renders = 0
+    W._render = function(_p, w, h) renders = renders + 1; return fakeBB(w, h) end
+    W._keep_two = function() return keep end
+    return W, d, function() return renders end
+end
+
+t.test("with shelf themes in use, switching back to the last wallpaper does not decode it again", function()
+    local W, d, renders = twoSetup(true)
+    W.bg("a.png", 100, 100, false); W.bg("b.png", 100, 100, false)
+    local back = W.bg("a.png", 100, 100, false)
+    assert(back, "no background")
+    eq(renders(), 2, "the previous wallpaper was decoded again")
+    W.bg("b.png", 100, 100, false)
+    eq(renders(), 2, "switching forward again decoded")
+    W.free()
+    eq(W._bg, nil); eq(W._bg2, nil, "free kept the second picture")
+    os.execute("rm -rf '" .. d .. "'"); package.loaded["ffi/blitbuffer"] = nil
+end)
+
+t.test("without shelf themes the cache keeps one picture, as before", function()
+    local W, d, renders = twoSetup(false)
+    W.bg("a.png", 100, 100, false); W.bg("b.png", 100, 100, false); W.bg("a.png", 100, 100, false)
+    eq(renders(), 3)
+    eq(W._bg2, nil, "a second picture was kept with no shelf themes")
+    os.execute("rm -rf '" .. d .. "'"); package.loaded["ffi/blitbuffer"] = nil
+end)
+
+t.test("a decoded picture is kept on disk, so the next session doesn't decode it", function()
+    local W, d, renders = twoSetup(false)
+    local disk = {}
+    W._disk_cache = { load = function(k) return disk[k] end,
+                      store = function(k, bb) disk[k] = bb; return true end }
+    local mtime = 1
+    package.loaded["libs/libkoreader-lfs"] = { attributes = function() return { modification = mtime, size = 10 } end }
+    package.loaded["device"] = { screen = { bb = { getType = function() return 1 end } } }
+    W.bg("a.png", 100, 100, false)
+    eq(renders(), 1)
+    W.free(); W._bg, W._bg_key = nil, nil
+    W.bg("a.png", 100, 100, false)
+    eq(renders(), 1, "decoded again with the picture on disk")
+    -- An edited picture is decoded again.
+    W.free(); W._bg, W._bg_key = nil, nil
+    mtime = 2
+    W.bg("a.png", 100, 100, false)
+    eq(renders(), 2, "an edited picture came from the old copy")
+    package.loaded["libs/libkoreader-lfs"] = nil; package.loaded["device"] = nil
+    os.execute("rm -rf '" .. d .. "'"); package.loaded["ffi/blitbuffer"] = nil
+end)
+
+t.test("a panel's blur is kept on disk beside its picture, keyed on what made it", function()
+    local src = io.open("lib/bookshelf_wallpaper.lua"):read("*a")
+    local ff = src:match("\nlocal function frostFor%(x, y, w, h, tint%)\n(.-)\nend\n")
+    assert(ff, "frostFor moved")
+    assert(ff:find('fkey = string.format("frost:%s|%s|%d,%d,%dx%d|%s|%s|%d/%d/%d", bg.dkey,', 1, true),
+        "the blur isn't keyed on its picture, mode, rect, tint and constants")
+    assert(ff:find("pcall(diskCache().store, fkey, bb)", 1, true), "never stored")
+    assert(src:find("widget.dkey = dkey", 1, true), "the picture doesn't carry its disk key")
+    -- Declared above frostFor: a local below its caller is a nil global there.
+    assert(src:find("local function diskCache", 1, true) < src:find("local function frostFor", 1, true))
+end)
+
+-- ── Scaling (issue 578) ─────────────────────────────────────────────────────
+
+t.test("fitLayout: fill covers the screen and crops the overhang, centred", function()
+    local W = fresh()
+    -- A 4:3 landscape picture on a 3:4 portrait screen: scaled to the height.
+    local dw, dh, ox, oy = W.fitLayout(400, 300, 300, 400, "fill")
+    eq(dh, 400); eq(dw, 533); eq(oy, 0); eq(ox, -117)
+end)
+
+t.test("fitLayout: fit shows all of it, centred, margins round it", function()
+    local W = fresh()
+    local dw, dh, ox, oy = W.fitLayout(400, 300, 300, 400, "fit")
+    eq(dw, 300); eq(dh, 225); eq(ox, 0); eq(oy, 87)
+end)
+
+t.test("fitLayout: stretch, or a size it cannot use, is nil", function()
+    local W = fresh()
+    eq(W.fitLayout(400, 300, 300, 400, "stretch"), nil)
+    eq(W.fitLayout(nil, 300, 300, 400, "fill"), nil)
+    eq(W.fitLayout(0, 300, 300, 400, "fit"), nil)
+end)
+
+local function fitSetup(mode, size)
+    local W = fresh()
+    local made = {}
+    installBlitbufferStub(made)
+    W._lfs = lfs_shim
+    local d = scratch()
+    W._data_dir = d; W.ensureDir(); touch(W.dir(), "a.png")
+    local asked = {}
+    W._render = function(_p, w, h) asked[#asked + 1] = { w = w, h = h }; return fakeBB(w, h) end
+    package.loaded["lib/bookshelf_settings_store"] = {
+        read = function(k) if k == W.FIT_SETTING then return mode end return nil end,
+        save = function() end,
+    }
+    package.loaded["lib/bookshelf_image_source"] = {
+        probeSize = function() return size and size[1], size and size[2] end,
+    }
+    local function done()
+        package.loaded["lib/bookshelf_settings_store"] = nil
+        package.loaded["lib/bookshelf_image_source"] = nil
+        package.loaded["ffi/blitbuffer"] = nil
+        os.execute("rm -rf '" .. d .. "'")
+    end
+    return W, asked, made, done
+end
+
+t.test("Crop to fill decodes at the covering size and hands back a screen-sized picture", function()
+    local W, asked, _made, done = fitSetup("fill", { 400, 300 })
+    local wp = W.bg("a.png", 300, 400, false)
+    assert(wp and wp.bb, "no background")
+    eq(asked[1].w, 533); eq(asked[1].h, 400)
+    eq(wp.bb:getWidth(), 300); eq(wp.bb:getHeight(), 400)
+    eq(wp.bb.blits[1].sx, 117, "the crop is not centred")
+    eq(wp.margin, nil, "a cropped picture has no margin")
+    done()
+end)
+
+t.test("Fit centres the picture and records its margins", function()
+    local W, asked, _made, done = fitSetup("fit", { 400, 300 })
+    local wp = W.bg("a.png", 300, 400, false)
+    eq(asked[1].w, 300); eq(asked[1].h, 225)
+    eq(wp.bb:getWidth(), 300); eq(wp.bb:getHeight(), 400)
+    eq(wp.bb.blits[1].dy, 87)
+    assert(wp.margin and wp.margin.oy == 87 and wp.margin.ox == 0, "margins not recorded")
+    done()
+end)
+
+t.test("Stretch, the default, decodes at the screen size as before", function()
+    local W, asked, _made, done = fitSetup(nil, { 400, 300 })
+    W.bg("a.png", 300, 400, false)
+    eq(asked[1].w, 300); eq(asked[1].h, 400)
+    eq(W.fitMode(), "stretch")
+    done()
+end)
+
+t.test("a picture whose size the header does not give is stretched", function()
+    local W, asked, _made, done = fitSetup("fill", nil)
+    W.bg("a.png", 300, 400, false)
+    eq(asked[1].w, 300); eq(asked[1].h, 400)
+    done()
+end)
+
+t.test("changing the scaling decodes again: it is in the key", function()
+    local W, asked, _made, done = fitSetup("fill", { 400, 300 })
+    W.bg("a.png", 300, 400, false)
+    package.loaded["lib/bookshelf_settings_store"].read = function(k)
+        if k == W.FIT_SETTING then return "fit" end return nil end
+    W.bg("a.png", 300, 400, false)
+    eq(#asked, 2, "the cropped picture was reused for Fit")
+    done()
+end)
+
+t.test("the picker's Scaling button cycles Stretch > Crop to fill > Fit and stores stretch as nothing", function()
+    local saved = {}
+    local cur
+    package.loaded["lib/bookshelf_settings_store"] = {
+        read = function(k) return saved[k] end,
+        save = function(k, v) saved[k] = v end,
+    }
+    local W = fresh()
+    package.loaded["lib/bookshelf_wallpaper"] = W
+    local WB = dofile("lib/bookshelf_wallpaper_browser.lua")
+    eq(WB.nextScaling(), "fill"); eq(saved[W.FIT_SETTING], "fill")
+    eq(WB.nextScaling(), "fit")
+    eq(WB.nextScaling(), "stretch"); eq(saved[W.FIT_SETTING], nil)
+    package.loaded["lib/bookshelf_settings_store"] = nil
+    package.loaded["lib/bookshelf_wallpaper"] = nil
 end)
 
 t.done()

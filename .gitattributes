@@ -1,8 +1,9 @@
 # Keep dev-only files out of `git archive` (release zips). Runtime needs
-# only the plugin code, locale/*.po, assets, and fonts.
+# only the plugin code, locale/*.po, fonts, and the assets whitelisted below.
 tests/          export-ignore
 tools/          export-ignore
 docs/           export-ignore
+STYLE.md        export-ignore
 .github/        export-ignore
 *.pot           export-ignore
 .gitattributes  export-ignore
@@ -10,3 +11,19 @@ docs/           export-ignore
 AGENTS.md       export-ignore
 CHANGELOG.md    export-ignore
 UPSTREAM_SYNC.md export-ignore
+
+# assets/ is mostly README material (screenshots, logos, example files), so
+# nothing in it ships unless listed here. Add a line for any new file the
+# plugin reads at runtime. An ignored DIRECTORY takes its whole tree with it,
+# so `assets/**` rather than `assets/`, and a whitelisted subfolder needs its
+# own line as well as one for its contents.
+assets/**                   export-ignore
+assets/bookshelf-logo.png   -export-ignore
+assets/icons               -export-ignore
+assets/icons/**            -export-ignore
+assets/wallpapers           -export-ignore
+assets/wallpapers/**        -export-ignore
+assets/planks               -export-ignore
+assets/planks/**            -export-ignore
+assets/shadows              -export-ignore
+assets/shadows/**           -export-ignore

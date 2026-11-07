@@ -114,6 +114,7 @@ test("seed: fresh install sets Roboto Condensed face id + seeds hero", function(
     eq(settings.author_format, "first_last", "fresh -> author format First Last")
     eq(settings.chip_flex_widths, true, "fresh -> flexible chip widths (issue 176)")
     eq(settings.micro_modules_placement, "fullscreen", "fresh -> full-screen micro-module button")
+    eq(settings.show_series_num, "in_series", "fresh -> series numbers only within a series")
     eq(seeded_hero, true, "fresh -> hero seeded")
     eq(settings.bookshelf_fonts_seeded, true, "marker set")
 end)
@@ -127,6 +128,7 @@ test("seed: existing user (file present) left on follow", function()
     eq(settings.author_format, nil, "existing user -> author format untouched")
     eq(settings.chip_flex_widths, nil, "existing user -> chip widths untouched")
     eq(settings.micro_modules_placement, nil, "existing user -> placement untouched")
+    eq(settings.show_series_num, nil, "existing user -> series numbers untouched")
     eq(seeded_hero, false, "existing user -> hero NOT reseeded")
     eq(settings.bookshelf_fonts_seeded, true, "marker still set")
 end)
@@ -161,6 +163,75 @@ test("getUIFontFace: probe passes a size to getFace (issue 175)", function()
     assert(last ~= nil, "probe must call Font:getFace")
     assert(type(last.size) == "number" and last.size > 0,
         "probe must pass a positive size; got " .. tostring(last and last.size))
+end)
+
+-- Issue 284: the modal's HTML is rendered by MuPDF, which is handed the UI
+-- font as files through @font-face, by ABSOLUTE path.
+test("uiFontCss: a chosen font becomes @font-face rules with its bold and italic", function()
+    settings.bookshelf_ui_font = "/f/Foo-Regular.ttf"
+    local css = BFont.uiFontCss("bsui")
+    assert(css:find('font-family: "bsui"; src: url("/f/Foo-Regular.ttf")', 1, true), css)
+    assert(css:find('font-weight: bold; src: url("/f/Foo-Bold.ttf")', 1, true), css)
+    assert(css:find('font-style: italic; src: url("/f/Foo-Italic.ttf")', 1, true), css)
+end)
+
+test("uiFontCss: a bare font name resolves to an absolute path", function()
+    package.loaded["fontlist"] = { fontdir = "./fonts", getFontList = function() return {} end }
+    package.loaded["ffi/util"] = { realpath = function(p) return "/opt/ko/" .. p:gsub("^%./", "") end }
+    settings.bookshelf_ui_font = "Bar-Regular.ttf"
+    local f = BFont.uiFontFiles()
+    eq(f and f.regular, "/opt/ko/fonts/Bar-Regular.ttf", "relative KOReader path made absolute")
+    package.loaded["fontlist"] = nil
+    package.loaded["ffi/util"] = nil
+end)
+
+test("uiFontCss: no font on disk gives no rules, so MuPDF keeps its own", function()
+    package.loaded["libs/libkoreader-lfs"].attributes = function() return nil end
+    settings.bookshelf_ui_font = "/f/Gone-Regular.ttf"
+    eq(BFont.uiFontCss("bsui"), "")
+    package.loaded["libs/libkoreader-lfs"].attributes = function() return "file" end
+end)
+
+-- A family with no italic file (CJK fonts ship none): the derived -Italic name
+-- must not reach Font:getFace, which logs an ERROR for a missing file on every
+-- call before the fallback to regular.
+test("chosen font with no italic file: never asks Font for the missing sibling", function()
+    local real_attr = package.loaded["libs/libkoreader-lfs"].attributes
+    package.loaded["libs/libkoreader-lfs"].attributes = function(p)
+        if p == "/f/Han-Italic.otf" or p == "/f/Han-Bold.otf" then return nil end
+        return "file"
+    end
+    local asked = {}
+    local real_get = package.loaded["ui/font"].getFace
+    package.loaded["ui/font"].getFace = function(self, arg, size)
+        asked[arg] = true
+        return real_get(self, arg, size)
+    end
+    settings.bookshelf_ui_font = "/f/Han-Regular.otf"
+    local face, bold = BFont:getFace("infofont", 16, { italic = true })
+    eq(last.arg, "/f/Han-Regular.otf", "no italic file -> regular")
+    eq(bold, false)
+    face, bold = BFont:getFace("infofont", 16, { bold = true })
+    eq(last.arg, "/f/Han-Regular.otf", "no bold file -> regular")
+    eq(bold, true, "faux-bold the regular")
+    eq(asked["/f/Han-Italic.otf"], nil, "missing italic must not be loaded")
+    eq(asked["/f/Han-Bold.otf"], nil, "missing bold must not be loaded")
+    package.loaded["ui/font"].getFace = real_get
+    package.loaded["libs/libkoreader-lfs"].attributes = real_attr
+end)
+
+test("displayName: the family name, not the file name", function()
+    -- Settings showed "Bookshelf UI font: RobotoCondensed-Regular" (user test).
+    package.loaded["lib/bookshelf_i18n"] = { gettext = function(s) return s end }
+    package.loaded["fontlist"] = { fontinfo = {
+        ["/f/RobotoCondensed-Regular.ttf"] = { { name = "Roboto Condensed" } },
+        ["/f/RobotoCondensed-Bold.ttf"] = { { name = "Roboto Condensed", bold = true } },
+    } }
+    eq(BFont.displayName("/f/RobotoCondensed-Regular.ttf"), "Roboto Condensed")
+    eq(BFont.displayName("/f/RobotoCondensed-Bold.ttf"), "Roboto Condensed Bold")
+    eq(BFont.displayName("RobotoCondensed-Regular.ttf"), "Roboto Condensed", "a bare file name, as the setting stores it")
+    eq(BFont.displayName("/f/Unknown-Font.otf"), "Unknown-Font", "no metadata: the file name")
+    package.loaded["fontlist"] = nil
 end)
 
 io.write(("bookshelf_fonts: %d passed, %d failed\n"):format(pass, fail))

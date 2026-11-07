@@ -46,7 +46,6 @@
 local InputDialog = require("ui/widget/inputdialog")
 local UIManager   = require("ui/uimanager")
 local Focus       = require("lib/bookshelf_focus")
-local FontList    = require("fontlist")
 local Screen      = require("device").screen
 local _           = require("lib/bookshelf_i18n").gettext
 
@@ -83,6 +82,19 @@ local function cycleNext(list, current)
         if v == current then return list[(i % #list) + 1] end
     end
     return list[1]
+end
+
+-- Bar style names as the Bar style button shows them: bookends' labels
+-- (bookends_line_editor.lua), so a style reads the same in both plugins.
+-- Looked up at call time so a language switch takes effect. An id with no
+-- label (the radial dials the editor does not offer, a style the painter
+-- gains later) shows as itself.
+local function barStyleLabel(id)
+    local labels = {
+        bordered = _("Bordered"), solid = _("Solid"), rounded = _("Rounded"),
+        metro = _("Metro"), wavy = _("Wave"), pacman = _("Pacman"),
+    }
+    return labels[id] or id
 end
 
 local ALIGN_CYCLE  = { "left", "center", "right" }
@@ -133,7 +145,7 @@ local function showSizeNudge(current, default, on_change, on_close, opts)
     d = ButtonDialog:new{
         -- dismissable=false + movable.ges_events wipe below: matches
         -- the lockdown applied to every nudge dialog in
-        -- bookshelf_settings.lua (see _pickCoverBadgeFontScale for
+        -- bookshelf_settings.lua (see _showScaleNudge for
         -- the rationale). Same reasoning: rapid taps near +/- shouldn't
         -- fall through to the modal background and dismiss mid-edit,
         -- and a long-press on a button shouldn't toggle the dialog to
@@ -161,73 +173,17 @@ local function showSizeNudge(current, default, on_change, on_close, opts)
         },
     }
     if d.movable then d.movable.ges_events = {} end
+    require("lib/bookshelf_gesture_zones").passSwipesOn(d)
     UIManager:show(d)
 end
 
--- showFontPicker — uses the bookends picker (richer UI: previews each
--- family in its own typeface, dedupes weight variants) when bookends is
--- loaded. Falls back to a plain FontList Menu when it isn't.
---
--- The bookends class is the return value of bookends/main.lua, which the
--- KOReader plugin loader stashes on PluginLoader.enabled_plugins (it uses
--- dofile, NOT require, so package.loaded["main"] is empty). We grab the
--- class by name and invoke showFontPicker as a static call with an empty
--- self table — the function only uses self.frame for tap-outside dismissal,
--- a transient field that doesn't need a real Bookends instance.
+-- showFontPicker -- bookshelf's own picker (lib/bookshelf_font_picker, ported
+-- from bookends'): one row per family, each in its own typeface. It used to
+-- borrow bookends' copy when that was installed and fall back to a Menu of
+-- raw file paths otherwise, so the picker a reader got depended on which
+-- other plugin they had (issue 450).
 local function showFontPicker(current_face, default_face, on_select)
-    -- Bookends's picker injects "@family:serif" / "@family:fantasy" /
-    -- "@family:cursive" sentinel rows that resolve via KOReader's CRengine
-    -- font_family settings — that resolution only happens inside the
-    -- Reader context, where bookshelf doesn't run. Filter those out at
-    -- the callback boundary with a friendly message instead of letting
-    -- the literal string flow through to Font:getFace and crash render.
-    local function safe_select(file)
-        if type(file) == "string" and file:match("^@family:") then
-            local InfoMessage = require("ui/widget/infomessage")
-            UIManager:show(InfoMessage:new{
-                text = _("Font-family fonts (serif, sans-serif, etc.) only resolve inside the Reader view. Pick a specific font file instead."),
-                timeout = 3,
-            })
-            return
-        end
-        on_select(file)
-    end
-    local ok_pl, PluginLoader = pcall(require, "pluginloader")
-    if ok_pl and PluginLoader and PluginLoader.enabled_plugins then
-        for _i, plugin in ipairs(PluginLoader.enabled_plugins) do
-            if plugin.name == "bookends" and type(plugin.showFontPicker) == "function" then
-                -- include_family = false suppresses the "@family:" sentinel
-                -- rows that bookends would otherwise prepend. Newer bookends
-                -- (feature/font-picker-opts → master) honours the option;
-                -- older bookends ignores extra args, in which case safe_select
-                -- catches any "@family:" tap with the toast fallback.
-                local ok = pcall(plugin.showFontPicker, {}, current_face,
-                    safe_select, default_face, { include_family = false })
-                if ok then return end
-                break -- bookends present but the call failed; fall through to fallback
-            end
-        end
-    end
-    -- Fallback: native KOReader FontList as a full-screen Menu. Modelled on
-    -- KOReader's filemanagershortcuts menu: covers_fullscreen + is_borderless,
-    -- shown without manual positioning so MenuItem tap ranges line up, and a
-    -- close_callback so selecting (or tapping the title-bar close) dismisses it
-    -- -- the generic Menu only closes via close_callback (onMenuSelect).
-    local Menu   = require("ui/widget/menu")
-    local items  = { { text = _("(Default)"), callback = function() safe_select(nil) end } }
-    for _i, file in ipairs(FontList:getFontList() or {}) do
-        items[#items + 1] = { text = file, callback = function() safe_select(file) end }
-    end
-    local menu
-    menu = Menu:new{
-        title             = _("Pick font"),
-        item_table        = items,
-        covers_fullscreen = true,
-        is_borderless     = true,
-        is_popout         = false,
-    }
-    menu.close_callback = function() UIManager:close(menu) end
-    UIManager:show(menu)
+    require("lib/bookshelf_font_picker").show(current_face, on_select, default_face)
 end
 
 -- Shows the bundled icons library picker. Dynamic %tokens stay available
@@ -359,6 +315,13 @@ end
 --                 makes Default a no-op rather than a field-wiper when a
 --                 caller has nothing meaningful to restore to.
 --   uppercase     show the Aa/AA case toggle (default true).
+--   size, font, alignment
+--                 show the Size nudge, the Font picker and the alignment cycle
+--                 (each default true). A surface that draws the line in a face
+--                 and size it does not own -- the cover label -- turns them
+--                 off rather than offering controls it would ignore.
+--   token_filter  function(catalogue_entry) -> false to leave a token out of
+--                 the Tokens… picker. Optional; nil offers the whole catalogue.
 --   bar           show the %bar controls row (default false). Progress-shaped
 --                 regions only.
 --   bar_styles    function returning the cycle of bar style names. Required
@@ -448,7 +411,9 @@ function LineEditor.edit(spec)
                     if dialog then dialog:reinit() end
                 end,
             },
-            {
+        }
+        if spec.size ~= false then
+            style_row[#style_row + 1] = {
                 text_func = function() return _("Size") .. ": " .. (draft.font_size or "") end,
                 callback  = function()
                     if dialog then dialog:onCloseKeyboard() end
@@ -458,8 +423,10 @@ function LineEditor.edit(spec)
                         function(val) draft.font_size = val; applyLivePreview() end,
                         function() if dialog then dialog:reinit() end end)
                 end,
-            },
-            {
+            }
+        end
+        if spec.font ~= false then
+            style_row[#style_row + 1] = {
                 text_func = function() return draft.font_face and _("Font \xE2\x9C\x93") or _("Font\xE2\x80\xA6") end,
                 callback  = function()
                     if dialog then dialog:onCloseKeyboard() end
@@ -470,8 +437,8 @@ function LineEditor.edit(spec)
                             if dialog then dialog:reinit() end
                         end)
                 end,
-            },
-        }
+            }
+        end
         if spec.uppercase ~= false then
             style_row[#style_row + 1] = {
                 text_func = function() return draft.uppercase and "AA" or "Aa" end,
@@ -483,32 +450,34 @@ function LineEditor.edit(spec)
                 end,
             }
         end
-        style_row[#style_row + 1] = {
-            text_func = function() return ALIGN_LABELS[draft.alignment or "left"] or ALIGN_LABELS.left end,
-            -- Dead while the line carries %spacer or %bar, and saying so.
-            --
-            -- Either token makes the line exactly as wide as its box -- the
-            -- spacer pushes the two halves to the edges, the bar fills what is
-            -- left -- so there is no slack for an alignment to move anything
-            -- into. The setting was reported as "doesn't work", and it does
-            -- work; it was being tried on lines that had already given their
-            -- width away. Greying the control is the honest answer, and it
-            -- matches how the bar controls already behave when there is no
-            -- %bar to configure.
-            enabled_func = function() return not hasElasticToken(dialog) end,
-            -- Render with the Symbols Nerd Font face so the MDI alignment
-            -- codepoints resolve. Default button face would render them as
-            -- tofu (missing-glyph boxes). Size matches eyeballed alongside
-            -- the Latin text buttons in the same row.
-            font_face = "symbols",
-            font_size = 22,
-            callback  = function()
-                if dialog then dialog:onCloseKeyboard() end
-                draft.alignment = cycleNext(ALIGN_CYCLE, draft.alignment or "left")
-                applyLivePreview()
-                if dialog then dialog:reinit() end
-            end,
-        }
+        if spec.alignment ~= false then
+            style_row[#style_row + 1] = {
+                text_func = function() return ALIGN_LABELS[draft.alignment or "left"] or ALIGN_LABELS.left end,
+                -- Dead while the line carries %spacer or %bar, and saying so.
+                --
+                -- Either token makes the line exactly as wide as its box -- the
+                -- spacer pushes the two halves to the edges, the bar fills what is
+                -- left -- so there is no slack for an alignment to move anything
+                -- into. The setting was reported as "doesn't work", and it does
+                -- work; it was being tried on lines that had already given their
+                -- width away. Greying the control is the honest answer, and it
+                -- matches how the bar controls already behave when there is no
+                -- %bar to configure.
+                enabled_func = function() return not hasElasticToken(dialog) end,
+                -- Render with the Symbols Nerd Font face so the MDI alignment
+                -- codepoints resolve. Default button face would render them as
+                -- tofu (missing-glyph boxes). Size matches eyeballed alongside
+                -- the Latin text buttons in the same row.
+                font_face = "symbols",
+                font_size = 22,
+                callback  = function()
+                    if dialog then dialog:onCloseKeyboard() end
+                    draft.alignment = cycleNext(ALIGN_CYCLE, draft.alignment or "left")
+                    applyLivePreview()
+                    if dialog then dialog:reinit() end
+                end,
+            }
+        end
 
         rows[#rows + 1] = style_row
 
@@ -522,7 +491,7 @@ function LineEditor.edit(spec)
                 {
                     text_func = function()
                         if not hasBarToken(dialog) then return _("Bar style") end
-                        return _("Bar: ") .. (draft.bar_style or "bordered")
+                        return _("Bar: ") .. barStyleLabel(draft.bar_style or "bordered")
                     end,
                     enabled_func = function() return hasBarToken(dialog) end,
                     callback = function()
@@ -582,7 +551,7 @@ function LineEditor.edit(spec)
                 callback = function()
                     if dialog then dialog:onCloseKeyboard() end
                     if spec.settings_module and spec.settings_module._pickToken then
-                        spec.settings_module:_pickToken(dialog)
+                        spec.settings_module:_pickToken(dialog, spec.token_filter)
                     end
                 end,
             },
@@ -641,6 +610,7 @@ LineEditor.showSizeNudge  = showSizeNudge
 LineEditor.hideParentMenu = hideParentMenu
 LineEditor.guardStrayTaps = guardStrayTaps
 LineEditor.cycleNext      = cycleNext
+LineEditor.barStyleLabel  = barStyleLabel
 LineEditor.ALIGN_LABELS   = ALIGN_LABELS
 LineEditor.ALIGN_CYCLE    = ALIGN_CYCLE
 

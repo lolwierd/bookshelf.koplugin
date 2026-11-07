@@ -12,6 +12,12 @@ Each goal can be independently activated/deactivated. Tap cycles through
 the active goals (keep_open = true); small dot indicators (● ○) show
 position. Time data comes from statistics.sqlite3, book counts come from
 ReadHistory + Repo.readProgress. Everything is TTL-cached at 30 s.
+
+Render never waits for those reads. Cold, they cost 630ms on a PW5 inside the
+first full-screen micro-modules open. The card draws the last figures it has
+(saved across restarts, a period that has since rolled over reading 0), the
+queries run after the screen has painted, and the card redraws itself through
+ctx.refresh when a number moved.
 ]]
 local _ = require("lib/bookshelf_i18n").gettext
 local T = require("ffi/util").template
@@ -22,6 +28,9 @@ local KEY_DAILY   = "micromodule_reading_goal_daily"    -- minutes (int)
 local KEY_WEEKLY  = "micromodule_reading_goal_weekly"   -- minutes (int, displayed as hours)
 local KEY_MONTHLY = "micromodule_reading_goal_monthly"  -- books   (int)
 local KEY_YEARLY  = "micromodule_reading_goal_yearly"   -- books   (int)
+-- Books read outside KOReader (paper, audio, another device), added to the
+-- year's count only: { year = YYYY, n = int }, so they start again each year.
+local KEY_OTHER   = "micromodule_reading_goal_other_books"
 
 local GOAL_ORDER = { "daily", "weekly", "monthly", "yearly" }
 
@@ -67,6 +76,22 @@ end
 local function readYearly()
     local v = tonumber(store().read(KEY_YEARLY, DEFAULTS.yearly)) or DEFAULTS.yearly
     return math.max(1, v)
+end
+
+-- readOtherBooks(year) -> the books read outside KOReader that year. A reader
+-- moving from SimpleUI kept them as its "physical books read this year", so an
+-- unset value starts from that number, once (a Reddit report: "the count for
+-- my annual reading goal is off ... I can't figure out a way to [change it]").
+local function readOtherBooks(year)
+    local v = store().read(KEY_OTHER)
+    if v == nil then
+        local sui = G_reader_settings
+            and tonumber(G_reader_settings:readSetting("navbar_reading_goal_physical"))
+        v = { year = year, n = (sui and sui > 0) and math.floor(sui) or 0 }
+        store().save(KEY_OTHER, v)
+    end
+    if type(v) ~= "table" or tonumber(v.year) ~= year then return 0 end
+    return math.max(0, math.floor(tonumber(v.n) or 0))
 end
 
 -- ─── View cycling ────────────────────────────────────────────────────────────
@@ -140,25 +165,65 @@ end
 local DATA_TTL = 30
 local _data_cache -- { at = <epoch>, data = <table|false> }
 
--- Count books with status "finished" whose last access was within the period.
-local function countFinishedBooks(period_start)
-    local ok_rh, rh = pcall(require, "readhistory")
-    if not ok_rh or not rh or not rh.hist then return 0 end
-    local Repo = require("lib/bookshelf_book_repository")
-    local count = 0
-    for _, entry in ipairs(rh.hist) do
+-- dateYM(d) -> year, month of a sidecar's summary.modified: KOReader writes
+-- "YYYY-MM-DD", and older sidecars a timestamp or an os.date table.
+local function dateYM(d)
+    if type(d) == "string" then
+        local y, m = d:match("^(%d%d%d%d)%-(%d%d)")
+        if y then return tonumber(y), tonumber(m) end
+        return nil
+    end
+    if type(d) == "number" then
+        local dt = os.date("*t", d)
+        return dt.year, dt.month
+    end
+    if type(d) == "table" and tonumber(d.year) then
+        return tonumber(d.year), tonumber(d.month)
+    end
+    return nil
+end
+
+-- countFinished(hist, now_t, since, statusOf, finishedOn) -> month, year
+-- Books finished this month and this year, counted under the date each was
+-- MARKED finished (summary.modified), so a book finished in December and
+-- opened again in January stays in the year it was read. The date it was last
+-- opened stands in when a sidecar has none. Candidates are the history entries
+-- opened since `since` (the start of the year), as before; one pass for both.
+local function countFinished(hist, now_t, since, statusOf, finishedOn)
+    local month, year, seen = 0, 0, {}
+    for _i, entry in ipairs(hist or {}) do
         local fp = entry.file
-        if fp then
-            local t = entry.time or 0
-            if t >= period_start then
-                local ok, _pct, status = pcall(Repo.readProgress, fp)
-                if ok and status == "finished" then
-                    count = count + 1
+        if fp and not seen[fp] and (entry.time or 0) >= since then
+            seen[fp] = true
+            if statusOf(fp) == "finished" then
+                local y, m = dateYM(finishedOn(fp))
+                if not y then
+                    local et = os.date("*t", entry.time or 0)
+                    y, m = et.year, et.month
+                end
+                if y == now_t.year then
+                    year = year + 1
+                    if m == now_t.month then month = month + 1 end
                 end
             end
         end
     end
-    return count
+    return month, year
+end
+
+local function countFinishedBooks(now_t, since)
+    local ok_rh, rh = pcall(require, "readhistory")
+    if not ok_rh or not rh or not rh.hist then return 0, 0 end
+    local Repo = require("lib/bookshelf_book_repository")
+    return countFinished(rh.hist, now_t, since,
+        function(fp)
+            local ok, _pct, status = pcall(Repo.readProgress, fp)
+            return ok and status or nil
+        end,
+        function(fp)
+            local ok, d = pcall(Repo.finishedOn, fp)
+            return ok and d or nil
+        end)
 end
 
 -- Single query for time-based goals (daily + weekly).
@@ -207,37 +272,116 @@ local function queryTimeData()
     return res
 end
 
-local function queryAllData()
+local function computeAllData()
     local now = os.time()
-    if _data_cache and (now - _data_cache.at) < DATA_TTL then
-        return _data_cache.data or nil
-    end
     local time_data = queryTimeData()
-    if not time_data then
-        _data_cache = { at = now, data = false }
-        return nil
-    end
+    if not time_data then return false end
 
     -- Book counts for monthly / yearly
     local t = os.date("*t", now)
-    local month_start = os.time{
-        year = t.year, month = t.month, day = 1,
-        hour = 0, min = 0, sec = 0 }
     local year_start = os.time{
         year = t.year, month = 1, day = 1,
         hour = 0, min = 0, sec = 0 }
 
-    local month_books = countFinishedBooks(month_start)
-    local year_books  = countFinishedBooks(year_start)
+    local month_books, year_books = countFinishedBooks(t, year_start)
+    year_books  = year_books + readOtherBooks(t.year)
 
-    local data = {
+    return {
         today_secs  = time_data.today_secs,
         week_secs   = time_data.week_secs,
         month_books = month_books,
         year_books  = year_books,
     }
-    _data_cache = { at = now, data = data }
-    return data
+end
+
+-- The figures last computed, for drawing while fresh ones are worked out, and
+-- the cards to redraw when they land.
+local SAVED_KEY = "reading_goal_last"
+local _compute = computeAllData   -- swapped by tests
+local _last_data
+local _pending = false
+local _waiters = {}
+
+-- Period stamps, so saved figures from an earlier day / week / month / year
+-- read 0 for the period that has rolled over rather than yesterday's total.
+local function periodStamps(now)
+    local t = os.date("*t", now)
+    local day_start = os.time{ year = t.year, month = t.month, day = t.day,
+                               hour = 0, min = 0, sec = 0 }
+    return {
+        day   = os.date("%Y-%m-%d", now),
+        week  = os.date("%Y-%m-%d", day_start - ((t.wday + 5) % 7) * 86400),
+        month = os.date("%Y-%m", now),
+        year  = os.date("%Y", now),
+    }
+end
+
+local function savedData()
+    local saved = require("lib/bookshelf_module_cache").read(SAVED_KEY)
+    if type(saved) ~= "table" or type(saved.data) ~= "table" then return nil end
+    local d, at, now = saved.data, saved.stamps or {}, periodStamps(os.time())
+    return {
+        today_secs  = (at.day   == now.day)   and tonumber(d.today_secs)  or 0,
+        week_secs   = (at.week  == now.week)  and tonumber(d.week_secs)   or 0,
+        month_books = (at.month == now.month) and tonumber(d.month_books) or 0,
+        year_books  = (at.year  == now.year)  and tonumber(d.year_books)  or 0,
+    }
+end
+
+local function sameData(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+    return a.today_secs == b.today_secs and a.week_secs == b.week_secs
+        and a.month_books == b.month_books and a.year_books == b.year_books
+end
+
+local function refreshData()
+    if _pending then return end
+    _pending = true
+    -- After the next paint, not before it: a nextTick task runs ahead of the
+    -- repaint the tap that opened the view has queued.
+    require("ui/uimanager"):tickAfterNext(function()
+        _pending = false
+        local ok, data = pcall(_compute)
+        if not ok then data = false end
+        local moved = not sameData(data, _last_data)
+        _data_cache = { at = os.time(), data = data }
+        _last_data = data
+        -- Saved only when a figure moved, and to the cache file: this runs on
+        -- every refresh, and the settings file is rewritten whole on a save.
+        if data and moved then
+            require("lib/bookshelf_module_cache").save(SAVED_KEY,
+                { data = data, stamps = periodStamps(os.time()) })
+        end
+        local waiting = _waiters
+        _waiters = {}
+        if moved then
+            for _i, refresh in ipairs(waiting) do pcall(refresh) end
+        end
+    end)
+end
+
+-- queryAllData(refresh, preview) -> data, or nil when the stats are unavailable.
+-- Fresh figures (under DATA_TTL old) are returned as they are. Otherwise the
+-- last known ones are, while a refresh runs after the next paint and redraws
+-- this card through `refresh`. The picker preview never starts one.
+local function queryAllData(refresh, preview)
+    local now = os.time()
+    if _data_cache and (now - _data_cache.at) < DATA_TTL then
+        return _data_cache.data or nil
+    end
+    if _last_data == nil then
+        _last_data = savedData() or {
+            today_secs = 0, week_secs = 0, month_books = 0, year_books = 0 }
+    end
+    if not preview then
+        if refresh then
+            local queued = false
+            for _i, w in ipairs(_waiters) do if w == refresh then queued = true break end end
+            if not queued then _waiters[#_waiters + 1] = refresh end
+        end
+        refreshData()
+    end
+    return _last_data or nil
 end
 
 -- ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -376,7 +520,51 @@ local function showSettings(ctx)
         }
     end
 
-    dialog = ButtonDialog:new{
+    -- ── Books read outside KOReader, this year ──
+    -- Zero is a real answer here, so this has its own dialog rather than the
+    -- targets' Custom..., which takes only a positive number.
+    local function otherBooksBtn()
+        local year = os.date("*t").year
+        return {
+            text = T(_("Books read outside KOReader this year: %1"), readOtherBooks(year)),
+            callback = function()
+                UIManager:close(dialog)
+                local InputDialog = require("ui/widget/inputdialog")
+                local input_dlg
+                input_dlg = InputDialog:new{
+                    title = _("Books read outside KOReader this year"),
+                    description = _("Paper books, audiobooks or another reader: added to the yearly goal."),
+                    input_type = "number",
+                    input = tostring(readOtherBooks(year)),
+                    buttons = {{
+                        {
+                            text = _("Cancel"),
+                            callback = function()
+                                UIManager:close(input_dlg)
+                                showSettings(ctx)
+                            end,
+                        },
+                        {
+                            text = _("Save"),
+                            is_enter_default = true,
+                            callback = function()
+                                local v = tonumber(input_dlg:getInputText())
+                                if v and v >= 0 then
+                                    S.save(KEY_OTHER, { year = year, n = math.floor(v) })
+                                end
+                                UIManager:close(input_dlg)
+                                reload()
+                            end,
+                        },
+                    }},
+                }
+                UIManager:show(input_dlg)
+                input_dlg:onShowKeyboard()
+            end,
+        }
+    end
+
+    dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
         title        = _("Reading goals"),
         title_align  = "center",
         width_factor = 0.85,
@@ -409,8 +597,9 @@ local function showSettings(ctx)
             { yearlyBtn(6),  yearlyBtn(12), yearlyBtn(24),
               yearlyBtn(36), yearlyBtn(52),
               customTargetBtn(_("Yearly challenge"), _("books"), readYearly, function(v) S.save(KEY_YEARLY, v) end) },
+            { otherBooksBtn() },
         },
-    }
+    })
     UIManager:show(dialog)
 end
 
@@ -426,7 +615,7 @@ local function computeGoal(goal, data, t)
         local met = today_min >= target
         header_text  = _("Daily goal")
         big_text     = tostring(today_min)
-        suffix       = " / " .. tostring(target) .. " min"
+        suffix       = " / " .. T(_("%1 min"), target)
         if met then suffix = suffix .. " \xE2\x9C\x93" end
         pct          = math.min(1, data.today_secs / math.max(1, target * 60))
         local left   = math.max(0, target - today_min)
@@ -474,60 +663,39 @@ local function computeGoal(goal, data, t)
     return header_text, big_text, suffix, pct, context_text
 end
 
+--- How many goals to show at once, and side by side or stacked. Two side by
+--- side in a wide cell; two stacked when one block takes under 65% of the
+--- height; else one (a tap cycles). No height (the start menu): one.
+local function arrangement(shape, n_active, block_h, avail_h)
+    if not (avail_h and avail_h > 0) or n_active < 2 then return 1, false end
+    if shape == "wide" then return 2, true end
+    if block_h and block_h < 0.65 * avail_h then return 2, false end
+    return 1, false
+end
+
 -- Build one goal's widget block: header, big progress number + baseline-aligned
 -- suffix, a full-width progress bar, and a context line. `sc` is the caller's
 -- font-scale helper; `mw` the inner width. Returned widget owns a fresh tree.
-local function buildGoalBlock(goal, mw, scale_pct, data, t)
-    local Blitbuffer = require("ffi/blitbuffer")
-    local Widget     = require("ui/widget/widget")
-    local Geom       = require("ui/geometry")
-    local Kit        = require("lib/bookshelf_module_kit")
+local function buildGoalBlock(goal, mw, scale_pct, data, t, height)
+    local Kit = require("lib/bookshelf_module_kit")
     local sc = Kit.sc(scale_pct)
-    -- The bar is DRAWING, not text, so nothing hands it a colour: it was a
-    -- hard-coded black fill on a fixed 0xCC track. Under the shelf's dark
-    -- theme that reads exactly backwards -- the black fill sinks into the card
-    -- and the pale track becomes the part that looks filled, so a goal at 20%
-    -- shows as a goal at 80%.
-    --
-    -- Fill is the card's ink. The track keeps the relationship it has always
-    -- had to it: 0xCC is a seventh of the way from the 0xEE card toward black,
-    -- so a seventh of the way from the card toward the ink reproduces the
-    -- light theme exactly (238 + (0-238)/7 = 204 = 0xCC) and gives the dark
-    -- one a 0x33 track on its near-black card.
-    local FILL  = Kit.COLOR_PRIMARY or Blitbuffer.COLOR_BLACK
-    local TRACK = Blitbuffer.Color8(0xCC)
-    local ok_lum, lum = pcall(function() return FILL:getColor8().a end)
-    if ok_lum and type(lum) == "number" then
-        local card = (lum > 128) and 0x11 or 0xEE
-        TRACK = Blitbuffer.Color8(math.floor(card + (lum - card) / 7 + 0.5))
-    end
-
     local header_text, big_text, suffix, pct, context_text = computeGoal(goal, data, t)
-
-    -- Full-width progress bar: a custom Widget (reading_goal's signature look),
-    -- passed to valueCard as its `bar`. bar_w = mw fills the card; the offscreen
-    -- ClipContainer keeps it inside the cell.
-    local bar_h  = sc(6)
-    local bar_w  = mw
-    local fill_w = math.max(0, math.min(bar_w, math.floor(bar_w * (pct or 0))))
-    local Bar = Widget:extend{}
-    function Bar:init()   self.dimen = Geom:new{ w = bar_w, h = bar_h } end
-    function Bar:getSize() return Geom:new{ w = bar_w, h = bar_h } end
-    function Bar:paintTo(bb, x, y)
-        self.dimen = Geom:new{ x = x, y = y, w = bar_w, h = bar_h }
-        bb:paintRect(x, y, bar_w, bar_h, TRACK)
-        if fill_w > 0 then bb:paintRect(x, y, fill_w, bar_h, FILL) end
-    end
+    -- Full-width progress bar (reading_goal's signature look, now in the Kit
+    -- so the battery card shares it). bar_w = mw fills the card; the
+    -- offscreen ClipContainer keeps it inside the cell.
+    local bar = Kit.progressBar{ width = mw, height = sc(6), fraction = pct }
 
     return Kit.valueCard{
-        width = mw, scale_pct = scale_pct,
+        width = mw, scale_pct = scale_pct, height = height,
         heading = header_text, value = big_text, suffix = suffix,
-        bar = Bar:new{}, context = context_text,
+        bar = bar, bar_fraction = pct, context = context_text,
     }
 end
 
 return {
     key   = "reading_goal",
+    -- Text: unreadable one grid column wide (truncates or breaks words).
+    min_w = 2,
     title = _("Reading goals"),
     summary = _("From your reading stats. Works offline."),
     keep_open = true,  -- tap cycles goals without closing menu
@@ -535,7 +703,7 @@ return {
     render = function(ctx)
         local width, scale_pct, preview, avail_h = ctx.width, ctx.scale, ctx.preview, ctx.height
         local Fonts         = require("lib/bookshelf_fonts")
-        local TextWidget    = require("ui/widget/textwidget")
+        local TextWidget    = require("lib/bookshelf_colour_text")
         local VerticalGroup = require("ui/widget/verticalgroup")
         local VerticalSpan  = require("ui/widget/verticalspan")
         local SM            = require("lib/bookshelf_start_menu_modules")
@@ -544,7 +712,7 @@ return {
             return math.max(1, math.floor(n * (scale_pct or 100) / 100 + 0.5))
         end
 
-        local data = queryAllData()
+        local data = queryAllData(ctx.refresh, preview)
         if not data then
             return TextWidget:new{
                 text = _("Stats unavailable"),
@@ -562,18 +730,33 @@ return {
         -- goal per view (the start menu passes no avail_h; a short cell stays
         -- single). The gate only gets easier as the scale drops, so per_view
         -- stays stable (never flips 2->1) across the host's fit iterations.
-        local per_view = 1
+        local per_view, side = 1, false
         if avail_h and avail_h > 0 and not preview and #getActiveList() >= 2 then
             local probe = buildGoalBlock(getCurrentView(), mw, scale_pct, data, t)
             local h1 = probe:getSize().h
             if probe.free then probe:free() end
-            if h1 < 0.65 * avail_h then per_view = 2 end
+            local Kit = require("lib/bookshelf_module_kit")
+            per_view, side = arrangement(Kit.shape(mw, avail_h), #getActiveList(), h1, avail_h)
         end
         _last_per_view = per_view  -- on_tap's cycleView steps by this
 
         local goals = getViewGoals(per_view)
         if #goals <= 1 then
-            return buildGoalBlock(goals[1] or getCurrentView(), mw, scale_pct, data, t)
+            -- One goal: lays itself out sideways in a strip (Kit.isStrip).
+            return buildGoalBlock(goals[1] or getCurrentView(), mw, scale_pct, data, t, avail_h)
+        end
+        if side then
+            -- Side by side, each in half the width.
+            local HorizontalGroup = require("ui/widget/horizontalgroup")
+            local HorizontalSpan  = require("ui/widget/horizontalspan")
+            local hgap = sc(20)
+            local half = math.floor((mw - hgap) / 2)
+            local row = HorizontalGroup:new{ align = "top" }
+            for i, g in ipairs(goals) do
+                if i > 1 then row[#row + 1] = HorizontalSpan:new{ width = hgap } end
+                row[#row + 1] = buildGoalBlock(g, half, scale_pct, data, t)
+            end
+            return row
         end
         local container = VerticalGroup:new{ align = "left" }
         for i, g in ipairs(goals) do
@@ -588,4 +771,11 @@ return {
     end,
 
     show_settings = showSettings,
+
+    -- The counting and the other-books rule, for tests/_test_reading_goal_count.
+    -- The deferred refresh, for tests/_test_reading_goal_deferred.
+    _test = { countFinished = countFinished, dateYM = dateYM, readOtherBooks = readOtherBooks,
+              queryAllData = function(...) return queryAllData(...) end,
+              setCompute = function(fn) _compute = fn end,
+              forget = function() _data_cache, _last_data = nil, nil end },
 }

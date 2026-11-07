@@ -52,21 +52,27 @@ t.test("the spec round-trips it, alone and in company", function()
     eq(spec("all").first_unread, nil, "All is its own answer")
 end)
 
+-- The marking, driven for real. markSeriesHeads answers both series reasons;
+-- these cases are the ones it inherited from the run rule it replaced.
+local function marker(unread)
+    local body = src:match("\nfunction SpineShelf%.markSeriesHeads%(f, src, st%)\n(.-)\nend\n")
+    assert(body, "markSeriesHeads moved or was renamed")
+    local ifs = src:match("\nfunction SpineShelf%.isFirstInSeries%(src%)\n(.-)\nend\n")
+    local SS = { isUnread = function(s) return unread[s.id] == true end }
+    SS.isFirstInSeries = assert(load("return function(src)\n" .. ifs .. "\nend", "ifs", "t",
+        { type = type, tonumber = tonumber }))()
+    local mark = assert(load("return function(f, src, st)\n" .. body .. "\nend", "mark", "t",
+        { SpineShelf = SS, type = type, tostring = tostring }))()
+    local st = { run_has_series = {}, run_next = {}, series_first = {}, series_next = {} }
+    return function(f, s) mark(f, s, st) end, st
+end
+
 t.test("only the first unread of a run faces out, and only inside a run", function()
-    -- The marking, lifted out of the plan loop and driven directly. `f` is a
-    -- flattened entry; the loop is what supplies run_idx and in_group.
-    local block = src:match("(if f%.in_group and not first_unread_seen.-\n        end)")
-    assert(block, "the first-unread marking moved or was renamed")
-    local seen = {}
-    local unread = { ["a2"] = true, ["a3"] = true, ["b1"] = true, ["c1"] = true }
-    local env = {
-        first_unread_seen = seen,
-        SpineShelf = { isUnread = function(s) return unread[s.id] == true end },
-    }
-    local mark = assert(load(
-        "return function(f, src)\n" .. block .. "\nend", "mark", "t", env))()
-    -- Series A: book 1 finished, 2 and 3 unread -> only 2 faces out.
+    -- Runs with no series names (folder sections of loose files): the run
+    -- stands for the series.
+    local mark = marker({ a2 = true, a3 = true, b1 = true, c1 = true })
     local rows = {
+        -- Series A: book 1 finished, 2 and 3 unread -> only 2 faces out.
         { { in_group = true,  run_idx = 1 }, { id = "a1" } },
         { { in_group = true,  run_idx = 1 }, { id = "a2" } },
         { { in_group = true,  run_idx = 1 }, { id = "a3" } },
@@ -79,51 +85,70 @@ t.test("only the first unread of a run faces out, and only inside a run", functi
     for _i = 1, #rows do mark(rows[_i][1], rows[_i][2]) end
     local out = {}
     for _i = 1, #rows do
-        if rows[_i][1].first_unread_of_group then out[#out + 1] = rows[_i][2].id end
+        if rows[_i][1].series_next then out[#out + 1] = rows[_i][2].id end
     end
     eq(table.concat(out, ","), "a2,b1",
        "expected the next unread of each series and nothing else")
 end)
 
 t.test("a fully-read series faces nothing out", function()
-    local block = src:match("(if f%.in_group and not first_unread_seen.-\n        end)")
-    local env = {
-        first_unread_seen = {},
-        SpineShelf = { isUnread = function() return false end },
-    }
-    local mark = assert(load(
-        "return function(f, src)\n" .. block .. "\nend", "mark", "t", env))()
+    local mark = marker({})
     local f = { in_group = true, run_idx = 1 }
     mark(f, { id = "x" })
-    eq(f.first_unread_of_group, nil,
+    eq(f.series_next, nil,
        "a series the reader has finished should show no cover at all")
 end)
 
-t.test("the plan reads the mark, and does not confuse it with first-in-series", function()
+t.test("a mark earned last time does not outlive the book being finished", function()
+    -- The flattened entries can be planned again; the old marks were only
+    -- ever SET, so a finished book kept its cover until something rebuilt
+    -- the entry.
+    local mark = marker({})
+    local f = { in_group = true, run_idx = 1, series_next = true }
+    mark(f, { id = "x" })
+    eq(f.series_next, nil)
+end)
+
+t.test("the plan reads the marks, and does not confuse the two reasons", function()
     local line = src:match("(or %(face_spec%.first_unread[^\n]+)")
     assert(line, "the plan never consults the new reason")
-    assert(line:find("f.first_unread_of_group == true", 1, true),
+    assert(line:find("f.series_next == true", 1, true),
         "it reads something other than the mark the loop sets")
     local plain = src:match("(or %(face_spec%.first and[^\n]+)")
-    assert(plain and plain:find("f.first_of_group == true", 1, true),
-        "the original first-in-series reason changed meaning")
+    assert(plain and plain:find("f.series_first == true", 1, true),
+        "the first-in-series reason reads something else")
+    assert(src:find("SpineShelf.markSeriesHeads(f, src, series_state)", 1, true),
+        "the plan loop no longer marks the series heads")
 end)
 
 t.test("the picker groups the reasons the way a reader thinks", function()
     -- Reading state first, the two series reasons on one line, and the
-    -- whole-shelf answers at the bottom with Favourites.
+    -- whole-shelf answers at the bottom. Unread standalone sits under Unread,
+    -- with Favourites beside it, and the collection reason has its own row
+    -- beside the button that picks which (issue 470).
     local ed = io.open("lib/bookshelf_chip_editor.lua"):read("*a")
-    local rows = ed:match("local sub_rows = {(.-)\n%s+}\n")
+    local rows = ed:match("\nfunction Editor:_openFaceOut%b()(.-)\nend\n")
     assert(rows, "the picker's rows moved")
     local order = {}
-    for name in rows:gmatch('toggle%("([%a_]+)"%)') do order[#order + 1] = name end
-    eq(table.concat(order, ","), "unread,reading,first,first_unread,recent,favorites",
+    for name in rows:gmatch('toggle%("([%a_]+)"[,%)]') do order[#order + 1] = name end
+    eq(table.concat(order, ","), "unread,reading,on_hold,finished,first,first_unread,standalone,favorites,recent,collection",
        "the picker's row order changed")
-    assert(rows:find('toggle("first"),  toggle("first_unread")', 1, true),
+    assert(rows:find('toggle%("unread"%), toggle%("reading"%),%s+toggle%("on_hold"%), toggle%("finished"%)'),
+        "the four reading states should share a line, in the book menu's order")
+    assert(rows:find('toggle("first"), toggle("first_unread")', 1, true),
         "the two series reasons should share a line")
-    local ed_labels = ed:match("local FACE_LABELS = (%b{})")
+    local ed_labels = ed:match("local function _faceLabels%(%)\n    return (%b{})")
     assert(ed_labels and ed_labels:find("first_unread", 1, true),
         "the new reason has no label, so its button would be blank")
+end)
+
+t.test("the summaries say which books stand face out", function()
+    -- "3 reasons" named none of them, and the View mode card said "Spines"
+    -- over a shelf of covers (user test, fresh install).
+    local ed = io.open("lib/bookshelf_chip_editor.lua"):read("*a")
+    assert(not ed:find('_("%1 reasons")', 1, true), "the count-only summary is back")
+    assert(ed:find('_("%1 + %2 more")', 1, true), "past two, the first reason and a count")
+    assert(ed:find('_("Spines, face out")', 1, true), "the View mode card should say face out")
 end)
 
 t.test("every reason survives the widget's own gate, stored as a bare string", function()
@@ -139,9 +164,12 @@ t.test("every reason survives the widget's own gate, stored as a bare string", f
     local w = io.open("lib/bookshelf_widget.lua"):read("*a")
     assert(not w:match("local FACE_OUT_MODES = {"),
         "the widget keeps its own list of face-out modes again")
-    local fn = w:match("local function _faceOutModes%(%)(.-)\nend")
-    assert(fn, "_faceOutModes is gone")
-    assert(fn:find("SS.FACE_REASONS", 1, true),
+    -- The resolution lives in SpineShelf.faceOutFor, shared with the Shelf
+    -- micro-module.
+    local ss0 = io.open("lib/bookshelf_spine_shelf.lua"):read("*a")
+    local fn = ss0:match("function SpineShelf%.faceOutFor%(tab%)(.-)\nend")
+    assert(fn, "SpineShelf.faceOutFor is gone")
+    assert(fn:find("SpineShelf.FACE_REASONS", 1, true),
         "the accepted modes are not derived from the single list")
     assert(fn:find("none = true", 1, true) and fn:find("all = true", 1, true),
         "none/all are answers rather than reasons and must be added explicitly")
@@ -153,16 +181,16 @@ t.test("every reason survives the widget's own gate, stored as a bare string", f
         reasons[#reasons + 1] = name
     end
     assert(#reasons >= 5, "could not read FACE_REASONS")
-    local modes = assert(load(
-        "local require = ...\nreturn (function()" .. fn .. "\nend)()",
-        "modes", "t"))(function()
-            return { FACE_REASONS = reasons }
-        end)
-    -- pcall(require, ...) is used inside, so hand it a stub that answers.
+    local SS = { FACE_REASONS = reasons }
+    local faceOutFor = assert(load("return function(tab)" .. fn .. "\nend", "modes", "t",
+        { SpineShelf = SS, type = type, ipairs = ipairs, pcall = pcall,
+          require = function() return { read = function() return nil end } end }))()
     for _i = 1, #reasons do
-        assert(modes[reasons[_i]], reasons[_i]
+        assert(faceOutFor({ spine_face_out = reasons[_i] }) == reasons[_i], reasons[_i]
             .. " is rejected by the widget, so ticking it alone does nothing")
     end
+    local modes = { none = faceOutFor({ spine_face_out = "none" }) == "none",
+                    all = faceOutFor({ spine_face_out = "all" }) == "all" }
     assert(modes.none and modes.all, "none/all must still be accepted")
 end)
 

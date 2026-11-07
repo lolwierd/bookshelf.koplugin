@@ -27,6 +27,7 @@ local BFont          = require("lib/bookshelf_fonts")
 local Blitbuffer     = require("ffi/blitbuffer")
 local Screen         = require("device").screen
 local Device         = require("device")
+local Space          = require("lib/bookshelf_space")
 
 -- CardboardTextBox: TextBoxWidget subclass that pins alpha=true so its
 -- explicit bgcolor=CARDBOARD and fgcolor=COLOR_BLACK survive third-party
@@ -60,9 +61,11 @@ local CARDBOARD_EDGE = Blitbuffer.COLOR_BLACK
 -- book card behind the folder casts its drop shadow into the same L-strip
 -- where the folder's would be. Callers rely on this to skip a separate
 -- folder shadow layer.
-local SHADOW_OFFSET = Screen:scaleBySize(4)
+-- Space: a drop shadow should not grow with a DPI override. Mirrors
+-- bookshelf_spine_widget's SHADOW_OFFSET.
+local SHADOW_OFFSET = Space.px(4)
 local CARD_BORDER   = Screen:scaleBySize(1)
-local CARD_RADIUS   = Screen:scaleBySize(4)
+local CARD_RADIUS   = Space.px(4)   -- a corner: does not grow with a DPI override
 
 -- Memoized rendered line height of a single ascii line ("Mg") at a given
 -- infofont-bold size and available width. Tab height and the two-line
@@ -310,7 +313,7 @@ function FolderCard.build(opts)
     local label_scale = BookshelfSettings.read("stack_label_font_scale", 100) or 100
     local face_size   = math.max(8, math.floor(16 * label_scale / 100))
     local face, bold  = BFont:getFace("infofont", face_size, { bold = true })
-    local label_pad     = Size.padding.large
+    local label_pad     = Space.padding.large
     local label_w_avail = card_w - label_pad * 2
 
     -- Single-ascii-line probe to derive actual rendered line height
@@ -425,5 +428,13 @@ end
 -- Exposed for callers that need to align other elements (e.g., a count
 -- badge) with the slot's shadow allocation.
 FolderCard.SHADOW_OFFSET = SHADOW_OFFSET
+
+-- fillColor() -> the card's fill as it is SHOWN now (theme override, or the
+-- manilla / grey default, pre-inverted in night mode): what an author photo's
+-- frame is painted in (bookshelf_series_stack), so frame and card match.
+function FolderCard.fillColor()
+    local fill = _cardColors()
+    return fill
+end
 
 return FolderCard

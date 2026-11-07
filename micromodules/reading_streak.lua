@@ -75,7 +75,7 @@ local function showSettings(ctx)
     local function header(label)
         return { text = label, enabled = false }
     end
-    dialog = ButtonDialog:new{
+    dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
         title        = _("Reading streak"),
         title_align  = "center",
         width_factor = 0.65,
@@ -84,7 +84,7 @@ local function showSettings(ctx)
             { radio(_("Reading insight"), "reading_progress") },
             { radio(_("Reading calendar"), "stats_calendar_view") },
         },
-    }
+    })
     UIManager:show(dialog)
 end
 
@@ -337,6 +337,8 @@ end
 
 return {
     key   = "reading_streak",
+    -- Text: unreadable one grid column wide (truncates or breaks words).
+    min_w = 2,
     title = _("Reading streak"),
     summary = _("From KOReader statistics. Works offline."),
     -- Test hook: the week-consecutiveness rule (incl. the Monday-1-Jan year
@@ -363,7 +365,7 @@ return {
         end
         if s == false then
             -- queried: no statistics DB, or the query failed
-            local TextWidget = require("ui/widget/textwidget")
+            local TextWidget = require("lib/bookshelf_colour_text")
             return TextWidget:new{
                 text    = _("Stats unavailable"),
                 face    = Kit.face(15, scale_pct),

@@ -25,11 +25,36 @@ local VerticalSpan    = require("ui/widget/verticalspan")
 local Modules         = require("lib/bookshelf_start_menu_modules")
 local BFont           = require("lib/bookshelf_fonts")
 local logger          = require("logger")
+local Space           = require("lib/bookshelf_space")
 local _               = require("lib/bookshelf_i18n").gettext
 
 local Screen = Device.screen
 
 local ModulePicker = {}
+
+-- The cards' area. A card holds a live preview, its title and a summary: two
+-- rows of them in an area AREA_ROWS of the modal's 64dp list rows high (one
+-- fewer in landscape, as the modal shaves its grids). On a page of the shelf
+-- editor the modal would fill the page with 64dp rows of cards instead, which
+-- cut every preview short and ran each title into the card below (PW5,
+-- maintainer), so the picker sizes its own area (config.area_height, as the
+-- Theme library does). Short of room, a card gives up to SQUEEZE of its
+-- height before a page drops to one row: the editor's page on a PW5, with a
+-- pack's chips wrapping the strip to two rows, needs about a fifth.
+ModulePicker.AREA_ROWS = 6
+ModulePicker.SQUEEZE = 0.3
+
+-- _areaFor(room, unit, gap, units) -> the area's height, and its rows of
+-- cards. unit: a 64dp list row; gap: the modal's margin; units: list rows in
+-- the window's area; room: the most the area can have (nil: no limit).
+function ModulePicker._areaFor(room, unit, gap, units)
+    local natural = units * unit + (units - 1) * gap
+    local own = math.floor((natural - gap) / 2)
+    if not room or natural <= room then return natural, 2 end
+    local squeezed = math.floor((room - gap) / 2)
+    if squeezed >= own * (1 - ModulePicker.SQUEEZE) then return 2 * squeezed + gap, 2 end
+    return math.max(1, math.min(own, room)), 1
+end
 
 -- Render one module card for the grid: the live preview sits on the same
 -- light-grey rounded card the start menu paints module rows on (visual
@@ -52,13 +77,13 @@ local ModulePicker = {}
 -- whole block is left-aligned and centred in the grey area by the card. No
 -- render/fetch happens here — the live module appears once it's on the page.
 function ModulePicker._networkInfo(def, w)
-    local TextWidget = require("ui/widget/textwidget")
+    local TextWidget = require("lib/bookshelf_colour_text")
     local muted = Modules.COLOR_MUTED or Blitbuffer.COLOR_DARK_GRAY
     local hf, hb = BFont:getFace("cfont", 15, { bold = true })
     local g = VerticalGroup:new{ align = "left" }
     g[#g + 1] = TextWidget:new{ text = _("Network required"),
         face = hf, bold = hb, fgcolor = Blitbuffer.COLOR_BLACK, max_width = w }
-    g[#g + 1] = VerticalSpan:new{ width = Screen:scaleBySize(4) }
+    g[#g + 1] = VerticalSpan:new{ width = Space.px(4) }
     -- Secondary text bumped from 11 to 13: the muted source line was hard to
     -- read at the smaller size on e-ink.
     g[#g + 1] = TextWidget:new{ text = _("Data provided by:"),
@@ -71,9 +96,11 @@ function ModulePicker._networkInfo(def, w)
 end
 
 function ModulePicker._renderCell(item, dimen)
-    local TextWidget = require("ui/widget/textwidget")
-    local card_pad = Screen:scaleBySize(10)
-    local border   = Size.border.thin
+    local TextWidget = require("lib/bookshelf_colour_text")
+    local card_pad = Space.px(10)
+    -- No border in the sizes: the kit's card (cardify) has none, so counted,
+    -- the card came out short of its slot by twice the border.
+    local border   = 0
     local card_w = item.solo
         and math.min(dimen.w, Screen:scaleBySize(300)) or dimen.w
     local card_h = dimen.h
@@ -92,7 +119,7 @@ function ModulePicker._renderCell(item, dimen)
         fgcolor = Blitbuffer.COLOR_BLACK,
         max_width = inner_w,
     }
-    local title_gap = Screen:scaleBySize(6)
+    local title_gap = Space.px(6)
     -- Grey preview area: all remaining inner height once the title row is
     -- reserved — uniform across the grid, independent of preview height.
     local reserved = title_w:getSize().h + title_gap
@@ -101,6 +128,16 @@ function ModulePicker._renderCell(item, dimen)
     -- FRESH preview per render (never the menu's own instance): the same
     -- contract as bookshelf_start_menu._buildModuleRow, including the
     -- title-text fallback when render fails or returns nil.
+    -- The picker is KOReader's own dialog, light whatever the shelf's theme,
+    -- so its cards are drawn in the default light card and ink, not a dark
+    -- theme's (near-black cards in a white dialog, maintainer, PW5). The
+    -- theme's come back once the card is built: modules read these at render
+    -- time.
+    -- Only a dark card is swapped: a light theme's own (warm paper on a
+    -- colour screen, or the reader's pick) already suits the dialog.
+    local Card = require("lib/bookshelf_module_card")
+    local saved_bg, saved_ink, saved_muted = Modules.CARD_BG, Modules.COLOR_PRIMARY, Modules.COLOR_MUTED
+    if Card.isDark(saved_bg) then Modules.resetTheme() end
     local def = Modules.get(item.key)
     local preview
     if def and def.network then
@@ -121,6 +158,8 @@ function ModulePicker._renderCell(item, dimen)
             preview = true, refresh = nil, shape = "square", entry = nil,
             surface = "picker", bw = nil, menu = nil,
             config = require("lib/bookshelf_module_kit").entryConfig(nil, nil),
+            -- The spec's own colours at their defaults (bookshelf_module_card).
+            colors = require("lib/bookshelf_module_card").look(nil, def).colors,
         })
         preview = ok and widget or nil
         if not ok then
@@ -137,7 +176,7 @@ function ModulePicker._renderCell(item, dimen)
     end
     local grey_card = FrameContainer:new{
         background = Modules.CARD_BG,
-        radius     = Screen:scaleBySize(4),
+        radius     = require("lib/bookshelf_popup_kit").RADIUS,
         bordersize = 0,
         padding    = 0,
         -- Preview centred in the capped grey area; ClipContainer bounds it to
@@ -150,6 +189,8 @@ function ModulePicker._renderCell(item, dimen)
             preview,
         },
     }
+    Modules.setCardBg(saved_bg)
+    Modules.setInk(saved_ink, saved_muted)
     local stack = VerticalGroup:new{
         align = "center",
         grey_card,
@@ -158,12 +199,13 @@ function ModulePicker._renderCell(item, dimen)
     }
     local card = FrameContainer:new{
         bordersize = border,
-        radius = Size.radius.default,
+        radius = require("lib/bookshelf_popup_kit").RADIUS,
         padding = card_pad,
         margin = 0,
         background = Blitbuffer.COLOR_WHITE,
         stack,
     }
+    require("lib/bookshelf_popup_kit").cardify(card)
     if item.solo then
         -- Centre the compact card in the (full-width) grid slot.
         return CenterContainer:new{
@@ -180,6 +222,12 @@ end
 --- them. Caller is responsible for the empty-registry case.
 function ModulePicker:show(on_select, opts)
     opts = opts or {}
+    -- opts.key: already chosen (the shelf editor's own Modules page picked
+    -- it): no second picker, straight on to adding it.
+    if opts.key then
+        if on_select then on_select(opts.key) end
+        return
+    end
     -- hero_only modules only make sense in the hero grid; hide them from the
     -- start-menu picker unless this picker was opened for the hero.
     local keys = {}
@@ -189,28 +237,74 @@ function ModulePicker:show(on_select, opts)
             keys[#keys + 1] = key
         end
     end
-    local items = {}
+    -- Every module's group (a chip): its category, its pack, or the reader's
+    -- own (Modules.group). Worked out once per open.
+    local all_items, group_ids, labels, seen = {}, {}, {}, {}
     for _i, key in ipairs(keys) do
-        items[#items + 1] = { key = key, title = Modules.title(key) or key,
-            solo = #keys == 1 }
+        local gid, glabel = "all", nil
+        pcall(function() gid, glabel = Modules.group(key) end)
+        all_items[#all_items + 1] = { key = key, title = Modules.title(key) or key,
+            solo = #keys == 1, group = gid }
+        if not seen[gid] then seen[gid] = true; group_ids[#group_ids + 1] = gid; labels[gid] = glabel end
     end
+    -- Under All, the cards run in the chips' order, a group's together and
+    -- by title within it.
+    local order = {}
+    for i, c in ipairs(Modules.groupChips(group_ids, labels)) do order[c.id] = i end
+    table.sort(all_items, function(a, b)
+        local oa, ob = order[a.group] or 999, order[b.group] or 999
+        if oa ~= ob then return oa < ob end
+        return (a.title or ""):lower() < (b.title or ""):lower()
+    end)
+    local chip = "all"
+    local items = all_items
+    local function filter()
+        if chip == "all" then items = all_items return end
+        items = {}
+        for _i, it in ipairs(all_items) do
+            if it.group == chip then items[#items + 1] = it end
+        end
+    end
+    -- Chips only once there is more than one group to choose between.
+    local chips = (#group_ids > 1) and Modules.groupChips(group_ids, labels) or nil
     local self_ref = self
     -- Columns: a lone module gets a single centred column (a sparse
     -- multi-column grid with one card top-left reads as broken); larger
     -- registries get the usual 2-portrait/3-landscape browse density.
+    -- Rows of cards a page: two, or the one area_height found room for.
+    local rows = 2
     local function cols()
         if #items <= 1 then return 1 end
         return Screen:getWidth() > Screen:getHeight() and 3 or 2
     end
     local config = {
-        title = _("Bookshelf micro-modules"),
+        title = _("Modules"),
+        -- opts.over: a page of the shelf editor (Home > Modules), its Close
+        -- the back chevron; see LibraryModal config.over.
+        over = opts.over,
         no_search = true, -- a handful of cards at most; search row is noise
         grid_cols = cols,
-        cells_per_page = function() return cols() * 2 end,
-        -- Taller grid area (default 5) so each card has room for the preview,
-        -- title AND the data-source summary line without squeezing the preview.
-        -- Still 2 rows per page; this just makes those rows taller.
-        rows_per_page = 6,
+        cells_per_page = function() return cols() * rows end,
+        -- The cards' own area (ModulePicker._areaFor), on a page of the
+        -- editor too: rows that fit hold their preview, title and summary.
+        area_height = function(_cw, room)
+            local units = ModulePicker.AREA_ROWS
+            if Screen:getWidth() > Screen:getHeight() then units = units - 1 end
+            local h
+            h, rows = ModulePicker._areaFor(room, Screen:scaleBySize(64), Space.px(10), units)
+            return h
+        end,
+        chip_strip = chips and function()
+            local out = {}
+            for _i, c in ipairs(chips) do
+                out[#out + 1] = { key = c.id, label = c.label, is_active = c.id == chip }
+            end
+            return out
+        end or nil,
+        on_chip_tap = chips and function(key)
+            chip = key
+            filter()
+        end or nil,
         cell_renderer = ModulePicker._renderCell,
         on_cell_tap = function(item)
             if self_ref.modal then

@@ -11,7 +11,7 @@
 -- all (full-size images, so tens of MB on a metered device).
 package.path = "./?.lua;./?/init.lua;" .. package.path
 
-package.loaded["datastorage"] = {
+package.loaded["datastorage"] = { getDataDir = function() return "/data" end, 
     getSettingsDir = function() return "/settings" end,
 }
 
@@ -76,7 +76,7 @@ local t = helpers.runner()
 
 local CoverApply = dofile("lib/bookshelf_cover_apply.lua")
 
-local ROOT = "/settings/bookshelf_covers"
+local ROOT = "/data/cache/bookshelf/covers"
 
 local function seed()
     FS = {}
@@ -148,6 +148,16 @@ t.test("resetWorkingCache tolerates an unreadable subdirectory", function()
     package.loaded["libs/libkoreader-lfs"].dir = real_dir
     assert(FS[ROOT .. "/emb_book1.png"] == nil, "the rest of the sweep still ran")
     assert(FS[ROOT .. "/opds/srvkey1/aaaa.img"] == "file", "opds/ still exempt")
+end)
+
+t.test("the embedded cover is kept in memory, not written out as a PNG", function()
+    -- Writing a 1400 x 2100 cover as PNG took 2 s on a desktop; the Cover
+    -- tab's first visit waited for it. The grid cell shows candidate.image.
+    local f = assert(io.open("lib/bookshelf_cover_apply.lua")); local src = f:read("*a"); f:close()
+    assert(not src:find("writePNG", 1, true), "embedded cover written to disk again")
+    assert(src:find("image = emb,", 1, true))
+    f = assert(io.open("lib/bookshelf_cover_grid_cell.lua")); src = f:read("*a"); f:close()
+    assert(src:find("local bb = c.image or", 1, true))
 end)
 
 t.done()

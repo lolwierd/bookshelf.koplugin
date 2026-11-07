@@ -5,6 +5,7 @@ above the footer, plus at most one cascade-flyout panel for an open folder.
 Rebuilt fresh from the model on every open and after every edit.
 ]]
 local Blitbuffer      = require("ffi/blitbuffer")
+local Gestures = require("lib/bookshelf_gestures")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device          = require("device")
 local Fonts           = require("lib/bookshelf_fonts")
@@ -17,7 +18,8 @@ local InputContainer  = require("ui/widget/container/inputcontainer")
 local LineWidget      = require("ui/widget/linewidget")
 local OverlapGroup    = require("ui/widget/overlapgroup")
 local Size            = require("ui/size")
-local TextWidget      = require("ui/widget/textwidget")
+local Space           = require("lib/bookshelf_space")
+local TextWidget      = require("lib/bookshelf_colour_text")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -125,7 +127,7 @@ local CHECK_OFF_ICON   = "\xEF\x82\x96" -- U+F096 fa-square-o
 -- is mode-aware because KOReader inverts the framebuffer in night mode, so a
 -- fixed mid-grey would read as a bright halo there (see the spine widget for
 -- the full rationale). Covers offset by scaleBySize(4); half = scaleBySize(2).
-local PANEL_SHADOW_DIST  = Screen:scaleBySize(2)
+local PANEL_SHADOW_DIST  = Space.px(2)   -- a shadow: does not grow with a DPI override
 local PANEL_SHADOW_DAY   = Blitbuffer.gray(0.5)
 local PANEL_SHADOW_NIGHT = Blitbuffer.gray(0.15)
 local function _panelShadowGray()
@@ -196,7 +198,7 @@ function StartMenu.open(bw, bottom_inset, burger_dimen, context, burger_art, anc
     local no_button = (burger_dimen == nil)
     local menu = StartMenu:new{
         bw            = bw,
-        bottom_inset  = no_button and 0 or (bottom_inset + Screen:scaleBySize(6)),
+        bottom_inset  = no_button and 0 or (bottom_inset + Space.px(6)),
         _balance_bottom_margin = no_button,
         burger_dimen  = burger_dimen,
         burger_art    = burger_art,   -- actual launcher art size (#279 scaling)
@@ -284,7 +286,7 @@ function StartMenu.open(bw, bottom_inset, burger_dimen, context, burger_art, anc
     StartMenu._live = menu -- test/introspection hook; cleared in onCloseWidget
 end
 
--- Model.load() filtered by the "In start menu" micro-module surface toggle.
+-- Model.load() filtered by the "In the start menu" module surface toggle.
 -- Display-only: mutations go through bookshelf_start_menu_edit's own fresh
 -- Model.load, so the stored model (with its module entries) is never touched by
 -- the filtering -- toggling the surface back on restores the cards untouched.
@@ -335,11 +337,6 @@ end
 
 function StartMenu:init()
     local _t0 = _gettime()
-    -- The module palette (card, ink) is process-global and only the LIBRARY's
-    -- hero build writes it. Under the reader this menu sits on a plain page
-    -- the shelf theme never touches, so after a dark or wallpapered shelf its
-    -- cards kept the dark card and white ink. See Modules.resetTheme.
-    if self.context == "reader" then pcall(Modules.resetTheme) end
     -- Menu-open signal: bump the loader's generation counter exactly once
     -- per open (init runs once per StartMenu instance; _reload does not
     -- re-init). Modules key per-open caches on it — see the README.
@@ -360,7 +357,7 @@ function StartMenu:init()
     -- so the popup sits off the screen edge like the shelf content does.
     local Size = require("ui/size")
     self._margin = math.min(
-        math.floor(Size.padding.fullscreen * 2 * 0.8),
+        math.floor(Space.padding.fullscreen * 2 * 0.8),
         math.floor(Screen:getWidth() * 0.03))
     -- Gesture-opened with no footer button: mirror the side margin onto the
     -- bottom so the panel is evenly inset (the horizontal anchor already
@@ -371,7 +368,7 @@ function StartMenu:init()
     -- Chrome constants shared by row building and the pagination budget.
     self._focus_border = Screen:scaleBySize(2) -- row margin/border swap
     self._panel_border = Screen:scaleBySize(2) -- panel FrameContainer border
-    self._panel_pad    = Screen:scaleBySize(3) -- panel FrameContainer padding
+    self._panel_pad    = Space.px(3) -- panel FrameContainer padding
     self:_applyFontScale()
     local _t1 = _gettime()
     self._items    = self:_loadItems()
@@ -457,7 +454,7 @@ end
 function StartMenu:_applyFontScale()
     local pct = Store.read("start_menu_font_scale") or 100
     local function sc(n) return math.max(1, math.floor(n * pct / 100 + 0.5)) end
-    self._pad      = Screen:scaleBySize(sc(10))
+    self._pad      = Space.px(sc(10))
     self._row_face  = Fonts:getFace("cfont", sc(18))
     self._icon_face = Fonts:getFace("cfont", sc(22))
     self._icon_col_w = Screen:scaleBySize(sc(30))
@@ -652,7 +649,7 @@ function StartMenu:_buildRow(entry, w, focused, in_flyout)
                 -- Just below the vertically-centred label baseline.
                 local cy = y + focus_border
                     + math.floor((ul_row_h + ul_h) / 2) + Screen:scaleBySize(1)
-                bb:paintRect(x + ul_x_off, cy, ul_w, th, ul_fg)
+                require("lib/bookshelf_color").paintRect(bb, x + ul_x_off, cy, ul_w, th, ul_fg)
             end
         end
     end
@@ -691,7 +688,7 @@ function StartMenu:_buildRow(entry, w, focused, in_flyout)
     end
     function row:onHold(_a, ges)
         if flyoutOwns(ges) then return false end
-        sm:_editEntry(entry); return true
+        if Gestures.on("start_menu_hold") then sm:_editEntry(entry) end; return true
     end
     return row
 end
@@ -773,7 +770,8 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
         -- layout/shaping error is caught here too. No disk writes on this path.
         -- The render still gets the scoped refresh (5th arg) for async redraws.
         local ok, widget = Breaker.guard(function()
-            local wgt = def.render({
+            -- With the book actions every module ctx has (bookHelpers).
+            local wgt = def.render(require("lib/bookshelf_hero_modules").bookHelpers({
                 width = inner_w, height = nil, max_height = content_cap,
                 scale = self._scale_pct or 100,
                 preview = false, refresh = refresh, shape = card_shape,
@@ -781,13 +779,15 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
                 surface = "start_menu", bw = self.bw, menu = self,
                 clamp = true,
                 config = Kit.entryConfig(entry, nil),
+                -- The spec's own colours (bookshelf_module_card).
+                colors = require("lib/bookshelf_module_card").look(entry, def).colors,
                 -- Optional per-region taps (Kit.hitRegion): rects in the
                 -- returned widget's own coordinate space; resolved by the
                 -- row's onTap below into ctx.tapped_region.
                 set_tap_regions = function(r)
                     tap_regions = type(r) == "table" and r or nil
                 end,
-            })
+            }))
             if wgt then wgt:getSize() end
             return wgt
         end)
@@ -828,7 +828,8 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
         local prev = self._module_heights[entry.id]
         if prev and math.abs(ih - prev) <= Screen:scaleBySize(6) then
             local ClipContainer = require("lib/bookshelf_clip_container")
-            inner = ClipContainer:new{ w = iw, h = prev, bg = Modules.CARD_BG, inner }
+            -- Gestures pass: unclipped, the module's own buttons get them anyway.
+            inner = ClipContainer:new{ w = iw, h = prev, bg = Modules.CARD_BG, pass_gestures = true, inner }
             hyst_clip = inner
         else
             self._module_heights[entry.id] = ih
@@ -846,10 +847,10 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     -- Shared card-surface grey (Modules.CARD_BG): light enough that the
     -- modules' COLOR_DARK_GRAY muted text stays readable, while still
     -- reading as a distinct surface against the panel's white.
-    local card = FrameContainer:new{
+    -- The popup kit's card (STYLE.md): its corner and hairline shadow, on
+    -- the modules' own card grey.
+    local card = require("lib/bookshelf_popup_kit").card{
         background = Modules.CARD_BG,
-        radius     = Screen:scaleBySize(4),
-        bordersize = 0,
         padding    = card_pad,
         content,
     }
@@ -913,7 +914,7 @@ function StartMenu:_buildModuleRow(entry, w, focused, in_flyout)
     end
     function row:onHold(_a, ges)
         if flyoutOwns(ges) then return false end
-        sm:_editEntry(entry); return true
+        if Gestures.on("start_menu_hold") then sm:_editEntry(entry) end; return true
     end
     return row
 end
@@ -926,7 +927,7 @@ end
 -- so it never appears in d-pad/chevron focus navigation -- nothing to land
 -- on, nothing to activate.
 function StartMenu:_buildDividerRow(entry, w)
-    local inset = Size.span.horizontal_default
+    local inset = Space.span.horizontal_default
     local line = HorizontalGroup:new{
         align = "center",
         HorizontalSpan:new{ width = inset },
@@ -949,7 +950,7 @@ function StartMenu:_buildDividerRow(entry, w)
         }
     end
     function row:onHold()
-        sm:_editEntry(entry); return true
+        if Gestures.on("start_menu_hold") then sm:_editEntry(entry) end; return true
     end
     return row
 end
@@ -972,7 +973,7 @@ function StartMenu:_buildPanel(entries, w, folder_id)
         rows[#rows + 1] = { row = row, entry = add_entry }
     end
     for _i, entry in ipairs(entries) do
-        local is_focused = self._focus and self._focus.entry_id == entry.id
+        local is_focused = self._focus and self._cursor_shown and self._focus.entry_id == entry.id
         local row
         if entry.type == "divider" then
             row = self:_buildDividerRow(entry, w)
@@ -989,7 +990,7 @@ function StartMenu:_buildPanel(entries, w, folder_id)
     local frame = PanelFrame:new{
         bordersize = self._panel_border,
         padding    = self._panel_pad,
-        radius     = Screen:scaleBySize(4), -- bookshelf's card radius (CARD_RADIUS)
+        radius     = Space.px(4), -- bookshelf's card radius (CARD_RADIUS)
         shadow     = PANEL_SHADOW_DIST,
         vg,
     }
@@ -1126,6 +1127,11 @@ end
 
 function StartMenu:_build()
     local _bt0 = _gettime()
+    -- The panel is always white, in the library and the reader alike, so its
+    -- module cards take the light palette, on every build: the palette is
+    -- process-global, and the shelf's grid sets its own theme's (a dark
+    -- shelf's dark cards came up on the white panel). See Modules.resetTheme.
+    pcall(Modules.resetTheme)
     self:_applyFontScale()
     self:_markUnresolved(self._items)
     local _bt1 = _gettime()
@@ -1309,21 +1315,21 @@ function StartMenu:_build()
             -- With the menu on the right the flyout opens LEFTWARD, the
             -- mirror image of the default layout (same overlap, mirrored
             -- narrow-screen clamp).
-            local overlap = Screen:scaleBySize(14)
+            local overlap = Space.px(14)
             local fly_x
             if on_right then
                 fly_x = root_x - fly_sz.w + overlap
                 if fly_x < self._margin then
                     -- Narrow screen: overlap the parent, keep a sliver visible.
                     fly_x = math.min(
-                        root_x + root_sz.w - Screen:scaleBySize(24) - fly_sz.w,
+                        root_x + root_sz.w - Space.px(24) - fly_sz.w,
                         self._margin)
                 end
             else
                 fly_x = root_x + root_sz.w - overlap
                 if fly_x + fly_sz.w + self._margin > sw then
                     -- Narrow screen: overlap the parent, keep a sliver visible.
-                    fly_x = math.max(root_x + Screen:scaleBySize(24),
+                    fly_x = math.max(root_x + Space.px(24),
                         sw - self._margin - fly_sz.w)
                 end
             end
@@ -1450,8 +1456,9 @@ function StartMenu:_build()
             -- Clamp so every square stays inside the art box.
             local last = xspan - stroke
             for t = 0, last do
-                bb:paintRect(x + t, y + t, stroke, stroke, ink)  -- ↘ diagonal
-                bb:paintRect(x + last - t, y + t, stroke, stroke, ink)  -- ↙
+                -- Through Color.paintRect: the ink is the Panel text pick.
+                require("lib/bookshelf_color").paintRect(bb, x + t, y + t, stroke, stroke, ink)  -- ↘ diagonal
+                require("lib/bookshelf_color").paintRect(bb, x + last - t, y + t, stroke, stroke, ink)  -- ↙
             end
         end
         local glyph = XWidget:new{}
@@ -1492,13 +1499,20 @@ function StartMenu:_build()
             if ok_cp and CoverProgress and CoverProgress.resolvedColors
                     and self.bw and self.bw.wallpaperScrimStrength then
                 local ok_c, colors = pcall(CoverProgress.resolvedColors)
-                if ok_c and colors then scrim_c = colors.panel_bg end
+                if ok_c and colors then scrim_c = colors.panel_tint or colors.panel_bg end
                 local ok_s, sv = pcall(function()
                     return self.bw:wallpaperScrimStrength()
                 end)
                 if ok_s then scrim_s = sv end
             end
-            local eraser = Wallpaper.eraser(true, art, box_h, scrim_c, scrim_s)
+            -- The shelf's own copy of what is under the button, when it has
+            -- one: the panel can carry a blur, and the bottom shelf's plank
+            -- design can stand in front of it, neither of which a replay of
+            -- picture and tint gets right.
+            local bw, menu = self.bw, self
+            local under = (bw and type(bw.burgerUnder) == "function")
+                and function() return bw:burgerUnder(menu) end or nil
+            local eraser = Wallpaper.eraser(true, art, box_h, scrim_c, scrim_s, under)
             if eraser then
                 close_inner = OverlapGroup:new{
                     dimen = Geom:new{ w = art, h = box_h },
@@ -1720,6 +1734,7 @@ function StartMenu:_activate(entry, tap_rect, tapped_region)
         local menu = self
         local ctx = { bw = self.bw, menu = self, entry = entry, surface = "start_menu",
                       tapped_region = tapped_region }
+        require("lib/bookshelf_hero_modules").bookHelpers(ctx)
         -- Per-instance save: persist a change the module made to ctx.entry into
         -- the start-menu list, then reload. (Mirrors the hero ctx.save.)
         function ctx.save()
@@ -1857,8 +1872,19 @@ end
 
 -- ── Key-nav event handlers ────────────────────────────────────────────────────
 
+-- _revealCursor() -> true when the keys' cursor was hidden and this press
+-- showed it (on the row it was seeded on) instead of acting. Opened by a
+-- tap, the menu shows no cursor: an outlined row looked picked (STYLE.md).
+function StartMenu:_revealCursor()
+    if self._cursor_shown then return false end
+    self._cursor_shown = true
+    self:_rebuild_only()
+    return true
+end
+
 function StartMenu:onSMFocusDown()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     local panel = self._focus.panel
     local entries = self:_panelEntries(panel)
     -- Find current position (nil when page has no focusables).
@@ -1913,6 +1939,7 @@ end
 
 function StartMenu:onSMFocusUp()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     local panel = self._focus.panel
     local entries = self:_panelEntries(panel)
     local idx = nil
@@ -1959,6 +1986,7 @@ end
 
 function StartMenu:onSMFocusRight()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     if self._focus.panel ~= "root" then return true end
     local entry = self:_focusedEntry()
     if not entry or entry.type ~= "folder" then return true end
@@ -1977,6 +2005,7 @@ end
 
 function StartMenu:onSMFocusLeft()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     if self._focus.panel ~= "flyout" then return true end
     -- Close the flyout, return focus to the folder entry in root.
     local folder_id = self._flyout_for
@@ -1990,6 +2019,7 @@ end
 
 function StartMenu:onSMPress()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     local entry = self:_focusedEntry()
     if not entry then return true end
     if entry.id == "__add" then
@@ -2005,6 +2035,7 @@ end
 
 function StartMenu:onSMHold()
     if not self._focus then return true end
+    if self:_revealCursor() then return true end
     local entry = self:_focusedEntry()
     if entry and entry.id ~= "__add" then
         self:_editEntry(entry)
@@ -2065,4 +2096,15 @@ function StartMenu:onTapDismiss(_arg, ges)
     self:_close()
     return true
 end
+-- KOReader's own gestures (the menu, brightness) keep working around it,
+-- as over the shelf (GestureZones.overlayEvent; maintainer, PW5).
+function StartMenu:handleEvent(event)
+    return require("lib/bookshelf_gesture_zones").overlayEvent(self, event, InputContainer,
+        function(pos)
+            local r, f = self._root_region, self._flyout_region
+            if not r then return true end
+            return pos:intersectWith(r) or (f and pos:intersectWith(f)) or false
+        end)
+end
+
 return StartMenu

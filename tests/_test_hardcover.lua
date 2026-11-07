@@ -89,6 +89,17 @@ package.loaded["hardcover/lib/hardcover_api"] = {
                             user = { name = "Reader One", username = "readerone" },
                         },
                     },
+                    spoiler_books = {
+                        {
+                            id = 502,
+                            rating = 5,
+                            review = "<p>The ending turns on the butler.</p>",
+                            review_has_spoilers = true,
+                            reviewed_at = "2026-05-02T00:00:00",
+                            likes_count = 7,
+                            user = { name = "Reader Two", username = "readertwo" },
+                        },
+                    },
                 },
             }
         end
@@ -159,6 +170,19 @@ test("linkBook stores a Bookshelf-owned link", function()
     local link = Hardcover.getLink("/books/a.epub")
     assert(link and link.book_id == 123, "missing book_id")
     assert(link.title == "A Book", "missing title")
+end)
+
+test("re-linking keeps the cover and description choices", function()
+    reset()
+    assert(Hardcover.linkBook("/books/a.epub", { id = 123, title = "A Book" }))
+    assert(Hardcover.markUseCover("/books/a.epub", true))
+    assert(Hardcover.setUseDescription("/books/a.epub", false))
+    -- Select edition / Manual link: a fresh record for the same file.
+    assert(Hardcover.linkBook("/books/a.epub", { id = 777, title = "Other Edition" }))
+    local link = Hardcover.getLink("/books/a.epub")
+    assert(link.book_id == 777, "the re-link did not take")
+    assert(link.use_cover == true, "the re-link dropped use_cover")
+    assert(link.use_description == false, "the re-link dropped use_description")
 end)
 
 test("enrichBook shows Hardcover cover/description only on an explicit flag", function()
@@ -275,6 +299,11 @@ test("fetchReviews loads and caches non-spoiler Hardcover reviews", function()
     assert(#result.reviews == 1, "expected one non-spoiler review")
     assert(result.reviews[1].user_name == "Reader One", "missing reviewer")
     assert(result.reviews[1].text == "<p>Sharp and strange.</p>", "missing review text")
+    -- Spoiler reviews come in the same request, kept apart for the popup's
+    -- "Include spoilers" switch.
+    assert(type(result.spoiler_reviews) == "table" and #result.spoiler_reviews == 1,
+        "expected one spoiler review kept apart")
+    assert(result.spoiler_reviews[1].spoiler == true)
 
     local Api = package.loaded["hardcover/lib/hardcover_api"]
     local old_query = Api.query

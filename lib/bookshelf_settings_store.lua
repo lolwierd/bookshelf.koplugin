@@ -24,7 +24,11 @@ local LuaSettings = require("luasettings")
 local logger      = require("logger")
 local lfs         = require("libs/libkoreader-lfs")
 
-local SETTINGS_PATH = DataStorage:getSettingsDir() .. "/bookshelf.lua"
+-- settings/bookshelf/settings.lua (lib/bookshelf_paths). Until 5.3 it was
+-- settings/bookshelf.lua; lib/bookshelf_storage_move brings it over, before
+-- this module loads (main.lua runs the move first).
+local Paths = require("lib/bookshelf_paths")
+local SETTINGS_PATH = Paths.settingsFile("settings.lua")
 
 local _file_present_at_load = lfs.attributes(SETTINGS_PATH, "mode") ~= nil
 
@@ -69,27 +73,36 @@ local _settings = nil
 
 -- Large values are routed to their OWN files (not bookshelf.lua), so saving an
 -- ordinary preference doesn't rewrite them:
---   * "micromodule_*" keys      -> bookshelf_micromodules.lua
---   * "hardcover_links" (cache) -> bookshelf_hardcover_links.lua
---   * "opds_cache" (cache)      -> bookshelf_opds.lua
+--   * "micromodule_*" keys      -> settings/bookshelf/micromodule_data.lua
+--   * "hardcover_links" (cache) -> settings/bookshelf/hardcover_links.lua
+--   * "opds_cache" (cache)      -> cache/bookshelf/opds.lua
+--   * "ornament_decks"          -> settings/bookshelf/ornament_decks.lua (every
+--     shelf's order of every piece: 208 KB of a 272 KB file on a PW5, so each
+--     preference saved rewrote it, a third of a second a time). Only on its
+--     way: lib/bookshelf_ornament_decks_db takes them into SQLite from here
 -- subStoreFor(key) returns the destination store or nil (= the main file).
 -- Sub-stores are lazy-required so they aren't pulled in until a routed key is
 -- touched (and so the standalone test runner can stub them).
-local _mm, _hc, _opds
+local _mm, _hc, _opds, _od
 local function mm()
     _mm = _mm or require("lib/bookshelf_micromodule_store")
     return _mm
 end
 local function hc()
-    _hc = _hc or require("lib/bookshelf_file_store").new("bookshelf_hardcover_links.lua")
+    _hc = _hc or require("lib/bookshelf_file_store").new(Paths.settingsFile("hardcover_links.lua"))
     return _hc
 end
 local function opds()
-    _opds = _opds or require("lib/bookshelf_file_store").new("bookshelf_opds.lua")
+    _opds = _opds or require("lib/bookshelf_file_store").new(Paths.cacheFile("opds.lua"))
     return _opds
+end
+local function od()
+    _od = _od or require("lib/bookshelf_file_store").new(Paths.settingsFile("ornament_decks.lua"))
+    return _od
 end
 local function subStoreFor(key)
     if type(key) ~= "string" then return nil end
+    if key == "ornament_decks" then return od() end
     if key:sub(1, 12) == "micromodule_" then return mm() end
     if key == "hardcover_links" then return hc() end
     if key == "opds_cache" then return opds() end
@@ -97,6 +110,21 @@ local function subStoreFor(key)
 end
 
 function Store.wasPresent() return _file_present_at_load end
+
+-- view() -> a readSetting-shaped view of this store, for code written against
+-- a LuaSettings object: lib/status_line, which is shared word for word with
+-- Bookends and still names the three status-line keys by their old
+-- settings.reader.lua names, read here under their new ones.
+local VIEW_NAMES = {
+    bookshelf_hero_regions     = "hero_regions",
+    bookshelf_status_in_reader = "status_in_reader",
+    bookshelf_reader_status_h  = "reader_status_h",
+}
+local _view
+function Store.view()
+    _view = _view or { readSetting = function(_self, k) return Store.read(VIEW_NAMES[k] or k) end }
+    return _view
+end
 
 local function _migrate(s)
     if s:readSetting("migrated") then return end
@@ -139,7 +167,10 @@ end
 -- the keys removed. A crash in between leaves the value in BOTH files (the main
 -- deletes are in-memory until its flush), so the next run simply re-migrates --
 -- never a loss.
-local RELOCATED_FLAG = "aux_data_relocated_v2"
+local RELOCATED_FLAG = "aux_data_relocated_v3"
+-- Keys lib/bookshelf_module_cache took over (disposable: a refit, a recount),
+-- left behind in this file by the versions before it. Dropped by the pass.
+local LEFT_BEHIND = { "module_fit_memo", "shelf_size_tally", "reading_goal_last" }
 local function _relocateAux(s)
     if s:readSetting(RELOCATED_FLAG) then return end
     local data = s.data or {}
@@ -160,8 +191,40 @@ local function _relocateAux(s)
         logger.dbg(string.format("[bookshelf] relocated %d key(s) to %s", n, sub.path()))
     end
     for _i, k in ipairs(keys) do s:delSetting(k) end
+    for _i, k in ipairs(LEFT_BEHIND) do s:delSetting(k) end
+    s:delSetting("aux_data_relocated_v2")
     s:saveSetting(RELOCATED_FLAG, true)
     s:flush()
+end
+
+-- One-shot (5.3): the three status-line settings lived in KOReader's
+-- settings.reader.lua, so a backup of settings/bookshelf/ missed them. Moved
+-- into this file; a value already here wins. Bookends reads them too, and
+-- follows them here in its own update.
+local READER_KEYS = {
+    bookshelf_hero_regions     = "hero_regions",
+    bookshelf_status_in_reader = "status_in_reader",
+    bookshelf_reader_status_h  = "reader_status_h",
+}
+local function _moveReaderKeys(s)
+    if type(G_reader_settings) ~= "table" then return end
+    local moved = s:readSetting("reader_keys_moved")
+    local cleared = false
+    for old, new in pairs(READER_KEYS) do
+        local v = G_reader_settings:readSetting(old)
+        if v ~= nil then
+            -- Copied once. Cleared whenever still there: a KOReader killed
+            -- before it saved its file brings the old entries back from disk.
+            if not moved and s:readSetting(new) == nil then s:saveSetting(new, v) end
+            G_reader_settings:delSetting(old)
+            cleared = true
+        end
+    end
+    if cleared and G_reader_settings.flush then pcall(function() G_reader_settings:flush() end) end
+    if not moved then
+        s:saveSetting("reader_keys_moved", true)
+        s:flush()
+    end
 end
 
 local function _open()
@@ -169,6 +232,7 @@ local function _open()
     _settings = LuaSettings:open(SETTINGS_PATH)
     _migrate(_settings)
     _relocateAux(_settings)
+    _moveReaderKeys(_settings)
     return _settings
 end
 
@@ -181,6 +245,11 @@ end
 local _generation = 0
 
 function Store.generation() return _generation end
+
+-- bump(): a new generation with nothing written. For a change that lives in
+-- memory only (the shelf on screen wears another theme), so every cache keyed
+-- on the generation is rebuilt without a settings write.
+function Store.bump() _generation = _generation + 1 end
 
 function Store.read(key, default)
     local sub = subStoreFor(key)
@@ -256,10 +325,18 @@ function Store.expandedTapAction()
     return Store.isTrue("tap_to_open_double") and "open_double" or "open"
 end
 
+-- Modules among a shelf's books (Shelf editor > Add a module to this shelf,
+-- an ornament's Pin here). On by default; off, a shelf shows only its books
+-- and the ornaments it deals, and its modules are kept for when it is on.
+function Store.microOnShelf()
+    return Store.read("micro_on_shelf") ~= false
+end
+
 -- Kill switch: true while ANY surface is on. When false the micro-module
 -- registry scan / loader is skipped entirely (no rendering, no async fetches).
 function Store.microAnyEnabled()
     return Store.microInStartMenu() or Store.microInHero() or Store.microFullscreenButton()
+        or Store.microOnShelf()
 end
 
 -- saveDeferred(key, value): in-memory write only -- no flush. For hot-path

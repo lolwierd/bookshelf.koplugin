@@ -178,12 +178,11 @@ function Edit.show(menu, entry)
                     UIManager:close(chooser); clearIcon()
                 end } }
             end
-            crows[#crows + 1] = { { text = _("Cancel"), id = "close",
-                callback = function() UIManager:close(chooser) end } }
-            chooser = ButtonDialog:new{
+            -- No Cancel row: the title's X (withClose) is the way out.
+            chooser = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
                 title = _("Icon"), title_align = "center",
                 width_factor = 0.65, buttons = crows,
-            }
+            })
             UIManager:show(chooser)
         end
 
@@ -290,12 +289,11 @@ function Edit.show(menu, entry)
                                 end },
                             }
                         end
-                        srows[#srows + 1] = { { text = _("Cancel"), id = "close",
-                            callback = function() UIManager:close(sub) end } }
-                        sub = ButtonDialog:new{
+                        -- No Cancel row: the title's X (withClose).
+                        sub = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
                             title = _("Move to folder"), title_align = "center",
                             width_factor = 0.65, buttons = srows,
-                        }
+                        })
                         UIManager:show(sub)
                     end) },
                 }
@@ -355,19 +353,21 @@ function Edit.show(menu, entry)
                           end },
                     }
                 end
-                srows[#srows + 1] = { { text = _("Cancel"), id = "close",
-                    callback = function() UIManager:close(sub) end } }
-                sub = ButtonDialog:new{ title = _("Show in"), title_align = "center",
-                    width_factor = 0.65, buttons = srows }
+                -- No Cancel row: the title's X (withClose).
+                sub = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{ title = _("Show in"), title_align = "center",
+                    width_factor = 0.65, buttons = srows })
                 UIManager:show(sub)
             end) },
         }
     end
 
     local function doDelete()
+        -- What the card owned goes with it (on_remove; a module row's).
+        local _l, _i, gone = Model.findById(Model.load(), id)
         mutate(menu, function(items)
             return Model.removeById(items, id)
         end)
+        if gone and gone.type == "module" then Modules.notifyRemoved(gone) end
     end
     local delete_btn = { text = "\xEE\xA2\xBF", -- U+E8BF mdi-delete (matches chip editor)
         font_face = "symbols", font_size = 28, font_bold = false,
@@ -406,12 +406,13 @@ function Edit.show(menu, entry)
     if title_icon and Model.imageIconName(title_icon) then title_icon = nil end
     local entry_title = (title_icon and (title_icon .. "  ") or "") .. displayLabel(entry)
 
-    dialog = ButtonDialog:new{
+    -- The title's X is the way out (STYLE.md).
+    dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
         title        = entry_title,
         title_align  = "center",
         width_factor = 0.65,
         buttons      = rows,
-    }
+    })
     UIManager:show(dialog)
 end
 
@@ -476,11 +477,11 @@ function Edit.showAdd(menu, anchor_id, folder_id)
     -- "Bookshelf micro-module…" is hidden when the start-menu micro-module
     -- surface is off: no way to add one when module cards aren't shown there.
     if require("lib/bookshelf_settings_store").microInStartMenu() then
-        rows[#rows + 1] = { { text = _("Bookshelf micro-module…"), callback = close(function()
+        rows[#rows + 1] = { { text = _("Bookshelf module…"), callback = close(function()
             local keys = Modules.keys()
             if #keys == 0 then
                 UIManager:show(Notification:new{
-                    text = _("No micro-modules available"),
+                    text = _("No modules available"),
                 })
                 return
             end
@@ -533,12 +534,12 @@ function Edit.showAdd(menu, anchor_id, folder_id)
         }
     end
 
-    dialog = ButtonDialog:new{
+    dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
         title        = _("Add to menu"),
         title_align  = "center",
         width_factor = 0.65,
         buttons      = rows,
-    }
+    })
     UIManager:show(dialog)
 end
 

@@ -93,6 +93,31 @@ local SKIP_ACQ_REL = {
     ["http://opds-spec.org/acquisition/sample"]  = true,
     ["http://opds-spec.org/acquisition/preview"] = true,
 }
+-- OPDS Page Streaming Extension (https://vaemendis.net/opds-pse/): a comic
+-- or manga served one page image at a time, as Komga, Kavita and Suwayomi do.
+-- Its link carries the page count as a namespaced attribute; the prefix is
+-- whatever the feed declared, so it is matched by suffix, as the stock
+-- browser does. A chapter can be stream-only (Suwayomi), so a stream link
+-- alone makes an entry a book.
+local STREAM_REL = "http://vaemendis.net/opds-pse/stream"
+M.STREAM_REL = STREAM_REL
+
+-- streamOf(link, href) -> { href, count, last_read } or nil without a count.
+local function streamOf(link, href)
+    local count, last_read
+    for k, v in pairs(link) do
+        if type(k) == "string" then
+            if k:sub(-6) == ":count" then count = tonumber(v)
+            elseif k:sub(-9) == ":lastRead" then last_read = tonumber(v) end
+        end
+    end
+    if not count or count < 1 then return nil end
+    return { href = href, count = math.floor(count),
+             -- Page 1 is where a stream starts anyway: no Resume for it.
+             last_read = last_read and last_read > 1 and math.floor(last_read) or nil }
+end
+M._streamOf = streamOf
+
 local CATALOG_TYPE    = "application/atom%+xml"
 local OSD_TYPE        = "application/opensearchdescription%+xml"
 -- OPDS 2.0's canonical MIME type: fetch()'s Accept-header preference, the
@@ -213,11 +238,72 @@ local function entryTitle(entry)
     return nil
 end
 
+-- seriesNum(v) -> a series position as the top panel shows it: "2" for 2
+-- or "2.0", "2.5" kept, nil for nothing usable.
+local function seriesNum(v)
+    local n = tonumber(v)
+    if not n then return nil end
+    if n == math.floor(n) then return string.format("%d", n) end
+    return (string.format("%.2f", n):gsub("0+$", ""))
+end
+
+-- entrySeries(entry) -> name, position: the series an entry belongs to.
+--   OPDS 1.x, EPUB 3 style (Grimmory, BookLore; GitHub issue 478):
+--     <meta property="belongs-to-collection" id="series">Name</meta>
+--     <meta property="group-position" refines="#series">2.0</meta>
+--   OPDS 2.0: mapped onto entry._series by opds2PublicationToEntry.
+local function entrySeries(entry)
+    if type(entry._series) == "table" then
+        return entry._series.name, seriesNum(entry._series.position)
+    end
+    local metas = entry.meta
+    if type(metas) ~= "table" then return nil end
+    local name, id
+    for _i, m in ipairs(metas) do
+        if type(m) == "table" and m.property == "belongs-to-collection"
+                and type(m._text) == "string" and m._text ~= "" then
+            name, id = m._text, m.id
+            break
+        end
+    end
+    if not name then return nil end
+    local pos
+    for _i, m in ipairs(metas) do
+        if type(m) == "table" and m.property == "group-position"
+                -- luxl drops the "#" of refines="#series": either spelling.
+                and (id == nil or m.refines == "#" .. id or m.refines == id) then
+            pos = seriesNum(m._text)
+            break
+        end
+    end
+    return name, pos
+end
+
 local function entryAuthor(entry)
     if type(entry.author) ~= "table" then return nil end
     local name = entry.author.name
     if type(name) == "string" and name ~= "" then return name end
     if type(name) == "table" and #name > 0 then return table.concat(name, ", ") end
+    return nil
+end
+
+-- entryPubdate(entry) -> the year a book was published, as %calibre{pubdate}
+-- shows it for a calibre book ("1974"), or nil (GitHub issue 566). KOReader
+-- has no publication date field, so only the feed can supply it:
+--   dcterms:issued / dc:issued: what the OPDS 1.x spec names for it.
+--   dc:date: calibre's own content server.
+--   published: Calibre-Web, whose <published> is the book's pubdate. Last,
+--     because calibre's server fills <published> with the date ADDED, and
+--     names the real one in dc:date above.
+--   OPDS 2.0: metadata.published, mapped onto entry._published.
+-- calibre writes 0100/0101-01-01 for "no date set": no year, as calibre_metadata.
+local PUBDATE_KEYS = { "_published", "dcterms:issued", "dc:issued", "dc:date", "published" }
+local function entryPubdate(entry)
+    for _i, k in ipairs(PUBDATE_KEYS) do
+        local v = entry[k]
+        local y = type(v) == "string" and v:match("^%s*(%d%d%d%d)")
+        if y and y:sub(1, 1) ~= "0" then return y end
+    end
     return nil
 end
 
@@ -293,13 +379,23 @@ local CANON_THUMB_REL = "http://opds-spec.org/image/thumbnail"
 -- equivalent, so it becomes two synthetic links carrying the canonical rels
 -- above instead.
 local function opds2PublicationToEntry(pub)
-    local title, author, summary, id
+    local title, author, summary, id, series, published
     if type(pub.metadata) == "table" then
         if type(pub.metadata.title) == "string" then title = pub.metadata.title end
+        if type(pub.metadata.published) == "string" then published = pub.metadata.published end
         author = opds2AuthorName(pub.metadata.author)
         if type(pub.metadata.description) == "string" then summary = pub.metadata.description end
         if type(pub.metadata.identifier) == "string" and pub.metadata.identifier ~= "" then
             id = pub.metadata.identifier
+        end
+        -- belongsTo.series: an array of {name, position}, one such object, or
+        -- a bare name. The first series is the one shown.
+        local bt = type(pub.metadata.belongsTo) == "table" and pub.metadata.belongsTo.series
+        if type(bt) == "table" and bt[1] ~= nil then bt = bt[1] end
+        if type(bt) == "string" and bt ~= "" then
+            series = { name = bt }
+        elseif type(bt) == "table" and type(bt.name) == "string" and bt.name ~= "" then
+            series = { name = bt.name, position = bt.position }
         end
     end
     local link = {}
@@ -323,6 +419,8 @@ local function opds2PublicationToEntry(pub)
         content = summary,
         id = id,
         link = link,
+        _series = series,
+        _published = published,
     }
 end
 
@@ -387,10 +485,37 @@ end
 -- only the text under the Summary heading (up to the end of its paragraph).
 -- Anything without that shape -- a plain OPDS 2.0 description, a Calibre blurb
 -- -- has no "Summary:…</p>" to match and is returned verbatim.
+--
+-- Calibre-Web (issue 490) opens its content block with a metadata header --
+-- RATING, TAGS, SERIES and any custom columns, one "LABEL: value<br />" line
+-- each -- before the blurb's <p>. That header is not the description: it is
+-- dropped, by its STRUCTURE (header lines straight after the opening div,
+-- then the paragraph) rather than by the English labels, which calibre's own
+-- server translates. No paragraph after it: no description, so the book's
+-- own is used.
+local function _calibreHeader(raw)
+    local rest = raw:match("^%s*<div[^>]*>(.*)$")
+    if not rest then return nil end
+    local n = 0
+    while true do
+        local tail = rest:match("^%s*[^<>:\n]+:[^<\n]*<br%s*/?>(.*)$")
+        if not tail then break end
+        rest, n = tail, n + 1
+    end
+    if n == 0 then return nil end
+    local p = rest:match("^%s*(<p.*)$")
+    if p then return p end
+    if rest:match("^%s*</div>%s*$") or rest:match("^%s*$") then return false end
+    return nil
+end
+
 function M.summaryText(raw)
     if type(raw) ~= "string" then return raw end
     local s = raw:match("Summary:%s*(.-)%s*</p>")
     if s and s ~= "" then return s end
+    local cw = _calibreHeader(raw)
+    if cw == false then return nil end
+    if cw then return cw end
     return raw
 end
 
@@ -545,10 +670,13 @@ function M.mapEntries(catalog, feed_url, server_key)
     for idx, entry in ipairs(entry_list) do
         local title = entryTitle(entry)
         local acquisitions, thumb, image, nav_url, tiny_icon = {}, nil, nil, nil, nil
+        local stream
         for _j, link in ipairs(entry.link or {}) do
             local rel, ltype, href = relOf(link.rel), link.type, link.href
             if href then
-                if rel and not SKIP_ACQ_REL[rel] and rel:match(ACQUISITION_REL)
+                if rel == STREAM_REL then
+                    stream = stream or streamOf(link, M.absolute(feed_url, href))
+                elseif rel and not SKIP_ACQ_REL[rel] and rel:match(ACQUISITION_REL)
                         and SUPPORTED_TYPE[ltype] then
                     acquisitions[#acquisitions + 1] = {
                         type = ltype, href = M.absolute(feed_url, href),
@@ -567,7 +695,7 @@ function M.mapEntries(catalog, feed_url, server_key)
             end
         end
 
-        if #acquisitions > 0 then
+        if #acquisitions > 0 or stream then
             local author = entryAuthor(entry)
             local merge_key = (title and author) and (title .. "\0" .. author) or nil
             local existing = merge_key and book_by_key[merge_key]
@@ -576,12 +704,28 @@ function M.mapEntries(catalog, feed_url, server_key)
             if existing then
                 local acq = existing.opds.acquisitions
                 for _k, a in ipairs(acquisitions) do acq[#acq + 1] = a end
+                existing.opds.stream = existing.opds.stream or stream
                 -- Fullest edition wins the summary; strict > keeps the earlier
                 -- entry on a tie. Compared against the count of the entry that
                 -- SUPPLIED the current summary, not the running total.
                 if summary and #acquisitions > (summary_acq_n[existing] or -1) then
                     existing.opds.summary = summary
                     summary_acq_n[existing] = #acquisitions
+                end
+                -- Series: fill a nil, as the cover below.
+                if not existing.series_name then
+                    local sname, snum = entrySeries(entry)
+                    if sname then
+                        existing.series, existing.series_name, existing.series_num = sname, sname, snum
+                    end
+                end
+                -- Publication year: fill a nil, as the series above.
+                if not existing.published then
+                    local year = entryPubdate(entry)
+                    if year then
+                        existing.published = year
+                        existing.calibre = existing.calibre or { pubdate = year }
+                    end
                 end
                 -- Cover: fill a nil, never replace what the first entry had.
                 if not existing.opds.thumbnail_url and thumb then
@@ -607,12 +751,24 @@ function M.mapEntries(catalog, feed_url, server_key)
                     attr          = { mode = "file", size = 0, modification = 0 },
                     opds = {
                         acquisitions  = acquisitions,
+                        stream        = stream,
                         thumbnail_url = thumb,
                         image_url     = image,
                         summary       = summary,
                         feed_url      = feed_url,
                     },
                 }
+                -- The series the top panel's series line shows, in the
+                -- fields a local book's record carries (GitHub issue 478).
+                local sname, snum = entrySeries(entry)
+                if sname then rec.series, rec.series_name, rec.series_num = sname, sname, snum end
+                -- The publication year, where %calibre{pubdate} reads a
+                -- calibre book's (GitHub issue 566), so the same token
+                -- shows it for a book still in the catalog.
+                -- %published reads it as rec.published (and keeps it at
+                -- download, lib/bookshelf_published).
+                local year = entryPubdate(entry)
+                if year then rec.calibre = { pubdate = year }; rec.published = year end
                 book_records[#book_records + 1] = rec
                 if merge_key then
                     book_by_key[merge_key] = rec
@@ -700,7 +856,11 @@ local function unescape(str)
     end))
 end
 
-local function createFlatXTable(luxl_mod, xlex, curr_element)
+-- keep_text: the element keeps its attributes and takes its text as _text,
+-- instead of becoming the text alone. For <meta>: EPUB 3 style metadata puts
+-- what it is in an attribute and the value in the text, as in
+-- <meta property="belongs-to-collection" id="series">Name</meta>.
+local function createFlatXTable(luxl_mod, xlex, curr_element, keep_text)
     local ffi = require("ffi")
     curr_element = curr_element or {}
     local curr_attr_name
@@ -708,12 +868,14 @@ local function createFlatXTable(luxl_mod, xlex, curr_element)
         local txt = ffi.string(xlex.buf + offset, size)
         if event == luxl_mod.EVENT_START then
             if txt ~= "xml" then
-                local tab = createFlatXTable(luxl_mod, xlex)
+                local tab = createFlatXTable(luxl_mod, xlex, nil, txt == "meta")
                 -- "Url" arrays the same way: OpenSearch description documents
                 -- (see parseOsd below) repeat it, one per result type
                 -- (html, atom, ...). Dropped during vendoring; restored to
                 -- match the stock parser's opdsparser.lua.
-                if txt == "entry" or txt == "link" or txt == "Url" then
+                -- "meta" arrays too: an entry carries several (series name,
+                -- series position, ...), and each would overwrite the last.
+                if txt == "entry" or txt == "link" or txt == "Url" or txt == "meta" then
                     if curr_element[txt] == nil then curr_element[txt] = {} end
                     table.insert(curr_element[txt], tab)
                 elseif type(curr_element) == "table" then
@@ -726,7 +888,11 @@ local function createFlatXTable(luxl_mod, xlex, curr_element)
             curr_element[curr_attr_name] = unescape(txt)
             curr_attr_name = nil
         elseif event == luxl_mod.EVENT_TEXT then
-            curr_element = unescape(txt)
+            if keep_text and type(curr_element) == "table" then
+                curr_element._text = unescape(txt)
+            else
+                curr_element = unescape(txt)
+            end
         elseif event == luxl_mod.EVENT_END then
             return curr_element
         end
@@ -1029,7 +1195,12 @@ end
 -- 30-second wait for something that is not running reads as a hang. Both are
 -- taken together or not at all -- a block timeout longer than the total is a
 -- pair that cannot behave, so a partial override is ignored.
-function M.fetch(url, username, password, opts)
+--
+-- redirect_depth is internal: redirects are followed here, one hop per call,
+-- because luasocket's own following would carry the Authorization header to
+-- whatever host the Location names (see bookshelf_http.basicAuthHeader).
+function M.fetch(url, username, password, opts, redirect_depth)
+    local Http = require("lib/bookshelf_http")
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local socket = require("socket")
@@ -1049,7 +1220,7 @@ function M.fetch(url, username, password, opts)
             and opts.block_timeout <= opts.total_timeout then
         block, total = opts.block_timeout, opts.total_timeout
     end
-    local ok_req, code, status = pcall(function()
+    local ok_req, code, status, resp_headers = pcall(function()
         socketutil:set_timeout(block, total)
         local headers = { ["Accept-Encoding"] = "identity", ["Accept"] = M.ACCEPT_FEED }
         -- Set explicitly so it survives a redirect; see basicAuthHeader.
@@ -1057,17 +1228,28 @@ function M.fetch(url, username, password, opts)
         -- self-describing, and adjustheaders lets ours override anyway.
         local auth = M.basicAuthHeader(username, password)
         if auth then headers["Authorization"] = auth end
-        local c, _h, st = socket.skip(1, http.request{
+        local c, h, st = socket.skip(1, http.request{
             url = url,
             headers = headers,
-            sink = ltn12.sink.table(sink),
+            sink = Http.cappedSink(sink),
+            redirect = false,
             user = username,
             password = password,
         })
-        return c, st
+        return c, st, h
     end)
     pcall(function() socketutil:reset_timeout() end)
     if not ok_req then return nil, "network unreachable" end
+    if Http.isRedirect(code) then
+        if (redirect_depth or 0) >= Http.MAX_REDIRECTS then
+            return nil, "too many redirects"
+        end
+        local target, keep = Http.redirectTarget(url,
+            type(resp_headers) == "table" and resp_headers.location)
+        if not target then return nil, "unsafe redirect" end
+        return M.fetch(target, keep and username or nil, keep and password or nil,
+            opts, (redirect_depth or 0) + 1)
+    end
     if code == 200 then
         local body = table.concat(sink)
         if body ~= "" then

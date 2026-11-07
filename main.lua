@@ -29,6 +29,15 @@
 --     which is required so the close-document hook fires inside the Reader.
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+-- First of all: a KOReader older than Bookshelf needs gets a stub plugin that
+-- says so, instead of a crash somewhere in what follows.
+do
+    local Gate = require("lib/bookshelf_version_gate")
+    if Gate.tooOld() then return Gate.stub(WidgetContainer) end
+end
+-- Before ANY store opens its file: bring bookshelf's files over from the old
+-- flat layout into settings/bookshelf/ and cache/bookshelf/ (5.3).
+require("lib/bookshelf_storage_move").run()
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local UIManager       = require("ui/uimanager")
 local logger          = require("logger")
@@ -49,7 +58,7 @@ local Bookshelf = WidgetContainer:extend{
 -- action, which probes addToMainMenu and hosts these in this order.
 -- Display order, banded with separators (set on the last item of each band in
 -- addToMainMenu): actions (Open) | customise (Shelf size, Chips) | configure
--- (Hardcover, Settings) | meta (Updates, About). Background and colors
+-- (Hardcover, Settings) | meta (Updates, About). The reader's own look
 -- joined the customise band in 5.1: it is what a reader changes to make the
 -- shelf look like theirs, and it was buried two levels down under Settings. The detail-view editor and
 -- collection manager moved under Settings in 4.0, and the selection-mode
@@ -61,7 +70,7 @@ Bookshelf.MENU_ORDER = {
     "bookshelf_toggle",
     "bookshelf_shelf_size",
     "bookshelf_shelf_tabs",
-    "bookshelf_background",
+    "bookshelf_theme",
     "bookshelf_hardcover",
     "bookshelf_settings",
     "bookshelf_updates",
@@ -84,6 +93,24 @@ end
 -- instance's onCloseWidget find and dismiss the overlay during a KOReader
 -- exit, so the UIManager window stack can drain to zero.
 local _live_widget = nil
+
+-- afterFirstPaint(delay, fn): fn, delay seconds after the shelf has first
+-- painted -- for startup chores that must not hold the shelf back. When
+-- the shelf isn't shown this session (started into a book, say), after
+-- 30 s anyway.
+local function afterFirstPaint(delay, fn)
+    local waited = 0
+    local function poll()
+        local w = _live_widget
+        if (w and w._first_paint_done) or waited >= 30 then
+            UIManager:scheduleIn(delay, fn)
+            return
+        end
+        waited = waited + 0.5
+        UIManager:scheduleIn(0.5, poll)
+    end
+    UIManager:scheduleIn(0.5, poll)
+end
 -- The FileManager path the overlay was sitting over when it last (re)appeared.
 -- onPathChanged compares against this so the PathChanged that FileManager
 -- fires during our OWN takeover (the onShow chain, same path) is ignored,
@@ -308,9 +335,58 @@ local function _installCalibreNotice()
     end
 end
 
+-- The shelf source API for other plugins (issue 452). A plugin that wants a
+-- shelf of its own registers a source instead of replacing Bookshelf's
+-- functions:
+--
+--     local bs = self.ui.bookshelf
+--     if bs and bs.registerSource and (bs.SOURCE_API or 0) >= 1 then
+--         bs:registerSource("komga", { api = 1, label = ..., available = ..., list = ... })
+--     end
+--
+-- The spec is documented at the top of lib/bookshelf_sources.lua. The registry
+-- lives for the whole KOReader session, across the file browser and the reader,
+-- so registering once is enough; registering the same id again replaces it.
+-- Returns true, or false and the reason the spec was refused.
+Bookshelf.SOURCE_API = require("lib/bookshelf_sources").API
+function Bookshelf:registerSource(id, spec)
+    return require("lib/bookshelf_sources").register(id, spec)
+end
+function Bookshelf:unregisterSource(id)
+    require("lib/bookshelf_sources").unregister(id)
+end
+-- Buttons on an OPDS book's details window from other plugins (PR 496). The
+-- contract is at the top of lib/bookshelf_record_actions.lua.
+Bookshelf.RECORD_ACTIONS_API = require("lib/bookshelf_record_actions").API
+function Bookshelf:registerRecordActions(id, fn)
+    return require("lib/bookshelf_record_actions").register(id, fn)
+end
+-- Tokens a user patch or plugin adds to every template (PR 515); the spec is
+-- at Tokens.register in lib/bookshelf_tokens.lua.
+Bookshelf.TOKENS_API = require("lib/bookshelf_tokens").API
+function Bookshelf:registerTokens(id, defs)
+    return require("lib/bookshelf_tokens").register(id, defs)
+end
+-- Placeholders for books without a cover (PR 515): a provider returns a
+-- widget to draw in the card instead of bookshelf's lettering. The contract,
+-- and how a user patch registers without this instance, are at the top of
+-- lib/bookshelf_placeholders.lua.
+Bookshelf.PLACEHOLDER_API = require("lib/bookshelf_placeholders").API
+function Bookshelf:registerPlaceholder(id, fn)
+    return require("lib/bookshelf_placeholders").register(id, fn)
+end
+-- sourceChanged(id): a fetch-mode source has more to show (a page it was
+-- fetching in the background has landed); the shelf redraws if it is showing
+-- that source.
+function Bookshelf:sourceChanged(id)
+    require("lib/bookshelf_sources").changed(id)
+end
+
 function Bookshelf:init()
     _installBroadcastTag()
     _installScreensaverHostFallback()
+    -- KOReader's menu closes over the shelf without a full-screen flash.
+    pcall(function() require("lib/bookshelf_menu_close_refresh").install() end)
     -- The panel's night-mode inversion flag is kernel-side and outlives the
     -- KOReader process, but Device:init() only ever sets it, never clears it.
     -- A session that ended without Device:exit() can therefore leave the
@@ -334,6 +410,10 @@ function Bookshelf:init()
     local Fonts = require("lib/bookshelf_fonts")
     Fonts.maybeSeedFreshInstall()
     Fonts.ensureInstalled()
+    -- Themes became layers over the reader's own look in 5.4: the old
+    -- applied-theme record is turned into the new keys, once, before any
+    -- menu or shelf reads them (bookshelf_theme_pack.migrate).
+    pcall(function() require("lib/bookshelf_theme_pack").migrate() end)
 
     -- Version marker, written every init. v5 is the FIRST build that
     -- writes it, which makes it the upgrade detector: settings present
@@ -440,8 +520,10 @@ function Bookshelf:init()
     -- want a quick toggle rather than digging through the FM menu.
     self:onDispatcherRegisterActions()
 
-    -- One silent background check per init when the user's opted in.
-    self:backgroundUpdateCheck()
+    -- One silent background check per init when the user's opted in. After
+    -- the shelf is on screen, not before it: the request (a TLS handshake,
+    -- then the reply) ran ahead of the first paint (~0.3 s of it on the PW5).
+    afterFirstPaint(5, function() self:backgroundUpdateCheck() end)
 
     -- One-shot bookinfo_cache staleness sweep. Detects EPUBs whose
     -- on-disk size/mtime has diverged from BIM's cached values (typical
@@ -450,7 +532,10 @@ function Bookshelf:init()
     -- requeues fresh extraction. Deferred 2s so init isn't blocked and
     -- so BIM's own scan-on-start has settled. Module guards against
     -- double-fire across FM+Reader init contexts.
-    UIManager:scheduleIn(2, function()
+    -- Counted from the first paint: two seconds from here landed before it
+    -- on a device with many plugins (the shelf first paints ~4 s after this
+    -- init on the PW5), and the sweep's SQLite pass delayed it.
+    afterFirstPaint(2, function()
         local ok, StaleSweep = pcall(require, "lib/bookshelf_stale_sweep")
         if ok and StaleSweep then
             pcall(function() StaleSweep:run() end)
@@ -668,11 +753,25 @@ function Bookshelf:hideMenu(touchmenu_instance)
     -- none, the restore closure below just refreshes the instance.
     local menu_container = touchmenu_instance.show_parent
         or touchmenu_instance.menu_container
+    -- The KOReader menu (file browser's, reader's) holding this container
+    -- now. It keeps one and REPLACES it when the menu is opened again (a tap
+    -- in its top zone, outside the picker): showing the old one after left
+    -- a menu nothing could close, its tap outside closing the new one
+    -- (maintainer, PW5). So it comes back only while it is still theirs.
+    local owner
+    if menu_container then
+        for _i, mod in ipairs({ "apps/filemanager/filemanager", "apps/reader/readerui" }) do
+            local ok, C = pcall(require, mod)
+            local m = ok and type(C) == "table" and C.instance and C.instance.menu
+            if m and m.menu_container == menu_container then owner = m end
+        end
+    end
     if menu_container and UIManager and UIManager.close then
         UIManager:close(menu_container)
     end
     return function()
-        if menu_container and UIManager and UIManager.show then
+        local current = not owner or owner.menu_container == menu_container
+        if menu_container and current and UIManager and UIManager.show then
             UIManager:show(menu_container)
         end
         if touchmenu_instance and touchmenu_instance.updateItems then
@@ -701,7 +800,8 @@ function Bookshelf:buildMenuItems(menu_items)
     -- Stash plugin ref now so _updateSubItems callbacks resolve correctly.
     S._plugin = outer
 
-    menu_items.bookshelf_tab = { icon = "book.opened", text = _("Bookshelf") }
+    -- Its own icon (issue 548): KOReader's new "Reader" tab took book.opened.
+    menu_items.bookshelf_tab = { icon = require("lib/bookshelf_menu_icon").name(self.path), text = _("Bookshelf") }
 
     menu_items.bookshelf_toggle = {
         -- NO ICON, deliberately. This row and About are the secondary pair:
@@ -796,25 +896,34 @@ function Bookshelf:buildMenuItems(menu_items)
         separator = true,
     }
 
-    -- Hardcover enrichment, promoted from Settings to the top level (below
-    -- Manage collections). Only shown while the Hardcover plugin is live
-    -- (installed and enabled); uninstalling/disabling it hides the menu and
-    -- reverts all Hardcover data to native. Defined conditionally rather than
     -- Everything that decides what the shelf LOOKS like, in one place and at
     -- the top level: the theme, the background (picture, colour, shading), the
     -- ornaments and the accent colours. They used to be split between
     -- Settings > Colors and Settings > Wallpaper and ornaments, which put the
     -- theme, the background colour and the panel shading in three different
     -- menus (maintainer). Text size stays under Settings on purpose.
-    menu_items.bookshelf_background = {
-        text                = MenuIcons.label(MenuIcons.APPEARANCE,
-                                  _("Background and colors")),
+    -- The Theme menu, ONE row named for the theme of the shelf on screen,
+    -- "Theme (Macabre)" (maintainer, 2026-10-09, after Bookends' "Preset
+    -- (Name)"): This shelf, Other shelves (each other shelf's theme, a
+    -- level down) and Default theme first, then the rows that edit that
+    -- theme, all on one page (maintainer, 2026-10-09). It replaced a Theme
+    -- menu that chose themes and a My theme menu that edited them.
+    local ThemeMenu = require("lib/bookshelf_theme_menu")
+    menu_items.bookshelf_theme = {
+        text_func = function()
+            return MenuIcons.label(MenuIcons.THEME, ThemeMenu.menuText())
+        end,
+        help_text = ThemeMenu.menuHelp(),
         sub_item_table_func = function()
             S._bw = _live_widget
-            return S:_backgroundSubItems()
+            return ThemeMenu.items(S)
         end,
     }
 
+    -- Hardcover enrichment, promoted from Settings to the top level (below
+    -- Manage collections). Only shown while the Hardcover plugin is live
+    -- (installed and enabled); uninstalling/disabling it hides the menu and
+    -- reverts all Hardcover data to native. Defined conditionally rather than
     -- greyed out -- the order list keeps its slot and KOMenu skips a missing key.
     do
         local ok_hc, HC = pcall(require, "lib/bookshelf_hardcover")
@@ -1109,6 +1218,16 @@ function Bookshelf:onDispatcherRegisterActions()
         title    = _("Bookshelf: full screen shelves on or off"),
         general  = true,
     })
+    -- The swipe down on the shelf, assignable (issue 541): a reader who turns
+    -- that swipe off under Bookshelf gestures, because KOReader's multiswipes
+    -- kept setting it off, can still refresh from another gesture or a quick
+    -- menu.
+    Dispatcher:registerAction("bookshelf_refresh_library", {
+        category = "none",
+        event    = "BookshelfRefreshLibrary",
+        title    = _("Bookshelf: refresh the library"),
+        general  = true,
+    })
     Dispatcher:registerAction("bookshelf_toggle_selection_mode", {
         category  = "none",
         event     = "BookshelfToggleSelectionMode",
@@ -1157,7 +1276,7 @@ function Bookshelf:onDispatcherRegisterActions()
     Dispatcher:registerAction("bookshelf_open_micro_modules", {
         category = "none",
         event    = "BookshelfOpenMicroModules",
-        title    = _("Bookshelf: open micro-modules"),
+        title    = _("Bookshelf: open modules"),
         general  = true,
     })
     -- "Take me to the main screen" (#223). Distinct from "Bookshelf: open",
@@ -1165,6 +1284,15 @@ function Bookshelf:onDispatcherRegisterActions()
     -- drilled into: this also drops the drilldown and returns to page 1, so a
     -- gesture bound to it always lands on the same view -- the home-screen
     -- gesture other home-replacement plugins offer.
+    -- A fresh deal of the ornaments, same books (maintainer: "a gesture to
+    -- shuffle ornaments to get a new layout without having to change
+    -- anything else"). An action to bind, not a built-in gesture.
+    Dispatcher:registerAction("bookshelf_shuffle_ornaments", {
+        category = "none",
+        event    = "BookshelfShuffleOrnaments",
+        title    = _("Bookshelf: shuffle ornaments"),
+        general  = true,
+    })
     Dispatcher:registerAction("bookshelf_go_home", {
         category = "none",
         event    = "BookshelfGoHome",
@@ -1182,6 +1310,13 @@ function Bookshelf:onBookshelfGoHome()
         -- one that will be re-shown, so reset it directly.
         if _live_widget._drilldown_path and #_live_widget._drilldown_path > 0 then
             _live_widget:_drillBackTo(0)
+        end
+        -- And out of any shelf of shelves, to the top-level shelf.
+        if _live_widget.chip then
+            local ok_tm, TabModel = pcall(require, "lib/bookshelf_tab_model")
+            if ok_tm and TabModel and TabModel.rootOf then
+                _live_widget.chip = TabModel.rootOf(_live_widget.chip)
+            end
         end
         _live_widget._pending_restore_drill = nil
         _live_widget._cursor = 1
@@ -1526,9 +1661,10 @@ end
 -- Open the full-screen micro-module overlay from the reader (v1). No bookshelf
 -- widget exists here, so a minimal context shim stands in for `bw`: enough for
 -- the overlay to render + navigate the grid, position its close-X / hamburger,
--- and open the start menu. No status line (no _currentHeroBook /
--- _buildDeviceState), and widget-dependent module taps no-op (HeroModules._tap
--- pcalls on_tap). pcall'd so a context gap can't crash the reader.
+-- and open the start menu, plus the shelf's status line for the book being
+-- read, kept current by its own minute tick (the shelf's does not run in the
+-- reader). Widget-dependent module taps no-op (HeroModules._tap pcalls
+-- on_tap). pcall'd so a context gap can't crash the reader.
 function Bookshelf:_openReaderMicroModules()
     local ok, Mod = pcall(require, "lib/bookshelf_micro_fullscreen")
     if not ok or not Mod then return end
@@ -1567,7 +1703,31 @@ function Bookshelf:_openReaderMicroModules()
         end,
         _openStartMenu = function() outer:_openReaderStartMenu() end,
     }
+    -- The status line: the shelf's own answers for the current book (the
+    -- one being read) and the device state. Neither needs a shelf.
+    local ok_bw, BW = pcall(require, "lib/bookshelf_widget")
+    if ok_bw and type(BW) == "table" then
+        shim._currentHeroBook  = function(s) return BW._currentHeroBook(s) end
+        shim._buildDeviceState = function(s) return BW._buildDeviceState(s) end
+    end
     pcall(function() Mod.open(shim, shim._micromod_dimen, Screen:scaleBySize(48)) end)
+    -- Minute tick while the view is up: the status line and clock cells.
+    local tick
+    tick = function()
+        local view = shim._micro_fullscreen
+        if not (view and UIManager:isWidgetShown(view)) then return end
+        pcall(function()
+            if BW and BW.invalidateDeviceState then BW.invalidateDeviceState() end
+            require("lib/bookshelf_hero_modules").tickClocks(shim)
+            if view.refreshStatus then view:refreshStatus() end
+        end)
+        local delay = 60 - os.date("*t").sec
+        UIManager:scheduleIn(delay > 0 and delay or 60, tick)
+    end
+    if shim._micro_fullscreen then
+        local delay = 60 - os.date("*t").sec
+        UIManager:scheduleIn(delay > 0 and delay or 60, tick)
+    end
 end
 
 -- Open the start menu from the reader. No bookshelf widget exists here, but
@@ -1847,7 +2007,22 @@ function Bookshelf:onShow()
     -- announces just for Start with = Bookshelf, so an unannounced Show is
     -- still left alone whatever the setting says.
     if self.ui and self.ui.document then return end
-    if _live_widget and UIManager:isWidgetShown(_live_widget) then return end
+    if _live_widget and UIManager:isWidgetShown(_live_widget) then
+        -- Shown is not the same as on top. Since issue 422 the shelf survives
+        -- a book's close, and KOReader's own close route (the end-of-book
+        -- "Return to file browser", issue 460) then shows a fresh file browser
+        -- ABOVE it. Standing down here let that file browser paint -- the
+        -- flash -- until onCloseDocument's next-tick raise. An announced
+        -- takeover raises the buried shelf now, before the first paint;
+        -- onCloseDocument's scheduled show() then finds it on top and warm.
+        local stack = UIManager._window_stack
+        local top = stack and stack[#stack] and stack[#stack].widget
+        if top ~= _live_widget and _expect_onshow_takeover then
+            _expect_onshow_takeover = false
+            self:_raiseInPlace()
+        end
+        return
+    end
     if not _expect_onshow_takeover then
         -- Nobody announced bookshelf as this Show's destination (see the
         -- gate's declaration comment): stand down. Covers #110 (books
@@ -2171,6 +2346,8 @@ end
 -- actually performs the exit) still have to see the event.
 function Bookshelf:onExit()
     require("lib/bookshelf_reader_park").noteExit()
+    -- A scan stopped by a clean exit did not crash on its book (issue 518).
+    pcall(function() require("lib/bookshelf_render_guard").clear() end)
 end
 Bookshelf.onRestart = Bookshelf.onExit
 
@@ -2203,6 +2380,14 @@ function Bookshelf:onShowingReader()
             if _live_widget then _live_widget._suppress_transition_paint = false end
         end)
     end
+    -- The full-screen micro-modules view holds its opening pose the same way
+    -- (MicroFullscreen.hold_paint). Only when it is loaded: requiring it here
+    -- would load it for every book opened from anywhere.
+    local MF = package.loaded["lib/bookshelf_micro_fullscreen"]
+    if type(MF) == "table" then
+        MF.hold_paint = true
+        UIManager:scheduleIn(10, function() MF.hold_paint = nil end)
+    end
 end
 
 -- New ReaderUI has finished loading after a Reader→Reader switch — the new
@@ -2211,6 +2396,13 @@ end
 -- widget is the shared singleton, so clearing it here unblocks the eventual
 -- return-to-shelf paint when this book is closed.
 function Bookshelf:onReaderReady()
+    local MF = package.loaded["lib/bookshelf_micro_fullscreen"]
+    if type(MF) == "table" then MF.hold_paint = nil end
+    -- The page-count scan lays books out as the reader does; the status bar's
+    -- reserve at the bottom of the page is only knowable from a real reader.
+    if self.ui and self.ui.view then
+        pcall(function() require("lib/bookshelf_reader_layout").recordFooter(self.ui) end)
+    end
     if _live_widget then
         _live_widget._suppress_transition_paint = false
         -- Seamless open (opening-badge path): the reader arrived with a
@@ -2341,7 +2533,7 @@ function Bookshelf:scanAllMetadata()
         })
         return
     end
-    local home = G_reader_settings:readSetting("home_dir") or "/"
+    local home = require("lib/bookshelf_home_dir").get() or "/"
     -- BIM:extractBooksInDirectory uses Trapper:confirm for four prompts
     -- in fixed order: Continue / Recursive / Refresh / Prune. We don't
     -- need to ask the user about the first two — they already chose
@@ -2375,14 +2567,22 @@ function Bookshelf:scanAllMetadata()
             -- 3: Refresh, 4: Prune — pass through to the user.
             return original_confirm(self, text, cancel_text, ok_text)
         end
+        -- KOReader's scanner passes ngettext a nil count when not
+        -- refreshing, which throws in French and other languages.
+        local unguard = require("lib/bookshelf_plural_guard").guard(require("gettext"))
         local ok, err = pcall(BIM.extractBooksInDirectory, BIM, home, {
             max_cover_w = hero_w,
             max_cover_h = hero_h,
         })
+        unguard()
         Trapper.confirm = original_confirm
         if not ok then error(err) end
         local Repo = require("lib/bookshelf_book_repository")
         Repo.invalidateWalkCache()
+        -- Read the new rows now: the rows in memory are from before the
+        -- scan, so its new books would have no series until the background
+        -- refresh (issue 581).
+        if Repo.reloadLightMeta then Repo.reloadLightMeta() end
         -- Also drop per-chip book-list caches so the next tab render
         -- re-reads from the fresh BIM data rather than the pre-scan
         -- cached order. Without this the user has to switch tabs to
@@ -2401,10 +2601,15 @@ end
 -- kills its own fork, not KOReader, and the progress dialog's dismiss
 -- cancels the pass between books. Counts land in the spine shelf's
 -- persisted progress table -- deliberately NOT in a sidecar, because
--- creating one marks the book as opened. The count reflects crengine's
--- default layout rather than the user's exact font settings; for a spine's
--- thickness that is the right kind of true.
-function Bookshelf:scanPageCounts()
+-- creating one marks the book as opened. A rendered count is laid out at the
+-- reader's own global settings (lib/bookshelf_reader_layout), so it is close
+-- to the count the reader will show, and is shown ("user"). Publisher and
+-- Hardcover counts are print pages and are shown too ("print").
+-- opts (from lib/bookshelf_page_count_dialog): which sources to use --
+-- publisher / hardcover / render, each on unless false -- and recount, which
+-- counts every book again instead of only those without a trusted count.
+function Bookshelf:scanPageCounts(opts)
+    opts = opts or {}
     local Repo       = require("lib/bookshelf_book_repository")
     local SpineShelf = require("lib/bookshelf_spine_shelf")
     local Trapper    = require("ui/trapper")
@@ -2412,38 +2617,27 @@ function Bookshelf:scanPageCounts()
     local InfoMessage = require("ui/widget/infomessage")
 
     -- Classify the library up front (user spec, in priority order):
-    --   skip   books that already have a count (opened, or a prior scan),
-    --   count  p(N) filename markers (free -- readProgress serves them live),
-    --   probe  the rest: publisher page list, then Hardcover, then render.
-    local fps = Repo.getAllFilepaths and Repo.getAllFilepaths() or {}
+    --   skip   books that already have a count this scan trusts: a prior
+    --          scan ("print", "user", "calibre" or "filename") or stable page
+    --          numbers,
+    --   probe  the rest, through the sources the dialog left ticked, in its
+    --          order: publisher page list, Hardcover, render, a Calibre
+    --          column, then a p(N) file name. The first that answers wins.
+    -- An opened book's own count (KOReader's, from its sidecar) is a count:
+    -- "Only books without a page count" skips it (573), though it follows
+    -- that book's font where the scan's counts share one layout (issue 387,
+    -- SpineShelf.thicknessPages). Recount all probes it; its sidecar, and so
+    -- its %pages, are left alone either way.
+    -- A count from an older scan ("scan", untagged on a never-opened book,
+    -- or "layout": a render at crengine's own defaults, 3-4x short of what
+    -- the reader shows) is not shown, so those books are counted again.
+    -- Classified inside the job (classify, below), a sidecar read per opened
+    -- book, so the shelf answers taps from the first moment instead of
+    -- freezing before the status line even appears.
+    -- opts.paths scopes the scan to one folder or stack's books (issue 459).
+    local fps = opts.paths or (Repo.getAllFilepaths and Repo.getAllFilepaths()) or {}
     local skipped = 0
-    local fn_list, todo = {}, {}
-    for _i, fp in ipairs(fps) do
-        local fn = Repo.pageCountFromFilename
-                   and Repo.pageCountFromFilename(fp)
-        local pp = select(1, SpineShelf.cachedProgress(fp))
-        local _p, _s, _r, pc = Repo.readProgress(fp)
-        -- The filename marker outranks a persisted echo of itself: the
-        -- spine plan persists whatever readProgress answers when a page
-        -- is shown, so a never-opened p(N) book usually arrives here
-        -- already holding N -- that is still a filename count, not an
-        -- "opened" one. A count that DISAGREES with the marker came from
-        -- a sidecar or a real scan and wins.
-        if fn and (pc == nil or pc == fn) and (pp == nil or pp == fn) then
-            fn_list[#fn_list + 1] = fp
-        elseif pp or pc then
-            skipped = skipped + 1
-        else
-            todo[#todo + 1] = fp
-        end
-    end
-    if #todo == 0 and #fn_list == 0 then
-        UIManager:show(InfoMessage:new{
-            text    = _("Every book already has a page count."),
-            timeout = 3,
-        })
-        return
-    end
+    local todo = {}
 
     -- Report names: the light record's title when the batch knows the
     -- book (one map hit), else the de-extensioned filename.
@@ -2455,44 +2649,26 @@ function Bookshelf:scanPageCounts()
         return (fp:match("([^/]+)$") or fp):gsub("%.[^%.]+$", "")
     end
 
-    -- persist(fp, pages, is_publisher): the count lands in the spine
-    -- shelf's store (served library-wide through readProgress's fallback),
-    -- and a PUBLISHER count is additionally written into the book's
-    -- sidecar as pagemap_doc_pages -- the key ReaderPageMap owns and every
-    -- token consumer already reads -- but only when a sidecar EXISTS and
-    -- knows no count of its own: sidecars are never created (stock
-    -- KOReader treats their existence as "book opened"), and a sidecar
-    -- that already answers is never second-guessed.
-    local function persist(fp, pages, is_publisher)
-        local _p2, st = Repo.readProgress(fp)
-        SpineShelf.persistProgress(fp, pages, st)
-        if is_publisher then
-            pcall(function()
-                local DocSettings = require("docsettings")
-                if not DocSettings:hasSidecarFile(fp) then return end
-                local ds = DocSettings:open(fp)
-                local stats = ds:readSetting("stats")
-                if ds:readSetting("pagemap_doc_pages")
-                        or (type(stats) == "table" and stats.pages) then
-                    return
-                end
-                ds:saveSetting("pagemap_doc_pages", pages)
-                ds:flush()
-            end)
-        end
+    -- persist(fp, pages, tag): the count lands in bookshelf's own facts
+    -- store, tagged "print" or "user" (both served library-wide through
+    -- readProgress's fallback) -- and nowhere else. It used to be written into
+    -- a sidecar as KOReader's own pagemap_doc_pages too, and to read each
+    -- book's sidecar for its status first: main-process work per book that
+    -- kept the shelf from answering taps, for a count the store already
+    -- serves everywhere it is shown.
+    local function persist(fp, pages, tag)
+        SpineShelf.persistPages(fp, pages, tag)
     end
 
     local report = {
         skipped   = skipped,
         filename  = {},
+        calibre   = {},
         publisher = {},
         hardcover = {},
         rendered  = {},
         failed    = {},
     }
-    for _i, fp in ipairs(fn_list) do
-        report.filename[#report.filename + 1] = nameFor(fp)
-    end
 
     local function showReport()
         SpineShelf.flushPersist()
@@ -2508,57 +2684,197 @@ function Bookshelf:scanPageCounts()
         })
     end
 
+    -- Progress shows in the shelf's own status line, which leaves the shelf
+    -- usable: only its Stop stops the scan (Trapper's own message took a tap
+    -- ANYWHERE as cancel, so the scan never really ran in the background).
+    local Progress = require("lib/bookshelf_scan_progress")
+    if Progress.active() then
+        UIManager:show(InfoMessage:new{
+            text = _("Page counts are already being extracted."), timeout = 3 })
+        return
+    end
+    -- Hand control back to UIManager for a moment, so the shelf keeps
+    -- answering taps and the status line can repaint.
+    local function breathe(sec)
+        local co = coroutine.running()
+        UIManager:scheduleIn(sec or 0, function() coroutine.resume(co) end)
+        coroutine.yield()
+    end
+    -- The Hardcover pass runs in this process (a table lookup and a store
+    -- write per book, no file reads): breathe whenever SLICE_S of it has gone
+    -- by, so a large linked library cannot hold the shelf up either.
+    local SLICE_S = 0.05
+    local _gettime_slice = require("lib/bookshelf_gettime")
+    local slice_start = _gettime_slice()
+    local function maybeBreathe()
+        if _gettime_slice() - slice_start < SLICE_S then return end
+        breathe()
+        slice_start = _gettime_slice()
+    end
+    local function finish()
+        Progress.finish()
+        showReport()
+    end
+    -- "Counting pages in book 30 of 41": the line has no room for the book's
+    -- title as well, so it says what is being done instead.
+    local function scanTitle(i, n)
+        return T(_("Counting pages in book %1 of %2"), i, n)
+    end
+    -- One bar for the whole scan. The fast passes (publisher pages,
+    -- Hardcover) take its first tenth when books are rendered after them --
+    -- they are seconds against minutes -- and all of it when not. They show
+    -- no book count: it would run to the total and then start again for the
+    -- render, which read as two progress bars (device report).
+    local FAST_SHARE = (opts.render == false) and 1 or 0.1
+    local function fastFraction(f) return FAST_SHARE * f end
+    local function renderFraction(f) return FAST_SHARE + (1 - FAST_SHARE) * f end
+    local function lookupTitle() return _("Looking up page numbers\xe2\x80\xa6") end
+    -- Before it, a book whose pages turn: book-open-page-variant,
+    -- book-open-variant and book-open-o, one per update. Private Use Area
+    -- code points, which is what the status line's icon path renders safely.
+    local SCAN_ICONS = { "\xee\xb3\x99", "\xee\x9e\xbd", "\xee\x8a\x8b" }
+
+    local function classify()
+        for _i, fp in ipairs(fps) do
+            maybeBreathe()
+            local fn = Repo.pageCountFromFilename
+                       and Repo.pageCountFromFilename(fp)
+            local pp, _ps, _known, psrc, opened = SpineShelf.cachedProgress(fp)
+            local _p, _s, _r, pc, _pn, pc_src = Repo.readProgress(fp)
+            -- The spine plan used to store a p(N) book's marker as "stable",
+            -- as though it were the book's own page numbers; such a row is
+            -- the file name's count, and one the reader may be replacing.
+            local echo = fn and psrc == "stable" and pp == fn and pc_src ~= "stable"
+            -- A p(N) marker is no longer a reason to skip a book: it is one
+            -- source among the others, tried in the dialog's order, and a
+            -- reader who unticked it wants the other sources to replace it.
+            local trusted = not opts.recount and not echo
+                            and (psrc == "print" or psrc == "user" or psrc == "calibre"
+                                 or psrc == "filename" or psrc == "stable"
+                                 or pc_src == "stable"
+                                 -- A count from opening the book (KOReader's
+                                 -- own, in the sidecar) is a count: "Only
+                                 -- books without a page count" leaves it be
+                                 -- (573). Recount all still replaces it.
+                                 or psrc == "render"
+                                 or (pc_src == "render" and (tonumber(pc) or 0) > 0))
+            if trusted then
+                skipped = skipped + 1
+            else
+                todo[#todo + 1] = fp
+            end
+        end
+    end
+
+    -- A Lua error mid-scan must still end the job, or the status line would
+    -- show its progress until KOReader restarts.
+    -- holdAwake(on): a scan runs for minutes, and the device suspended in the
+    -- middle of one (issue 459's crash.log). AutoSuspend reads
+    -- PluginShare.pause_auto_suspend, not UIManager's standby count, so both
+    -- are held; the flag's earlier value (Keep-alive may have set it) comes
+    -- back. Idempotent both ways, so a wait can let go and take it again.
+    local held_prev
+    local function holdAwake(on)
+        local ok_ps, PluginShare = pcall(require, "pluginshare")
+        if on and held_prev == nil then
+            held_prev = (ok_ps and PluginShare.pause_auto_suspend) and true or false
+            if ok_ps then PluginShare.pause_auto_suspend = true end
+            pcall(function() UIManager:preventStandby() end)
+        elseif not on and held_prev ~= nil then
+            if ok_ps then PluginShare.pause_auto_suspend = held_prev end
+            held_prev = nil
+            pcall(function() UIManager:allowStandby() end)
+        end
+    end
+
     Trapper:wrap(function()
+    -- Every exit below comes back through here.
+    holdAwake(true)
+    local ok_run, err_run = xpcall(function()
+        local job = Progress.begin{
+            title  = lookupTitle(),
+            icons  = SCAN_ICONS,
+            shelf = function() return _live_widget end,
+        }
+        classify()
+        report.skipped = skipped
+        if #todo == 0 then
+            Progress.finish()
+            UIManager:show(InfoMessage:new{
+                text    = _("Every book already has a page count."),
+                timeout = 3,
+            })
+            return
+        end
         -- Phase A: publisher page numbers straight from each EPUB's zip
         -- (bookshelf_pagemap_probe) -- the truest count there is, and
-        -- milliseconds per book. Dismissing the progress message cancels.
+        -- milliseconds per book. Stop in the status line cancels.
         report.cancelled = false
-        do
-            local ok_probe, Probe = pcall(require, "lib/bookshelf_pagemap_probe")
-            if ok_probe and Probe then
-                local rest = {}
-                for i, fp in ipairs(todo) do
-                    if report.cancelled then
-                        rest[#rest + 1] = fp
-                    else
-                        if i % 20 == 1 then
-                            if not Trapper:info(T(_(
-                                    "Checking publisher page numbers\xe2\x80\xa6 %1 of %2"),
-                                    i, #todo)) then
-                                report.cancelled = true
-                                rest[#rest + 1] = fp
-                            end
+        if opts.publisher ~= false then
+            -- In forked batches, like the render pass: the zip reads leave
+            -- the main process, so the shelf keeps answering taps (device
+            -- report: swipes queued until this pass finished), and the
+            -- libarchive memory that used to need a full collect every 25
+            -- books (issue 388: +69MB over 249 EPUBs without) goes back to
+            -- the system when each child exits. A batch is one line of
+            -- output per book, the count or nothing.
+            local BATCH = 40
+            local rest = {}
+            local i = 1
+            while i <= #todo do
+                local batch = {}
+                for k = i, math.min(i + BATCH - 1, #todo) do batch[#batch + 1] = todo[k] end
+                if job.stopped then report.cancelled = true end
+                if report.cancelled then
+                    for _k, fp in ipairs(batch) do rest[#rest + 1] = fp end
+                else
+                    Progress.update{
+                        title = lookupTitle(),
+                        fraction = fastFraction((i - 1) / #todo),
+                    }
+                    job.in_run = true
+                    local completed, out = Trapper:dismissableRunInSubprocess(function()
+                        local ok_p, Probe = pcall(require, "lib/bookshelf_pagemap_probe")
+                        local lines = {}
+                        for k, fp in ipairs(batch) do
+                            local ok_n, n = false, nil
+                            if ok_p and Probe then ok_n, n = pcall(Probe.publisherPages, fp) end
+                            lines[k] = (ok_n and tonumber(n) and n > 0) and tostring(n) or ""
                         end
-                        if not report.cancelled then
-                            local n = Probe.publisherPages(fp)
-                            -- libarchive's allocations are ffi.gc-wrapped, so
-                            -- they come back only when LuaJIT collects the
-                            -- small cdata that owns them -- and LuaJIT paces
-                            -- its collector off the Lua heap, which this loop
-                            -- barely moves. Measured over 249 real EPUBs:
-                            -- +69MB across the scan without this, +11MB with,
-                            -- same books found, same wall time. A 1200-book
-                            -- library on a 512MB device does not survive the
-                            -- difference -- it dies at a different book every
-                            -- run, which is what issue 388 reported.
-                            if i % 25 == 0 then collectgarbage("collect") end
-                            if n and n > 0 then
-                                persist(fp, n, true)
+                        return table.concat(lines, "\n") .. "\n"
+                    end, job, true)
+                    job.in_run = false
+                    if not completed then
+                        -- Stopped, or the fork failed: these books are not
+                        -- counted, and a failed fork ends the pass.
+                        report.cancelled = true
+                        if not job.stopped then report.could_not_start = true end
+                        for _k, fp in ipairs(batch) do rest[#rest + 1] = fp end
+                    else
+                        local k = 0
+                        for line in (out or ""):gmatch("([^\n]*)\n") do
+                            k = k + 1
+                            local fp, n = batch[k], tonumber(line)
+                            if fp and n and n > 0 then
+                                persist(fp, n, "print")
                                 report.publisher[#report.publisher + 1] =
                                     { name = nameFor(fp), pages = n }
-                            else
+                            elseif fp then
                                 rest[#rest + 1] = fp
                             end
                         end
+                        -- A short answer leaves the rest uncounted, not lost.
+                        for j = k + 1, #batch do rest[#rest + 1] = batch[j] end
                     end
                 end
-                todo = rest
+                i = i + BATCH
             end
+            todo = rest
         end
         -- Phase B: Hardcover-linked books carry their matched edition's
         -- page count in the plugin's own settings -- one local read for
         -- the whole library (user insight).
-        if not report.cancelled then
+        if not report.cancelled and opts.hardcover ~= false then
             pcall(function()
                 local HC = require("lib/bookshelf_hardcover")
                 if not (HC and HC.linkedPages) then return end
@@ -2566,8 +2882,10 @@ function Bookshelf:scanPageCounts()
                 if not next(linked) then return end
                 local rest = {}
                 for _i, fp in ipairs(todo) do
-                    if linked[fp] then
-                        persist(fp, linked[fp], false)
+                    maybeBreathe()
+                    if job.stopped then report.cancelled = true end
+                    if linked[fp] and not report.cancelled then
+                        persist(fp, linked[fp], "print")
                         report.hardcover[#report.hardcover + 1] =
                             { name = nameFor(fp), pages = linked[fp] }
                     else
@@ -2577,28 +2895,76 @@ function Bookshelf:scanPageCounts()
                 todo = rest
             end)
         end
+        -- Last of the sources: a p(N) marker in the file name, when the
+        -- reader keeps it. The lowest priority (maintainer): often Calibre's
+        -- estimate, so it answers only for books nothing else counted -- all
+        -- that is left when the render is off, and the renders that failed
+        -- when it is on. A string match per book, in this process.
+        -- filenamePass(list) -> the books it could not count.
+        -- Next to last: a Calibre custom column (issue 405), when the dialog
+        -- found one and the reader kept it. Often an estimate too (the Count
+        -- Pages plugin's), so it sits with the file name below the render. A
+        -- table lookup per book, in this process.
+        -- calibrePass(list) -> the books it could not count.
+        local function calibrePass(list)
+            if report.cancelled or not opts.calibre then return list end
+            local rest = {}
+            for _i, fp in ipairs(list) do
+                maybeBreathe()
+                if job.stopped then report.cancelled = true end
+                local n = not report.cancelled and Repo.calibrePagesFor
+                          and Repo.calibrePagesFor(fp, opts.calibre)
+                if n then
+                    persist(fp, n, "calibre")
+                    report.calibre[#report.calibre + 1] = { name = nameFor(fp), pages = n }
+                else
+                    rest[#rest + 1] = fp
+                end
+            end
+            return rest
+        end
+        local function filenamePass(list)
+            if report.cancelled or opts.filename == false then return list end
+            local rest = {}
+            for _i, fp in ipairs(list) do
+                maybeBreathe()
+                if job.stopped then report.cancelled = true end
+                local n = not report.cancelled and Repo.pageCountFromFilename
+                          and Repo.pageCountFromFilename(fp)
+                if n and n > 0 then
+                    persist(fp, n, "filename")
+                    report.filename[#report.filename + 1] = nameFor(fp)
+                else
+                    rest[#rest + 1] = fp
+                end
+            end
+            return rest
+        end
         SpineShelf.flushPersist()
-        if report.cancelled or #todo == 0 then
+        -- The slow pass was chosen (or not) in the dialog, before any of this.
+        if report.cancelled or #todo == 0 or opts.render == false then
+            todo = filenamePass(calibrePass(todo))
+            SpineShelf.flushPersist()
             report.remaining = #todo
-            Trapper:clear()
-            showReport()
+            finish()
             return
         end
 
         -- Phase C: everything still unknown gets opened and paginated by
         -- the reading engine, one subprocess per book (a crashing book
-        -- kills its fork, not KOReader; dismiss cancels between books).
-        local go_on = Trapper:confirm(T(_(
-            "%1 books have no page source.\n\nPaginate them the slow way?\n\nEach one is opened in the background; this can take a while. You can cancel between books by tapping the progress message."),
-            #todo), _("Skip"), _("Paginate"))
-        if not go_on then
-            report.remaining = #todo
-            Trapper:clear()
-            showReport()
-            return
-        end
+        -- kills its fork, not KOReader; Stop cancels between books).
         local processed = 0
+        local failed = {}
         local _gettime = require("lib/bookshelf_gettime")
+        -- A book that took KOReader down with it last time is not rendered
+        -- again while the file is unchanged (issue 518): it is reported as
+        -- not counted instead, after the other sources have had their try.
+        local Guard = require("lib/bookshelf_render_guard")
+        local crashed = Guard.takeCrashed(BookshelfSettings)
+        if crashed then
+            logger.warn("bookshelf: page count render skips a book that stopped KOReader last time:", crashed)
+        end
+        local skip_list = BookshelfSettings.read(Guard.SETTING)
         -- Every subprocess below is a fork of this one, so it needs room.
         -- The passes above hand their C allocations back only on a full
         -- collect; without this the first fork on a large library can fail
@@ -2606,68 +2972,115 @@ function Bookshelf:scanPageCounts()
         -- dismissing the book (issue 388).
         collectgarbage("collect")
         for i, fp in ipairs(todo) do
-            local name = fp:match("([^/]+)$") or fp
-            -- Up to one retry per book: a dismissal within a second of the
-            -- trap widget appearing is the LAUNCH tap bleeding onto it (the
-            -- same ghost runPacedScan arms against -- Trapper overwrites
-            -- the widget's dismiss_callback, so arming isn't possible
-            -- here), not the user cancelling a scan they just started.
-            -- Device report: tapping Paginate produced an instant
-            -- "report (cancelled)" with no book attempted.
-            local completed, pages_s
-            local elapsed = 0
-            for attempt = 1, 2 do
-                local t0 = _gettime()
-                completed, pages_s = Trapper:dismissableRunInSubprocess(
-                function()
-                    local ok_pc, pc = pcall(function()
-                        local DocumentRegistry = require("document/documentregistry")
-                        local doc = DocumentRegistry:openDocument(fp)
-                        if not doc then return nil end
-                        if doc.loadDocument then doc:loadDocument() end
-                        if doc.render then doc:render() end
-                        local n = doc:getPageCount()
-                        pcall(function() doc:close() end)
-                        return n
-                    end)
-                    return tostring(ok_pc and pc or "")
-                end,
-                T(_("Paginating\xe2\x80\xa6 %1 of %2\n%3"), i, #todo, name),
-                true)
-                elapsed = _gettime() - t0
-                if completed or elapsed > 1.0 then break end
+            -- Not while a book is open: each render is seconds of CPU the
+            -- reader would feel. A parked reader (under the shelf) is fine.
+            -- The reader's session is not the scan's to keep awake.
+            if Progress.reading() then
+                holdAwake(false)
+                while Progress.reading() and not job.stopped do breathe(2) end
+                holdAwake(true)
             end
-            if not completed then
+            if job.stopped then
                 report.cancelled = true
-                -- Trapper answers a fork that never started exactly as it
-                -- answers a dismissed book. Nothing attempted, twice, both
-                -- inside a second, is not someone tapping: it is the fork
-                -- failing, and saying "cancelled" sends the reader looking
-                -- for a stray tap they never made.
-                if processed == 0 and elapsed <= 1.0 then
-                    report.could_not_start = true
-                end
                 break
             end
-            processed = i
-            local pages = tonumber(pages_s)
-            if pages and pages > 0 then
-                -- A render count is layout-derived, not publisher truth:
-                -- it stays out of sidecars (persist() only writes those
-                -- for publisher counts).
-                persist(fp, pages, false)
-                report.rendered[#report.rendered + 1] =
-                    { name = nameFor(fp), pages = pages }
+            if Guard.skipped(BookshelfSettings, fp, skip_list) then
+                failed[#failed + 1] = fp
+                processed = i
             else
-                report.failed[#report.failed + 1] = nameFor(fp)
+                Progress.update{
+                    title  = scanTitle(i, #todo),
+                    fraction = renderFraction((i - 1) / #todo),
+                    force  = true,
+                }
+                -- Up to one retry per book: Trapper answers a fork that never
+                -- started exactly as it answers a dismissal, and a fork can fail
+                -- once on a device short of memory and then start.
+                local completed, pages_s
+                local elapsed = 0
+                -- At info level, before the fork: a scan that stalls on one book
+                -- leaves that book as the last line of crash.log (issue 459's
+                -- log named nothing).
+                logger.info(string.format("bookshelf: page count render %d/%d: %s", i, #todo, fp))
+                Guard.mark(fp)
+                for attempt = 1, 2 do
+                    local t0 = _gettime()
+                    job.in_run = true
+                    completed, pages_s = Trapper:dismissableRunInSubprocess(
+                    function()
+                        -- This child, not KOReader, is what runs out of memory.
+                        local G = require("lib/bookshelf_render_guard")
+                        local ok_g, headroom, avail = pcall(G.childLimits)
+                        if not ok_g then headroom, avail = nil, nil end
+                        local ok_pc, pc = pcall(function()
+                            local DocumentRegistry = require("document/documentregistry")
+                            local doc = DocumentRegistry:openDocument(fp)
+                            if not doc then return nil end
+                            -- The reader's own layout, not crengine's defaults:
+                            -- the count is shown as the book's page count. Its
+                            -- settings go in before the load, as the reader's do.
+                            local ok_l, Layout = pcall(require, "lib/bookshelf_reader_layout")
+                            if ok_l then pcall(Layout.beforeLoad, doc) end
+                            if doc.loadDocument then doc:loadDocument() end
+                            if ok_l then pcall(Layout.afterLoad, doc) end
+                            if doc.render then doc:render() end
+                            local n = doc:getPageCount()
+                            pcall(function() doc:close() end)
+                            return n
+                        end)
+                        if ok_pc and tonumber(pc) and tonumber(pc) > 0 then return tostring(pc) end
+                        -- No count: why, for the log (not a number, so the
+                        -- parent takes it as a failure).
+                        return "!" .. G.failureNote(ok_pc and "no count" or pc, headroom, avail)
+                    end,
+                    job, true)
+                    job.in_run = false
+                    elapsed = _gettime() - t0
+                    if completed or job.stopped or elapsed > 1.0 then break end
+                end
+                if not completed then
+                    report.cancelled = true
+                    -- Only Stop dismisses the job, so an incomplete run without
+                    -- it is the fork failing (issue 388), not the reader.
+                    if not job.stopped then report.could_not_start = true end
+                    break
+                end
+                processed = i
+                logger.info(string.format("bookshelf: page count render %d/%d took %.1fs", i, #todo, elapsed))
+                local pages = tonumber(pages_s)
+                if pages and pages > 0 then
+                    -- A render count is layout-derived, not publisher truth:
+                    -- it stays out of sidecars (persist() only writes those
+                    -- for publisher counts).
+                    persist(fp, pages, "user")
+                    report.rendered[#report.rendered + 1] =
+                        { name = nameFor(fp), pages = pages }
+                else
+                    failed[#failed + 1] = fp
+                    logger.warn("bookshelf: page count render failed:", fp,
+                        type(pages_s) == "string" and pages_s:match("^!(.*)") or tostring(pages_s))
+                end
+                -- Flush every few books: a mid-scan crash or battery death
+                -- should not cost the finished work.
+                if #report.rendered % 10 == 0 then SpineShelf.flushPersist() end
             end
-            -- Flush every few books: a mid-scan crash or battery death
-            -- should not cost the finished work.
-            if #report.rendered % 10 == 0 then SpineShelf.flushPersist() end
         end
+        Guard.clear()
         report.remaining = #todo - processed
-        Trapper:clear()
-        showReport()
+        -- A book the render could not lay out may still have a file name
+        -- to go by; only what that leaves is reported as failed.
+        for _i, fp in ipairs(filenamePass(calibrePass(failed))) do
+            report.failed[#report.failed + 1] = nameFor(fp)
+        end
+        SpineShelf.flushPersist()
+        finish()
+    end, debug.traceback)
+    if not ok_run then
+        pcall(function() require("lib/bookshelf_render_guard").clear() end)
+        require("logger").warn("bookshelf: page count scan failed:", err_run)
+        Progress.finish()
+    end
+    holdAwake(false)
     end)
 end
 
@@ -3030,7 +3443,17 @@ function Bookshelf:_repaintAfterWake()
     -- finally unlocks, so bookshelf still gets repainted then.
     if require("device").screen_saver_lock then return end
     if self:_isShowing() then
-        UIManager:setDirty(_live_widget, "full")
+        -- The sleep screen's close puts the shelf's own pixels back
+        -- (lib/bookshelf_underlay): then the panel needs a full refresh, not
+        -- the shelf a full repaint (~580 ms on a PW5).
+        local Underlay = require("lib/bookshelf_underlay")
+        if Underlay.covered() then
+            -- Still up: its close does it.
+        elseif os.time() - (Underlay._last_restore or 0) <= 2 then
+            UIManager:setDirty(nil, "full")
+        else
+            UIManager:setDirty(_live_widget, "full")
+        end
     end
     self:_evictHomescreenOverlay()
 end
@@ -3126,33 +3549,40 @@ end
 -- delete plugin settings". (Available in KOReader nightly via upstream
 -- PR #15240, expected in the next stable release.) Anything outside the
 -- install directory we need to clean up:
---   - <settings_dir>/bookshelf.lua (the LuaSettings file the store writes)
---     plus the routed sub-store files (micromodules / hardcover links /
---     opds cache) and the Hardcover module's settings + sqlite cache
---   - the cover / cache directories the plugin grows under settings_dir
+--   - our settings files in settings/bookshelf/ (the main settings file, the
+--     micro-module data, Hardcover links and cache, page counts) and all of
+--     cache/bookshelf/ (lib/bookshelf_paths), plus anything an older version
+--     left in the flat layout. The reader's content folders stay.
 --   - any legacy bookshelf_* keys in G_reader_settings that the migration
 --     never moved (e.g. user deleted the plugin before ever opening it
 --     post-upgrade)
 function Bookshelf:deletePluginSettings()
+    local Paths = require("lib/bookshelf_paths")
+    -- Our settings and caches (lib/bookshelf_paths). The reader's content in
+    -- settings/bookshelf/ (wallpapers, ornaments, quotes, micro-modules) is
+    -- left, as before; so are other plugins' files (the Hardcover sync
+    -- plugin's settings, which bookshelf only reads and adds to).
+    local sdir = Paths.settingsDir()
+    for _i, f in ipairs({ "settings.lua", "micromodule_data.lua", "hardcover_links.lua",
+                          "book_facts.sqlite3", "hardcover.sqlite3" }) do
+        for _j, c in ipairs({ "", ".old", "-wal", "-shm", "-journal" }) do
+            os.remove(sdir .. "/" .. f .. c)
+        end
+    end
+    local ok_ffi, ffiutil = pcall(require, "ffi/util")
+    if ok_ffi and ffiutil and type(ffiutil.purgeDir) == "function" then
+        pcall(ffiutil.purgeDir, Paths.cacheDir())
+    end
+    -- Anything an older bookshelf left in the flat layout.
     local DataStorage = require("datastorage")
     local settings_dir = DataStorage:getSettingsDir()
-    for _i, f in ipairs({
-        "bookshelf.lua",
-        "bookshelf_micromodules.lua",       -- bookshelf_settings_store sub-stores
-        "bookshelf_hardcover_links.lua",
-        "bookshelf_opds.lua",
-        "bookshelf_changelog.lua",          -- cached release notes
-        "hardcoversync_settings.lua",       -- bookshelf_hardcover settings
-    }) do
-        os.remove(settings_dir .. "/" .. f)
-        os.remove(settings_dir .. "/" .. f .. ".old")
+    for _i, f in ipairs({ "bookshelf.lua", "bookshelf_micromodules.lua", "bookshelf_hardcover_links.lua",
+                          "bookshelf_opds.lua", "bookshelf_changelog.lua", "bookshelf_book_facts.sqlite3",
+                          "bookshelf_hardcover.sqlite3", "bookshelf_opds.sqlite3", "bookshelf_hero_inflight" }) do
+        for _j, c in ipairs({ "", ".old", "-wal", "-shm", "-journal" }) do
+            os.remove(settings_dir .. "/" .. f .. c)
+        end
     end
-    os.remove(settings_dir .. "/bookshelf_hardcover.sqlite3")
-    -- Cover working dir (incl. the OPDS cover cache), the updater's download
-    -- scratch dir, and the Hardcover enrichment cover dir. purgeDir is
-    -- recursive; pcall so a missing dir (or an older KOReader without the
-    -- helper) can't abort the remaining cleanup.
-    local ok_ffi, ffiutil = pcall(require, "ffi/util")
     if ok_ffi and ffiutil and type(ffiutil.purgeDir) == "function" then
         for _i, d in ipairs({ "bookshelf_covers", "bookshelf_cache", "bookshelf_hardcover" }) do
             pcall(ffiutil.purgeDir, settings_dir .. "/" .. d)

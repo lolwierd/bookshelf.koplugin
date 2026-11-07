@@ -27,7 +27,7 @@
 local Button         = require("ui/widget/button")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local HorizontalGroup= require("ui/widget/horizontalgroup")
-local TextWidget     = require("ui/widget/textwidget")
+local TextWidget     = require("lib/bookshelf_colour_text")
 local VerticalGroup  = require("ui/widget/verticalgroup")
 local CenterContainer= require("ui/widget/container/centercontainer")
 local Geom           = require("ui/geometry")
@@ -35,6 +35,7 @@ local Size           = require("ui/size")
 local Font           = require("ui/font")
 local BFont          = require("lib/bookshelf_fonts")
 local Screen         = require("device").screen
+local Space          = require("lib/bookshelf_space")
 
 local List = {}
 List.__index = List
@@ -124,7 +125,7 @@ function List:_rebuild()
                 text = label,
                 face = label_face,
                 bold = label_bold,
-                max_width = label_w - Size.padding.default * 2,
+                max_width = label_w - Space.padding.default * 2,
             },
         }
         local label_widget
@@ -163,14 +164,6 @@ function List:_rebuild()
             row,
         }
     end
-end
-
-function List:getWidget()
-    return self._vg
-end
-
-function List:getItems()
-    return self.items
 end
 
 return List

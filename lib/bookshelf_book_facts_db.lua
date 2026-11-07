@@ -38,7 +38,7 @@ local logger = require("logger")
 
 local M = {}
 
-M.DB_NAME = "bookshelf_book_facts.sqlite3"
+M.DB_NAME = "book_facts.sqlite3"   -- in settings/bookshelf/ (lib/bookshelf_paths)
 
 local SCHEMA = [[
 CREATE TABLE IF NOT EXISTS book_facts (
@@ -51,9 +51,30 @@ CREATE TABLE IF NOT EXISTS book_facts (
     aspect        REAL,
     status        TEXT,
     status_known  INTEGER,
-    sidecar_mtime INTEGER
+    sidecar_mtime INTEGER,
+    highlights    INTEGER,
+    highlights_mtime INTEGER
 );
 ]]
+-- Columns added after the first release of the table, for a database made
+-- before them: ALTER TABLE fails harmlessly where a column is there already.
+local ADDED_COLUMNS = {
+    -- How many highlights the book's sidecar holds, and that sidecar's mtime
+    -- when they were counted (the quote of the day, lib/bookshelf_quotes).
+    "highlights INTEGER",
+    "highlights_mtime INTEGER",
+    -- What Repo.readProgress read from the book's sidecar (one packed
+    -- string), and that sidecar's mtime: answered from here while the
+    -- sidecar is unchanged, instead of parsing it on the first visit of
+    -- every session.
+    "rprog TEXT",
+    "rprog_mtime INTEGER",
+    -- The publication date read out of the book file (lib/bookshelf_pubdate)
+    -- or carried over from an OPDS catalog at download, for %published, and
+    -- the file's mtime when it was read. "" means looked, found none.
+    "pubdate TEXT",
+    "pubdate_mtime INTEGER",
+}
 
 local _db
 local _open_failed
@@ -61,6 +82,9 @@ local _open_failed
 -- here first and go to disk on flush. It is also the whole store when the
 -- database cannot be opened at all.
 local _memo  = {}
+-- Every stored publication date, read in one query the first time one is
+-- asked for (publishedMap), and kept current by put and drop.
+local _pd_map = nil
 local _dirty = {}
 
 -- open() -> db | nil, reason
@@ -71,7 +95,7 @@ function M.open()
     if not ok_ds then _open_failed = "no-datastorage"; return nil, _open_failed end
     local ok_sq, SQ3 = pcall(require, "lua-ljsqlite3/init")
     if not (ok_sq and SQ3) then _open_failed = "no-sqlite"; return nil, _open_failed end
-    local path = DataStorage:getSettingsDir() .. "/" .. M.DB_NAME
+    local path = require("lib/bookshelf_paths").settingsFile(M.DB_NAME)
     local ok_open, db = pcall(SQ3.open, path)
     if not (ok_open and db) then _open_failed = "open-failed"; return nil, _open_failed end
     local ok_p = pcall(function()
@@ -81,6 +105,11 @@ function M.open()
         db:exec("PRAGMA journal_size_limit=2097152;")
         db:exec(SCHEMA)
     end)
+    if ok_p then
+        for _i, col in ipairs(ADDED_COLUMNS) do
+            pcall(function() db:exec("ALTER TABLE book_facts ADD COLUMN " .. col .. ";") end)
+        end
+    end
     if not ok_p then
         pcall(function() db:close() end)
         _open_failed = "schema-failed"
@@ -100,6 +129,7 @@ end
 -- the app needs it, since the memo and the database never disagree.
 function M.forgetMemo()
     _memo, _dirty = {}, {}
+    _pd_map = nil
 end
 
 -- A store that will not open must degrade to "we know nothing", never to an
@@ -129,11 +159,18 @@ local function _rowToFacts(row)
     local sk = tonumber(row[9])
     e.sk   = sk == 1 or nil
     e.m    = tonumber(row[10])
+    e.hl   = tonumber(row[11])
+    e.hm   = tonumber(row[12])
+    e.rp   = row[13] ~= nil and tostring(row[13]) or nil
+    e.rpm  = tonumber(row[14])
+    e.pd   = row[15] ~= nil and tostring(row[15]) or nil
+    e.pdm  = tonumber(row[16])
     return e
 end
 
 local SELECT_COLS =
-    "fp, pages, pages_src, r, g, b, aspect, status, status_known, sidecar_mtime"
+    "fp, pages, pages_src, r, g, b, aspect, status, status_known, sidecar_mtime, "
+    .. "highlights, highlights_mtime, rprog, rprog_mtime, pubdate, pubdate_mtime"
 
 -- get(fp) -> facts | nil
 -- Keys match the entries the settings store used, so the call sites that read
@@ -152,6 +189,33 @@ function M.get(fp)
     end, nil)
     _memo[fp] = e or false
     return e
+end
+
+-- publishedMap() -> { [fp] = { pd = "YYYY-MM-DD" | "", pdm = mtime } } for every
+-- book whose file has been read for a date ("" = read, none found), or nil
+-- when the store cannot be read. One statement, once a session: the
+-- Publication year sort asks for every book on the shelf, and a query per
+-- book was 5.9 s for 1,615 books on a PW5 in each new session.
+function M.publishedMap()
+    if _pd_map then return _pd_map end
+    local map = with(function(db)
+        local out = {}
+        local st = db:prepare("SELECT fp, pubdate, pubdate_mtime FROM book_facts WHERE pubdate IS NOT NULL")
+        st:reset()
+        local row = st:step()
+        while row do
+            out[tostring(row[1])] = { pd = tostring(row[2]), pdm = tonumber(row[3]) }
+            row = st:step()
+        end
+        return out
+    end, nil)
+    if not map then return nil end
+    -- Writes this session made that are not flushed yet.
+    for fp, e in pairs(_memo) do
+        if e and e.pd ~= nil then map[fp] = { pd = e.pd, pdm = e.pdm } end
+    end
+    _pd_map = map
+    return map
 end
 
 -- prefetch(fps) -> number of rows found
@@ -207,13 +271,17 @@ end
 -- are touched, so writing a look never disturbs a page count and vice versa.
 function M.put(fp, facts)
     if type(fp) ~= "string" or fp == "" or type(facts) ~= "table" then return end
+    -- The row as stored, before merging: flush writes every column, so a
+    -- put onto a row this session never read would blank its other facts
+    -- (a page count lost to a publication date). One read, cold rows only.
+    if _memo[fp] == nil then M.get(fp) end
     local e = _memo[fp]
     if e == nil or e == false then e = {} end
     -- false means CLEAR this field, absent means leave it alone. The
     -- distinction matters: writing a look must not disturb a page count, and
     -- a sidecar that changed under us clears the cached status without
     -- touching the count, which is not the sidecar's to invalidate.
-    for _, k in ipairs({ "p", "psrc", "r", "g", "b", "a", "s", "sk", "m" }) do
+    for _, k in ipairs({ "p", "psrc", "r", "g", "b", "a", "s", "sk", "m", "hl", "hm", "rp", "rpm", "pd", "pdm" }) do
         local v = facts[k]
         if v ~= nil then
             if v == false then e[k] = nil else e[k] = v end
@@ -221,12 +289,42 @@ function M.put(fp, facts)
     end
     _memo[fp] = e
     _dirty[fp] = true
+    if _pd_map and facts.pd ~= nil then
+        _pd_map[fp] = e.pd ~= nil and { pd = e.pd, pdm = e.pdm } or nil
+    end
+end
+
+-- highlightBooks() -> { [fp] = count } for every book known to have
+-- highlights: the store's rows, with this session's unflushed counts over
+-- them. One query; the quote of the day picks among these.
+function M.highlightBooks()
+    local out = with(function(db)
+        local t = {}
+        local st = db:prepare("SELECT fp, highlights FROM book_facts WHERE highlights > 0")
+        st:reset()
+        local row = st:step()
+        while row do
+            t[tostring(row[1])] = tonumber(row[2])
+            row = st:step()
+        end
+        return t
+    end, {}) or {}
+    for fp in pairs(_dirty) do
+        local e = _memo[fp]
+        if type(e) == "table" and e.hl ~= nil then
+            out[fp] = (e.hl > 0) and e.hl or nil
+        elseif e == false then
+            out[fp] = nil
+        end
+    end
+    return out
 end
 
 function M.drop(fp)
     if type(fp) ~= "string" or fp == "" then return end
     _memo[fp] = false
     _dirty[fp] = "delete"
+    if _pd_map then _pd_map[fp] = nil end
 end
 
 -- flush() -> number of rows written
@@ -241,13 +339,16 @@ function M.flush()
         local ok = pcall(function()
             local ins = db:prepare(
                 "INSERT INTO book_facts (" .. SELECT_COLS .. ") "
-                .. "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                .. "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 .. "ON CONFLICT(fp) DO UPDATE SET "
                 .. "pages=excluded.pages, pages_src=excluded.pages_src, "
                 .. "r=excluded.r, g=excluded.g, b=excluded.b, "
                 .. "aspect=excluded.aspect, status=excluded.status, "
                 .. "status_known=excluded.status_known, "
-                .. "sidecar_mtime=excluded.sidecar_mtime")
+                .. "sidecar_mtime=excluded.sidecar_mtime, "
+                .. "highlights=excluded.highlights, highlights_mtime=excluded.highlights_mtime, "
+                .. "rprog=excluded.rprog, rprog_mtime=excluded.rprog_mtime, "
+                .. "pubdate=excluded.pubdate, pubdate_mtime=excluded.pubdate_mtime")
             local del = db:prepare("DELETE FROM book_facts WHERE fp=?")
             for fp, what in pairs(_dirty) do
                 if what == "delete" then
@@ -256,7 +357,8 @@ function M.flush()
                     local e = _memo[fp]
                     if type(e) == "table" then
                         ins:reset():bind(fp, e.p, e.psrc, e.r, e.g, e.b, e.a,
-                                         e.s, e.sk and 1 or nil, e.m):step()
+                                         e.s, e.sk and 1 or nil, e.m, e.hl, e.hm,
+                                         e.rp, e.rpm, e.pd, e.pdm):step()
                         n = n + 1
                     end
                 end
@@ -271,6 +373,21 @@ function M.flush()
     -- answers for the session.
     _dirty = {}
     return written
+end
+
+-- flushSoon(): a flush a few seconds after the last change, for writers
+-- that have no flush point of their own (Repo.readProgress).
+local _flush_armed = false
+function M.flushSoon()
+    if _flush_armed then return end
+    _flush_armed = true
+    local ok, UIManager = pcall(require, "ui/uimanager")
+    if ok and UIManager and UIManager.scheduleIn then
+        UIManager:scheduleIn(3, function() _flush_armed = false; M.flush() end)
+    else
+        _flush_armed = false
+        M.flush()
+    end
 end
 
 -- clearPageCounts() -> number of books cleared
@@ -290,6 +407,27 @@ function M.clearPageCounts()
     -- The memo holds the old answers; drop just the counts from it too.
     for _fp, e in pairs(_memo) do
         if type(e) == "table" then e.p, e.psrc = nil, nil end
+    end
+    return n
+end
+
+-- clearLooks() -> number of books cleared
+-- Forget every sampled spine colour, so each spine samples its cover again on
+-- its next paint. Counts and status stay, like clearPageCounts keeps the
+-- looks. Issue 537: a reader's spines were saved grey while their covers were
+-- in colour, and a look is otherwise only dropped one book at a time.
+function M.clearLooks()
+    M.flush()
+    local n = with(function(db)
+        local st = db:prepare("SELECT COUNT(*) FROM book_facts WHERE r IS NOT NULL")
+        st:reset()
+        local row = st:step()
+        local count = row and tonumber(row[1]) or 0
+        db:exec("UPDATE book_facts SET r=NULL, g=NULL, b=NULL, aspect=NULL WHERE r IS NOT NULL;")
+        return count
+    end, 0)
+    for _fp, e in pairs(_memo) do
+        if type(e) == "table" then e.r, e.g, e.b, e.a = nil, nil, nil, nil end
     end
     return n
 end

@@ -23,7 +23,7 @@ local LineWidget      = require("ui/widget/linewidget")
 local LeftContainer   = require("ui/widget/container/leftcontainer")
 local RightContainer  = require("ui/widget/container/rightcontainer")
 local TopContainer    = require("ui/widget/container/topcontainer")
-local TextWidget      = require("ui/widget/textwidget")
+local TextWidget      = require("lib/bookshelf_colour_text")
 local TextBoxWidget   = require("ui/widget/textboxwidget")
 local TransparentTextBox = require("lib/bookshelf_transparent_text")
 local RenderText      = require("ui/rendertext")
@@ -47,6 +47,7 @@ local TextFit         = require("lib/bookshelf_text_fit")
 local TextSegments    = require("lib/bookshelf_text_segments")
 local InlineStyle     = require("lib/bookshelf_inline_style")
 local ListGeom        = require("lib/bookshelf_list_geom")
+local Space           = require("lib/bookshelf_space")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local BandMetrics     = require("lib/bookshelf_band_metrics")
 local Repo            = require("lib/bookshelf_book_repository")
@@ -394,6 +395,11 @@ function ListRow.lineStyles(lines, scale_pct)
         -- language and an unclosed or nested tag means here what it means to
         -- the single-line path.
         --
+        -- Which [b] and [i]: the ones in force where the line STARTS
+        -- (InlineStyle.leadStyle). Taking any run's made "[b]%title[/b]
+        -- [i]%authors[/i]" wrap bold italic, and a description followed by a
+        -- bold percentage wrap bold (issue 510).
+        --
         -- Only a tag that adds something the line's own controls did not
         -- counts: with no tags at all the box must keep the face lineFace
         -- resolved, not a re-resolution of the same request through a
@@ -407,9 +413,10 @@ function ListRow.lineStyles(lines, scale_pct)
         local tpl_font = ListRow.templateFont(type(line) == "table"
                                               and line.template)
         local tag_bold, tag_italic = false, false
-        for _j, style in ipairs(styles or {}) do
-            if style.bold   and not (base and base.bold)   then tag_bold   = true end
-            if style.italic and not (base and base.italic) then tag_italic = true end
+        local lead = base and InlineStyle.leadStyle(line.template, base)
+        if lead then
+            tag_bold   = lead.bold   == true and not base.bold
+            tag_italic = lead.italic == true and not base.italic
         end
         if tpl_font or tag_bold or tag_italic then
             box_face, box_bold = ListRow.runFace(line, {
@@ -759,7 +766,7 @@ local ROW_GAP = Screen:scaleBySize(ListGeom.ROW_GAP_DP)
 local BORDER  = Screen:scaleBySize(ListGeom.ROW_RING_DP)
 -- The declared padding PLUS whatever OUTER gave up, so moving the box outward
 -- costs the row no height and re-baselines nothing.
-local INNER   = Screen:scaleBySize(ListGeom.ROW_INNER_PAD_DP)
+local INNER   = Space.px(ListGeom.ROW_INNER_PAD_DP)
               + Screen:scaleBySize(ListGeom.ROW_RING_DP)
 -- ZERO. The selection box reaches the row's own edge, which is as far out as
 -- it can go and lands it where the hairline rule between rows sits.
@@ -793,7 +800,7 @@ ListRow.RING  = RING
 -- invented: "the same style/thickness we use for cover images". A row and a
 -- thumbnail rounded to different radii on the same screen read as two
 -- different design languages.
-local RADIUS  = SpineWidget.CARD_RADIUS or Screen:scaleBySize(4)
+local RADIUS  = SpineWidget.CARD_RADIUS or Space.px(4)
 
 -- The leading between the two lines of ONE item, from the same declaration the
 -- height budget reads (ListGeom.INTRA_LEAD_DP). Exported for the same reason
@@ -998,8 +1005,8 @@ end
 -- about. ListRow.new falls back to computing it itself when no layout is
 -- passed, so a one-off row (a test, a future single-row surface) still works.
 function ListRow.pageLayout(opts)
-    local gap   = opts.gap or Size.padding.default
-    local pad   = Size.padding.small
+    local gap   = opts.gap or Space.padding.default
+    local pad   = Space.padding.small
     local model = opts.lines or Lines.layout()
 
     -- Reserve the selection ring's footprint on every side, always -- not
@@ -1186,9 +1193,9 @@ end
 --
 -- ListRow.bar(line, width) -> a paintable bar for this line's %bar.
 --
--- The same backend the hero uses (lib/bookshelf_hero_bar.lua: bookends's
--- painter when it is installed, KOReader's ProgressWidget when it is not), the
--- same two colour settings, and the same height rule -- a percentage of the
+-- The same painter the hero uses (lib/bookshelf_hero_bar.lua: bookshelf's
+-- copy of bookends' painter, so every style draws with or without bookends),
+-- the same two colour settings, and the same height rule -- a percentage of the
 -- face's NOMINAL point size rather than of its rendered line height, because
 -- the rendered height includes leading and descender and a bar measured
 -- against it comes out about twice as tall as the glyphs beside it.
@@ -1198,22 +1205,15 @@ end
 -- a round trip without the model naming them, and the shared line editor
 -- surfaces them on the same button row.
 local function resolvedBarColors(style)
-    -- Pacman has a fixed identity baked into bookends's painter (yellow body,
+    -- Pacman has a fixed identity baked into the painter (yellow body,
     -- peach pellets) and ignores overrides, so the plumbing is skipped rather
     -- than passed and discarded.
     if style == "pacman" then return nil end
-    local custom_fill  = BookshelfSettings.read("progress_fill")
-    local custom_track = BookshelfSettings.read("progress_track")
-    -- Only pass colours the user actually picked: each bookends style has its
-    -- own defaults, and handing over this plugin's dark-grey-on-white would
-    -- wash them out for everyone who never opened the colours menu.
-    if not (custom_fill or custom_track) then return nil end
-    local Color    = require("lib/bookshelf_color")
-    local is_color = Screen:isColorEnabled()
-    return {
-        fill = custom_fill  and Color.parseColorValue(custom_fill,  is_color) or nil,
-        bg   = custom_track and Color.parseColorValue(custom_track, is_color) or nil,
-    }
+    -- Only the colours the user actually picked, for the current mode (see
+    -- CoverProgress.pickedBarColors): each bookends style has its own
+    -- defaults, and handing over this plugin's dark-grey-on-white would wash
+    -- them out for everyone who never opened the colours menu.
+    return require("lib/bookshelf_cover_progress").pickedBarColors()
 end
 
 function ListRow.bar(line, width, pct, band_h)
@@ -1517,10 +1517,42 @@ local function boxLines(box)
     return math.max(1, math.min(total, shown))
 end
 
+--
+-- PLUS line_glyph_extra_height: when a face's glyphs are taller than its line
+-- pitch (a bold title, typically) TextBoxWidget makes its bitmap that much
+-- taller than its lines (textboxwidget.lua _renderText), and getSize reports
+-- the bitmap. Billing lines alone budgeted a wrapped shelf name 70px for a
+-- 72px box; the cell outgrew its slot, centring lifted it a pixel, and its
+-- white fill painted over the rule above (issue 510).
 local function boxHeight(box)
     local total = #(box.vertical_string_list or {})
     local shown = box.lines_per_page or total
     return math.max(1, math.min(total, shown)) * (box.line_height_px or 1)
+        + (box.line_glyph_extra_height or 0)
+end
+
+-- fitBox(line, flat, w, offer) -> a wrapped box no taller than `offer` (as far
+-- as one line allows). wrapBox's height is the LINES' height, and the glyph
+-- overhang above comes on top, so a box granted the whole offer can come out
+-- taller than it. Rebuilt with the overhang taken off first; then, as before,
+-- rebuilt to its own lines if it came in short. Returns the box and what it
+-- really occupies, which is what its getSize reports.
+local function fitBox(line, flat, w, offer)
+    local box = wrapBox(line, flat, w, offer)
+    local extra = box.line_glyph_extra_height or 0
+    if extra > 0 and boxHeight(box) > offer then
+        box:free()
+        box = wrapBox(line, flat, w, math.max(1, offer - extra))
+    end
+    -- Short: its bitmap (height plus overhang) is taller than its lines. Tested
+    -- on the bitmap, not `used < offer`, which misses lines that fill the
+    -- offer exactly while the overhang still hangs below it.
+    local used = boxHeight(box)
+    if (box.height or 0) + extra > used then
+        box:free()
+        box = wrapBox(line, flat, w, math.max(1, used - extra))
+    end
+    return box, used
 end
 
 function ListRow.packRow(record, L, group_templates, text_w)
@@ -1591,7 +1623,7 @@ function ListRow.packRow(record, L, group_templates, text_w)
                 end
                 -- The gap is the truncating path's, so a wrapped line and a
                 -- truncated one hold their tail at the same distance.
-                local gap    = (after ~= "") and Size.padding.large or 0
+                local gap    = (after ~= "") and Space.padding.large or 0
                 local tail_w = ListRow.textWidth(line,
                                    ListRow.flatten(after), inner_w)
                 local plan = ListGeom.elasticWrapPlan{
@@ -1607,7 +1639,8 @@ function ListRow.packRow(record, L, group_templates, text_w)
                 -- if it comes in short -- the same two-step the plain wrapping
                 -- path below uses, and for the same reason.
                 flat = balancedFirstLine(i, line, flat, plan.box_w)
-                boxes[i] = wrapBox(line, flat, plan.box_w, offer)
+                local used
+                boxes[i], used = fitBox(line, flat, plan.box_w, offer)
                 -- elasticWrapPlan cleared this on `unit`, which is a TextWidget
                 -- probe carrying padding the box does not use, so an offer can
                 -- pass `>= unit * 2` and still buy only ONE line of the box's
@@ -1619,12 +1652,6 @@ function ListRow.packRow(record, L, group_templates, text_w)
                     boxes[i]:free()
                     boxes[i] = nil
                     return math.min(unit[i], offer)
-                end
-                local used = boxHeight(boxes[i])
-                if used < 1 then used = unit[i] end
-                if used < offer then
-                    boxes[i]:free()
-                    boxes[i] = wrapBox(line, flat, plan.box_w, used)
                 end
                 tails[i] = { text = after, box_w = plan.box_w, gap = gap }
                 return used
@@ -1641,13 +1668,8 @@ function ListRow.packRow(record, L, group_templates, text_w)
             -- and the box that answers is the box that gets drawn -- except
             -- when it comes in short, which is the only case that pays twice.
             flat = balancedFirstLine(i, line, flat, inner_w)
-            boxes[i] = wrapBox(line, flat, inner_w, offer)
-            local used = boxHeight(boxes[i])
-            if used < 1 then used = unit[i] end
-            if used < offer then
-                boxes[i]:free()
-                boxes[i] = wrapBox(line, flat, inner_w, used)
-            end
+            local used
+            boxes[i], used = fitBox(line, flat, inner_w, offer)
             return used
         end,
     }
@@ -1916,7 +1938,7 @@ function ListRow.textLine(record, line, width, pad, template, opts)
         --    floor too.
         local MIN_KEEP = 0.3
         if (b_w + a_w) > inner_w then
-            local trunc_gap = Size.padding.large
+            local trunc_gap = Space.padding.large
             local avail_a   = inner_w - b_w - trunc_gap
             local min_abs = 0
             do
@@ -1954,8 +1976,8 @@ function ListRow.textLine(record, line, width, pad, template, opts)
         -- %spacer needs none: the span IS the gap.
         local pre_gap, post_gap = 0, 0
         if kind == "bar" then
-            if b_widget and not before:match("%s$") then pre_gap  = Size.padding.small end
-            if a_widget and not after:match("^%s")  then post_gap = Size.padding.small end
+            if b_widget and not before:match("%s$") then pre_gap  = Space.padding.small end
+            if a_widget and not after:match("^%s")  then post_gap = Space.padding.small end
         end
         local elastic_w = math.max(0, inner_w - b_w - a_w - pre_gap - post_gap)
 
@@ -1975,7 +1997,10 @@ function ListRow.textLine(record, line, width, pad, template, opts)
                 bar_w = math.max(2, math.floor(elastic_w
                     * ListGeom.relativeBarFraction(record and record.page_count)))
             end
-            hg[#hg + 1] = ListRow.bar(line, bar_w, record and record.book_pct,
+            -- A book marked finished without being opened has no position;
+            -- it fills (issue 487). See ListGeom.barFraction.
+            hg[#hg + 1] = ListRow.bar(line, bar_w, ListGeom.barFraction(
+                                          record and record.book_pct, record and record.status),
                                       band_h)
             if bar_w < elastic_w then
                 hg[#hg + 1] = HorizontalSpan:new{ width = elastic_w - bar_w }
@@ -2425,6 +2450,8 @@ function ListRow.new(opts)
         padding    = card_pad,
         group,
     }
+    -- Its border in the row ink on every colour screen (Color.colourBorder).
+    require("lib/bookshelf_color").colourBorder(content)
     -- No ring. Selection is the tint (focus) and the checkbox (bulk); a
     -- rectangle round the row as well was too much ink for a soft state,
     -- competed with the hairline rules, and read as a box round the PAIR on a

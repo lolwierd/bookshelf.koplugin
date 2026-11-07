@@ -71,6 +71,8 @@ end
 
 return {
     key   = "stats", -- stable id stored in user menus; never change it
+    -- Text: unreadable one grid column wide (truncates or breaks words).
+    min_w = 2,
     title = _("Reading stats"),
     summary = _("From KOReader statistics. Works offline."),
     -- Heading + prominent "today" duration + pages + this-week, built via the
@@ -84,7 +86,7 @@ return {
         local mw  = math.max(50, width)
         local s = readStats()
         if not s then
-            local TextWidget = require("ui/widget/textwidget")
+            local TextWidget = require("lib/bookshelf_colour_text")
             return TextWidget:new{
                 text = _("Stats unavailable"),
                 face = Kit.face(15, scale_pct),

@@ -54,7 +54,11 @@ local function unpackStripRoot(zip_path, dest)
     local extract_err
     for entry in arc:iterate() do
         local rel = entry.path and entry.path:match("^[^/]+/(.+)$")
-        if rel and rel ~= "" then
+        -- Files and folders only. libarchive is told to refuse "..", but not
+        -- links: a link in the zip, then a file written through it, would
+        -- land outside the plugin folder. A release zip never holds one.
+        local plain = entry.mode == nil or entry.mode == "file" or entry.mode == "directory"
+        if rel and rel ~= "" and plain then
             if not arc:extractToPath(entry.path, dest .. "/" .. rel) then
                 extract_err = arc.err or "extract failed"
                 break
@@ -141,7 +145,22 @@ function Updater.otherCopies()
         local mine = Updater.pluginDir()
         local mine_id = _identity(lfs, mine)
         local seen = {}
-        local roots = { "plugins", DataStorage:getDataDir() .. "/plugins" }
+        -- KOReader's own list (PluginLoader:_discover): "plugins", then the
+        -- extra_plugin_paths setting, which it seeds with <data dir>/plugins
+        -- on first run and reads from then on -- so a folder a reader added
+        -- there is loaded too, and one they removed is not. Only with the
+        -- setting absent is it the data dir.
+        local roots = { "plugins" }
+        local extra = G_reader_settings and G_reader_settings.readSetting
+                      and G_reader_settings:readSetting("extra_plugin_paths")
+        if type(extra) == "string" then extra = { extra } end
+        if type(extra) == "table" then
+            for _i, p in ipairs(extra) do
+                if type(p) == "string" then roots[#roots + 1] = p end
+            end
+        else
+            roots[#roots + 1] = DataStorage:getDataDir() .. "/plugins"
+        end
         for _i = 1, #roots do
             local root = roots[_i]
             local root_id = _identity(lfs, root)
@@ -465,7 +484,7 @@ function Updater.install(zip_url, old_version, new_version, on_success, error_la
 
     UIManager:scheduleIn(0.1, function()
         -- Download ZIP to temp location
-        local cache_dir = DataStorage:getSettingsDir() .. "/bookshelf_cache"
+        local cache_dir = require("lib/bookshelf_paths").cacheFile("updater")
         if lfs.attributes(cache_dir, "mode") ~= "directory" then
             lfs.mkdir(cache_dir)
         end

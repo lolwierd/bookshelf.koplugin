@@ -13,11 +13,12 @@
 -- relative to their slot — this module is layout-agnostic.
 
 local FrameContainer = require("ui/widget/container/framecontainer")
-local TextWidget     = require("ui/widget/textwidget")
+local TextWidget     = require("lib/bookshelf_colour_text")
 local Size           = require("ui/size")
 local Font           = require("ui/font")
 local BFont          = require("lib/bookshelf_fonts")
 local Screen         = require("device").screen
+local Space          = require("lib/bookshelf_space")
 local CoverProgress  = require("lib/bookshelf_cover_progress")
 
 local CountBadge = {}
@@ -59,22 +60,22 @@ function CountBadge.render(total, selected_count, finished_count, finished_total
     end
     local colors = CoverProgress.resolvedColors()
     local face, bold = BFont:getFace("smallinfofont", _badgeSize(12), { bold = true })
-    local badge = FrameContainer:new{
+    local badge = require("lib/bookshelf_color").colourBorder(FrameContainer:new{
         bordersize     = Size.border.thin,
         background     = colors.badge_bg,
         color          = colors.badge_fg,
-        radius         = Screen:scaleBySize(3),
-        padding_left   = Size.padding.default,
-        padding_right  = Size.padding.default,
-        padding_top    = Size.padding.small,
-        padding_bottom = Size.padding.small,
+        radius         = Space.px(3),
+        padding_left   = Space.padding.default,
+        padding_right  = Space.padding.default,
+        padding_top    = Space.padding.small,
+        padding_bottom = Space.padding.small,
         TextWidget:new{
             text = text,
             face = face,
             bold = bold,
             fgcolor = colors.badge_fg,
         },
-    }
+    })
     -- Re-coloured in place on a night-mode flip rather than waiting for the
     -- shelf rebuild. FrameContainer reads background / color at paint time and
     -- TextWidget reads fgcolor at paint time, so all three are assignments.

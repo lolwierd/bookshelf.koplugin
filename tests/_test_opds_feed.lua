@@ -264,6 +264,34 @@ eq(Feed.summaryText("A plain description with no headings."),
    "A plain description with no headings.", "summaryText passes plain text through")
 eq(Feed.summaryText(nil), nil, "summaryText tolerates nil")
 
+-- Calibre-Web (issue 490): its content block opens with a metadata header --
+-- RATING / TAGS / SERIES and custom columns, one "LABEL: value<br />" line
+-- each -- before the blurb's <p>. The header is not the description. Matched
+-- by structure, not by the English labels (calibre translates them).
+local cw = '<div xmlns="http://www.w3.org/1999/xhtml">\n      RATING: \226\152\133\226\152\133<br />\n'
+        .. '    TAGS: Fiction, Science Fiction<br />\n    SERIES: Dune [1.00]<br />\n'
+        .. '        <p><p>A desert planet.</p></p>\n    </div>'
+local cws = Feed.summaryText(cw)
+eq(cws ~= nil and cws:find("TAGS:", 1, true) == nil and cws:find("RATING:", 1, true) == nil
+   and cws:find("SERIES:", 1, true) == nil, true, "summaryText drops the Calibre-Web header (#490)")
+eq(cws ~= nil and cws:find("A desert planet.", 1, true) ~= nil, true, "summaryText keeps the Calibre-Web blurb")
+eq(Feed.summaryText('<div>\n TAGS: Fiction<br />\n</div>'), nil,
+   "a Calibre-Web entry with no blurb gives no description")
+eq(Feed.summaryText("First line<br />Second line: more"), "First line<br />Second line: more",
+   "prose with line breaks is not mistaken for a header")
+eq(Feed.mapEntries({ feed = { entry = { {
+        title = "Dune", author = { name = "Frank Herbert" }, content = cw,
+        link = { { rel = "http://opds-spec.org/acquisition", href = "/d/1.epub", type = "application/epub+zip" } },
+    } } } }, "http://h/opds", "k").records[1].opds.summary:find("TAGS:", 1, true), nil,
+   "a mapped Calibre-Web record's summary carries no header")
+-- Books saved before the fix: the stored description is cleaned as it is read.
+do
+    local r = io.open("lib/bookshelf_book_repository.lua"):read("*a")
+    local body = r:match("\nlocal function _opdsDownloadDescription%(filepath%)\n(.-)\nend\n")
+    eq(body ~= nil and body:find("summaryText(", 1, true) ~= nil, true,
+       "a stored OPDS description is not cleaned when read (books downloaded before the fix)")
+end
+
 -- edition collapse: two entries, same title+author, different acquisitions
 -- (Gutenberg's shape: a with-images and a no-images edition of one work)
 local cat_edition = { feed = { entry = { {
@@ -895,6 +923,81 @@ ok(cov_i ~= nil, "covered nav record present")
 eq(cov_i.opds.icon, nil, "big data uri is a cover, not an icon")
 eq(cov_i.opds.thumbnail_url, big_uri, "big data uri kept as the thumbnail")
 
+-- Series from the feed (GitHub issue 478): EPUB 3 style metadata, as
+-- Grimmory / BookLore serve it, reaches the record's series fields, which
+-- the top panel's series line reads. parse() hands <meta> over as a list,
+-- each with its attributes and its text in _text.
+local function acqEntry(extra)
+    local e = { title = "Oathbringer", author = { name = "Brandon Sanderson" }, id = "urn:s3",
+                link = { { rel = "http://opds-spec.org/acquisition", type = "application/epub+zip", href = "/dl/3.epub" } } }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    return { feed = { entry = { e } } }
+end
+local rs = Feed.mapEntries(acqEntry{ meta = {
+    { property = "belongs-to-collection", id = "series", _text = "The Stormlight Archive" },
+    { property = "group-position", refines = "#series", _text = "3.0" },
+} }, "http://h/opds", "k").records[1]
+eq(rs.series_name, "The Stormlight Archive", "series name from belongs-to-collection")
+eq(rs.series, "The Stormlight Archive", "the series field the [if:series] test reads")
+eq(rs.series_num, "3", "group-position 3.0 reads as 3")
+local rh = Feed.mapEntries(acqEntry{ meta = {
+    { property = "belongs-to-collection", id = "c1", _text = "Novellas" },
+    { property = "group-position", refines = "#c1", _text = "2.5" },
+} }, "http://h/opds", "k").records[1]
+eq(rh.series_num, "2.5", "a half position is kept")
+local rn = Feed.mapEntries(acqEntry{}, "http://h/opds", "k").records[1]
+eq(rn.series_name, nil, "no series metadata: no series"); eq(rn.series_num, nil, "and no number")
+local rp = Feed.mapEntries(acqEntry{ meta = {
+    { property = "belongs-to-collection", id = "s", _text = "Solo" },
+} }, "http://h/opds", "k").records[1]
+eq(rp.series_name, "Solo", "a series without a position"); eq(rp.series_num, nil, "has no number")
+-- OPDS 2.0: metadata.belongsTo.series, an array or a single object
+local r2 = Feed.mapEntries({ is_opds2 = true, publications = { {
+    metadata = { title = "Rhythm of War", author = "Brandon Sanderson",
+                 belongsTo = { series = { { name = "The Stormlight Archive", position = 4 } } } },
+    links = { { rel = "http://opds-spec.org/acquisition", type = "application/epub+zip", href = "/dl/4.epub" } },
+} } }, "http://h/opds2", "k").records[1]
+eq(r2 and r2.series_name, "The Stormlight Archive", "OPDS 2.0 belongsTo.series name")
+eq(r2 and r2.series_num, "4", "OPDS 2.0 position")
+local r2o = Feed.mapEntries({ is_opds2 = true, publications = { {
+    metadata = { title = "X", belongsTo = { series = { name = "Solo", position = "1" } } },
+    links = { { rel = "http://opds-spec.org/acquisition", type = "application/epub+zip", href = "/dl/x.epub" } },
+} } }, "http://h/opds2", "k").records[1]
+eq(r2o and r2o.series_name, "Solo", "OPDS 2.0 series as one object")
+
+-- Publication year from the feed (GitHub issue 566), where %calibre{pubdate}
+-- reads it: KOReader has no field for it, so the catalog is the only source.
+local function pubYear(extra)
+    local r = Feed.mapEntries(acqEntry(extra), "http://h/", "k").records[1]
+    return r and r.calibre and r.calibre.pubdate
+end
+eq(pubYear{ published = "1974-01-01T00:00:00+00:00" }, "1974", "Calibre-Web <published> gives the year")
+eq(pubYear{ ["dcterms:issued"] = "1965" }, "1965", "dcterms:issued, a bare year")
+eq(pubYear{ ["dc:issued"] = "1965-08-01" }, "1965", "dc:issued")
+-- calibre's server: <published> is the date ADDED, dc:date the pubdate
+eq(pubYear{ published = "2024-05-02T10:00:00+00:00", ["dc:date"] = "1951-06-01T00:00:00+00:00" },
+   "1951", "dc:date wins over <published>")
+eq(pubYear{ ["dcterms:issued"] = "1965", published = "2001-01-01" }, "1965", "dcterms:issued wins over <published>")
+eq(pubYear{ published = "0101-01-01T00:00:00+00:00" }, nil, "calibre's 0101 'no date' is no year")
+eq(pubYear{ published = "unknown" }, nil, "no leading year: no year")
+eq(pubYear(), nil, "no date in the entry: no calibre table")
+local r2p = Feed.mapEntries({ is_opds2 = true, publications = { {
+    metadata = { title = "Dune", published = "1965-08-01" },
+    links = { { rel = "http://opds-spec.org/acquisition", type = "application/epub+zip", href = "/dl/d.epub" } },
+} } }, "http://h/opds2", "k").records[1]
+eq(r2p and r2p.calibre and r2p.calibre.pubdate, "1965", "OPDS 2.0 metadata.published")
+-- Two editions of one book merge: a later edition fills a missing year and
+-- never replaces one already there.
+local function edition(n, published)
+    return { title = "Dune", author = { name = "Frank Herbert" }, id = "urn:d" .. n, published = published,
+             link = { { rel = "http://opds-spec.org/acquisition", type = "application/epub+zip", href = "/d" .. n .. ".epub" } } }
+end
+local rm = Feed.mapEntries({ feed = { entry = { edition(1), edition(2, "1965-01-01") } } }, "http://h/", "k").records
+eq(#rm, 1, "two editions merge into one record")
+eq(rm[1].calibre and rm[1].calibre.pubdate, "1965", "a later edition fills the missing year")
+rm = Feed.mapEntries({ feed = { entry = { edition(1, "1965-01-01"), edition(2, "2005-01-01") } } }, "http://h/", "k").records
+eq(rm[1].calibre and rm[1].calibre.pubdate, "1965", "the first edition's year is kept")
+
 -- parse(): only when a KOReader tree provides luxl (needs luajit's ffi)
 local koreader_dir = os.getenv("KOREADER_DIR") or "/usr/lib/koreader"
 local have_ffi = pcall(require, "ffi")
@@ -912,6 +1015,39 @@ if have_ffi and f then
     ok(type(cat) == "table" and cat.feed and cat.feed.entry, "parse yields a feed table")
     local r3 = Feed.mapEntries(cat, "http://h/", "k")
     eq(#r3.records, 1, "parsed entry maps to a record")
+
+    -- Grimmory's series metadata through the real parser (issue 478)
+    local gxml = [[<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><title>Words of Radiance</title><id>g2</id>
+    <author><name>Brandon Sanderson</name></author>
+    <meta property="belongs-to-collection" id="series">The Stormlight Archive</meta>
+    <meta property="group-position" refines="#series">2.0</meta>
+    <link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/g2.epub"/>
+  </entry>
+</feed>]]
+    local gr = Feed.mapEntries(Feed.parse(gxml), "http://h/", "k").records[1]
+    eq(gr and gr.series_name, "The Stormlight Archive", "parse(): series name through the parser")
+    eq(gr and gr.series_num, "2", "parse(): series position through the parser")
+    eq(gr and gr.title, "Words of Radiance", "parse(): the title is untouched")
+
+    -- Publication dates through the real parser (issue 566): Calibre-Web's
+    -- <published>, calibre's namespaced dc:date
+    local pxml = [[<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/terms/">
+  <entry><title>Dune</title><id>p1</id>
+    <published>1965-08-01T00:00:00+00:00</published>
+    <link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/p1.epub"/>
+  </entry>
+  <entry><title>Foundation</title><id>p2</id>
+    <published>2024-05-02T10:00:00+00:00</published>
+    <dc:date>1951-06-01T00:00:00+00:00</dc:date>
+    <link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/p2.epub"/>
+  </entry>
+</feed>]]
+    local pr = Feed.mapEntries(Feed.parse(pxml), "http://h/", "k").records
+    eq(pr[1] and pr[1].calibre and pr[1].calibre.pubdate, "1965", "parse(): <published> through the parser")
+    eq(pr[2] and pr[2].calibre and pr[2].calibre.pubdate, "1951", "parse(): dc:date through the parser")
 
     -- parseOsd(): a Gutenberg-shaped OpenSearch description with several Url
     -- types (html, atom, a bare OSD self-reference) - the atom one is picked
@@ -1177,7 +1313,7 @@ do
 
     -- and fetch must actually send it as a header, not rely on user/password
     local src = io.open("lib/bookshelf_opds_feed.lua"):read("a")
-    local body = src:match("\nfunction M%.fetch%(url, username, password, opts%)\n(.-)\nend\n")
+    local body = src:match("\nfunction M%.fetch%(url, username, password, opts, redirect_depth%)\n(.-)\nend\n")
     ok(body ~= nil, "fetch could be located")
     if body then
         local code = body:gsub("%-%-[^\n]*", "")
@@ -1193,6 +1329,10 @@ do
            "and sets it before the request is built")
         ok(code:find("headers = headers", 1, true) ~= nil,
            "and that same table is the one the request sends")
+        -- luasocket's own redirect following would carry that header to
+        -- any host; tests/_test_opds_auth_redirects.lua drives the hops.
+        ok(code:find("redirect = false", 1, true) ~= nil,
+           "and luasocket does not follow redirects with it")
     end
 end
 

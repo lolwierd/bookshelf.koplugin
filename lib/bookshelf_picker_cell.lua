@@ -8,7 +8,7 @@
 --   * bookshelf_collection_manager (book-tag toggle + manage modes).
 --
 -- Cell anatomy:
---   * FrameContainer with thin border + slight radius + white background.
+--   * The popup kit's grey card with a hairline shadow.
 --   * CenterContainer wraps a VerticalGroup of:
 --       - bold label (single line, truncated with an ellipsis if too long)
 --       - optional secondary count ("n book(s)") OR a freeform subtitle
@@ -24,10 +24,11 @@ local Font            = require("ui/font")
 local BFont           = require("lib/bookshelf_fonts")
 local Geom            = require("ui/geometry")
 local Size            = require("ui/size")
-local TextWidget      = require("ui/widget/textwidget")
+local TextWidget      = require("lib/bookshelf_colour_text")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
 local Device          = require("device")
+local Space           = require("lib/bookshelf_space")
 local Screen          = Device.screen
 
 local _ = require("lib/bookshelf_i18n").gettext
@@ -53,7 +54,7 @@ local PickerCell = {}
 -- }
 function PickerCell.render(item, dimen, opts)
     opts = opts or {}
-    local content_inset = Size.padding.large
+    local content_inset = Space.padding.large
     local content_w     = dimen.w - 2 * content_inset
     -- Text stays black in BOTH normal and selected states. The selected
     -- state uses FrameContainer.invert (full-region pixel flip), which
@@ -93,7 +94,7 @@ function PickerCell.render(item, dimen, opts)
         -- Tight 1px vertical span between label and subtitle -- with both
         -- lines bold the visual relationship reads as one stacked unit;
         -- a larger gap broke that into two separate lines.
-        children[#children + 1] = VerticalSpan:new{ width = Screen:scaleBySize(1) }
+        children[#children + 1] = VerticalSpan:new{ width = Space.px(1) }
         local sub_face, sub_bold = BFont:getFace("cfont", 12, { bold = true })
         children[#children + 1] = TextWidget:new{
             text      = sub_text,
@@ -111,20 +112,26 @@ function PickerCell.render(item, dimen, opts)
     -- gray background literally rather than relying on invert (so it
     -- reads as a third, distinct state next to plain white and inverted
     -- black).
-    local bg     = opts.tint and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE
+    -- The popup kit's card (STYLE.md): light grey with a hairline shadow,
+    -- black when selected. tint: a third state, mid grey.
+    local Kit    = require("lib/bookshelf_popup_kit")
     local invert = opts.selected and not opts.tint
-    return FrameContainer:new{
-        bordersize = Size.border.thin,
-        radius     = Size.radius.default,
-        padding    = 0,
-        margin     = 0,
-        background = bg,
-        invert     = invert,
+    local card = Kit.card{
+        background = opts.tint and Blitbuffer.COLOR_LIGHT_GRAY or nil,
         CenterContainer:new{
-            dimen = Geom:new{ w = dimen.w, h = dimen.h },
+            dimen = Geom:new{ w = dimen.w - Kit.shadowSize(), h = dimen.h - Kit.shadowSize() },
             stack,
         },
     }
+    if invert then
+        local paint = card.paintTo
+        function card:paintTo(bb, x, y)
+            paint(self, bb, x, y)
+            local sz = self:getSize()
+            Kit.invertRounded(bb, x, y, sz.w, sz.h, Kit.RADIUS)
+        end
+    end
+    return card
 end
 
 return PickerCell

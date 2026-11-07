@@ -78,6 +78,8 @@ return {
     _fmtDate   = fmtDate,
     _daysUntil = daysUntil,
     key     = "countdown",
+    -- Text: unreadable one grid column wide (truncates or breaks words).
+    min_w = 2,
     title   = _("Countdown"),
     summary = _("From a date you set. Works offline."),
 
@@ -103,7 +105,7 @@ return {
 
         local n = daysUntil(y, m, d)
         if n == 0 then
-            return Kit.valueCard{ width = width, scale_pct = scale_pct,
+            return Kit.valueCard{ width = width, scale_pct = scale_pct, height = ctx.height,
                 value = _("Today"), sub = label }
         end
         local abs     = math.abs(n)
@@ -111,7 +113,7 @@ return {
         local T       = require("ffi/util").template
         local sub     = (n > 0) and T(_("until %1"), label)
                                 or  T(_("since %1"), label)
-        return Kit.valueCard{ width = width, scale_pct = scale_pct,
+        return Kit.valueCard{ width = width, scale_pct = scale_pct, height = ctx.height,
             value = tostring(abs), suffix = " " .. dayword, sub = sub }
     end,
 
@@ -133,7 +135,7 @@ return {
         local function close(fn)
             return function() UIManager:close(dialog); if fn then fn() end end
         end
-        dialog = ButtonDialog:new{
+        dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
             title = _("Countdown"), title_align = "center", width_factor = 0.7,
             buttons = {
                 {{ text = _("Change date\xE2\x80\xA6"), callback = close(function()
@@ -145,7 +147,7 @@ return {
                         function(label) ctx.config:set("label", label) end)
                 end) }},
             },
-        }
+        })
         UIManager:show(dialog)
     end,
 }

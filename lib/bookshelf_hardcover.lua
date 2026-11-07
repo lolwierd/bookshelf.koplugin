@@ -28,6 +28,11 @@ local _cache_memo = {}          -- [kind][ckey] -> decoded value (false = known-
 -- _cache_memo is (invalidate, _cacheDelKind, _cacheReplaceKind). _cachePut
 -- keeps the memo in step with the DB, so a single write does not unset it.
 local _cache_bulk = {}
+-- [kind][ckey] -> a row's JSON, not yet decoded: a bulk load (preloadMetadata)
+-- keeps the rows as they are and _cacheGet decodes one when it is asked for.
+-- Decoding every enrichment at once was ~13% of the shelf's first build on
+-- the PW5 (235 rows, 330 KB of JSON), for the handful of books on screen.
+local _cache_raw = {}
 local _hc_settings
 local _hc_settings_object
 
@@ -37,8 +42,7 @@ local function _settingsPath()
 end
 
 local function _cacheDir()
-    local DataStorage = require("datastorage")
-    return DataStorage:getSettingsDir() .. "/bookshelf_hardcover"
+    return require("lib/bookshelf_paths").cacheFile("hardcover")
 end
 
 -- Shared recursive, pcall-hardened helper (lib/bookshelf_fs).
@@ -144,7 +148,7 @@ local function _cacheDb(for_write)
     if _cache_db == false then return nil end   -- disabled after a prior failure
     if _cache_db then return _cache_db end
     local DataStorage = require("datastorage")
-    local db_path = DataStorage:getSettingsDir() .. "/bookshelf_hardcover.sqlite3"
+    local db_path = require("lib/bookshelf_paths").settingsFile("hardcover.sqlite3")
     if not for_write then
         local lfs = require("libs/libkoreader-lfs")
         if lfs.attributes(db_path, "mode") ~= "file"
@@ -181,6 +185,15 @@ local function _cacheGet(kind, ckey)
         local v = m[ckey]
         return v ~= false and v or nil
     end
+    local raws = _cache_raw[kind]
+    local raw = raws and raws[ckey]
+    if raw then
+        raws[ckey] = nil
+        local v = _cacheDecode(raw)
+        _cache_memo[kind] = _cache_memo[kind] or {}
+        _cache_memo[kind][ckey] = v or false
+        return v
+    end
     -- Every row of this kind is already memoised, so not being there IS the
     -- answer. Without this a bulk load would still pay a query per absent key.
     if _cache_bulk[kind] then return nil end
@@ -203,6 +216,7 @@ end
 -- Single-row write.
 local function _cachePut(kind, ckey, value)
     if not ckey then return end
+    if _cache_raw[kind] then _cache_raw[kind][ckey] = nil end
     _cache_memo[kind] = _cache_memo[kind] or {}
     _cache_memo[kind][ckey] = value or false
     local json = _cacheEncode(value)
@@ -219,6 +233,7 @@ end
 
 local function _cacheDelKind(kind)
     _cache_memo[kind] = nil
+    _cache_raw[kind] = nil
     _cache_bulk[kind] = nil
     local db = _cacheDb()
     if not db then return end
@@ -262,6 +277,24 @@ local function _cacheReadKind(kind)
     return out
 end
 
+-- _cacheReadKindRaw(kind) -> { [ckey] = json }: the rows, undecoded.
+local function _cacheReadKindRaw(kind)
+    local out = {}
+    local db = _cacheDb()
+    if not db then return out end
+    pcall(function()
+        local stmt = db:prepare("SELECT ckey, data FROM cache WHERE kind = ?")
+        stmt:bind(kind)
+        local row = stmt:step()
+        while row do
+            if row[2] then out[tostring(row[1])] = row[2] end
+            row = stmt:step()
+        end
+        stmt:clearbind():reset(); stmt:close()
+    end)
+    return out
+end
+
 local function _cacheReplaceKind(kind, tbl)
     _cacheDelKind(kind)
     local db = _cacheDb(true)   -- write path: create the DB on demand
@@ -277,6 +310,7 @@ local function _cacheReplaceKind(kind, tbl)
         stmt:close()
     end)
     _cache_memo[kind] = nil
+    _cache_raw[kind] = nil
     _cache_bulk[kind] = nil
 end
 
@@ -620,6 +654,7 @@ function Hardcover.invalidate()
     _links = nil
     _external_links = nil
     _cache_memo = {}
+    _cache_raw = {}
     _cache_bulk = {}
     _hc_settings = nil
     _hc_settings_object = nil
@@ -676,13 +711,6 @@ function Hardcover.hasData()
         or stats.fetched_at ~= nil
 end
 
--- Gate for the "Hardcover enrichment" settings menu: shown when the plugin is
--- available OR the user already has data, hidden only for someone who has
--- never used Hardcover and doesn't have the plugin installed.
-function Hardcover.shouldShowEnrichmentUI()
-    return Hardcover.isAvailable() or Hardcover.hasData()
-end
-
 function Hardcover.getCachedRating(book_id)
     if not book_id then return nil end
     return _ratingFromCacheEntry(_cacheGet("rating", tostring(book_id)))
@@ -736,6 +764,14 @@ function Hardcover.linkBook(filepath, hc_book)
         return false, "Missing Hardcover book id"
     end
     local links = _readLinks()
+    -- A re-link (Select edition, Manual link) keeps the reader's cover and
+    -- description choices. The payload is a fresh record, and dropping them
+    -- left autoDecideFlags to decide again, undoing a choice made by hand.
+    local old = links[filepath]
+    if type(old) == "table" then
+        payload.use_cover = old.use_cover
+        payload.use_description = old.use_description
+    end
     links[filepath] = payload
     _saveLinks(links)
     pcall(_mirrorExternalLink, filepath, payload)
@@ -1602,29 +1638,8 @@ local function _normaliseUserName(user)
     return user.name or user.username
 end
 
-local function _imageUrl(row)
-    if type(row) ~= "table" then return nil end
-    -- Hardcover's `cached_image` is a JSON object { url, width, height, ... },
-    -- NOT a plain string (the vendored plugin reads cached_image.url too).
-    -- The string branch is kept only as a defensive fallback for any caller
-    -- that pre-flattened it. Missing this object form was why linked books
-    -- never got a fallback cover: _imageUrl returned nil, so nothing was
-    -- downloaded.
-    local ci = row.cached_image
-    if type(ci) == "string" and ci ~= "" then
-        return ci
-    end
-    if type(ci) == "table" and type(ci.url) == "string" and ci.url ~= "" then
-        return ci.url
-    end
-    if type(row.image) == "table" and type(row.image.url) == "string" then
-        return row.image.url
-    end
-    return nil
-end
-
--- Like _imageUrl but also returns the cached_image's pixel dimensions when
--- present (the JSON object carries { url, width, height }). Used to compare
+-- The cover URL off a Hardcover row, with the cached_image's pixel dimensions
+-- when present (the JSON object carries { url, width, height }). Used to compare
 -- against the embedded cover's resolution when auto-deciding "Use Hardcover
 -- image" at link time. Dimensions are nil when Hardcover only gives a URL.
 local function _imageInfo(row)
@@ -1785,6 +1800,7 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
                 cached_tags
                 book_series { position series { name } }
                 pages
+                release_year
                 rating
                 ratings_count
                 reviews_count
@@ -1817,6 +1833,7 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
                 cached_tags
                 book_series { position series { name } }
                 pages
+                release_year
                 rating
                 ratings_count
                 reviews_count
@@ -1870,6 +1887,10 @@ local function _fetchBookEnrichment(book_id, edition_id, opts)
         -- refreshBook writes it back into the link store, which is where
         -- linkedPages() / the bulk page-count scan read from.
         pages = tonumber(edition and edition.pages) or tonumber(data.book.pages),
+        -- The work's first publication year, not the linked edition's (a 2014
+        -- reprint of Dracula is still 1897): %published and the Publication
+        -- year sort, under Use Hardcover metadata.
+        published_year = tonumber(data.book.release_year),
         fetched_at = os.time(),
     }
 end
@@ -1937,10 +1958,9 @@ function Hardcover.refreshBookOnline(book, opts, callback)
 end
 
 
-local function _normaliseReviewsPayload(book)
-    if type(book) ~= "table" then return nil end
+local function _normaliseReviews(rows)
     local reviews = {}
-    for _, row in ipairs(type(book.user_books) == "table" and book.user_books or {}) do
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
         local text = row.review or row.review_raw
         if type(text) == "string" and text ~= "" then
             reviews[#reviews + 1] = {
@@ -1955,7 +1975,16 @@ local function _normaliseReviewsPayload(book)
             }
         end
     end
+    return reviews
+end
+
+local function _normaliseReviewsPayload(book)
+    if type(book) ~= "table" then return nil end
+    local reviews = _normaliseReviews(book.user_books)
     return {
+        -- Reviews marked as spoilers, kept apart: the popup shows them only
+        -- when the reader ticks "Include spoilers".
+        spoiler_reviews = _normaliseReviews(book.spoiler_books),
         book_id = book.id,
         title = book.title,
         rating = tonumber(book.rating),
@@ -2002,6 +2031,24 @@ function Hardcover.fetchReviews(book_id, opts)
             reviews_count
             user_books(
               where: { has_review: { _eq: true }, review_has_spoilers: { _eq: false } },
+              order_by: [{ likes_count: desc_nulls_last }, { reviewed_at: desc_nulls_last }],
+              limit: $limit
+            ) {
+              id
+              rating
+              review
+              review_raw
+              review_has_spoilers
+              reviewed_at
+              likes_count
+              user {
+                id
+                name
+                username
+              }
+            }
+            spoiler_books: user_books(
+              where: { has_review: { _eq: true }, review_has_spoilers: { _eq: true } },
               order_by: [{ likes_count: desc_nulls_last }, { reviewed_at: desc_nulls_last }],
               limit: $limit
             ) {
@@ -2181,14 +2228,16 @@ function Hardcover.preloadMetadata()
     if _cache_bulk.enrich then return end
     if not Hardcover.isAvailable() then return end
     if not BookshelfSettings.isTrue("hardcover_use_metadata") then return end
-    local rows = _cacheReadKind("enrich")
+    local rows = _cacheReadKindRaw("enrich")
     local memo = _cache_memo.enrich or {}
-    for ckey, v in pairs(rows) do
+    local raw = {}
+    for ckey, json in pairs(rows) do
         -- Never overwrite a live memo entry: a _cachePut earlier this session
-        -- is newer than what the read returned.
-        if memo[ckey] == nil then memo[ckey] = v end
+        -- is newer than what the read returned. Decoded when asked for.
+        if memo[ckey] == nil then raw[ckey] = json end
     end
     _cache_memo.enrich = memo
+    _cache_raw.enrich = raw
     _cache_bulk.enrich = true
 end
 
@@ -2230,6 +2279,11 @@ function Hardcover.applyMetadata(book)
             book.series_num = nil
             book.series = enrichment.series_name
         end
+    end
+    -- Read by lib/bookshelf_published ahead of calibre and the file. A link
+    -- made before 6.3.2 has no year until its metadata is refreshed.
+    if tonumber(enrichment.published_year) and tonumber(enrichment.published_year) > 0 then
+        book.hardcover_published = tostring(math.floor(tonumber(enrichment.published_year)))
     end
     if type(enrichment.genres) == "table" and #enrichment.genres > 0 then
         local max = tonumber(BookshelfSettings.read("hardcover_max_genres")) or 5
@@ -2315,6 +2369,11 @@ function Hardcover.enrichBook(book)
     -- Expose the Hardcover genre list to the book-detail source chip bar even
     -- when the global "Use Hardcover metadata" toggle is off, so a per-book
     -- source choice can pick Hardcover for one book. Capped like applyMetadata.
+    -- Read by lib/bookshelf_published ahead of calibre and the file. A link
+    -- made before 6.3.2 has no year until its metadata is refreshed.
+    if tonumber(enrichment.published_year) and tonumber(enrichment.published_year) > 0 then
+        book.hardcover_published = tostring(math.floor(tonumber(enrichment.published_year)))
+    end
     if type(enrichment.genres) == "table" and #enrichment.genres > 0 then
         local max = tonumber(BookshelfSettings.read("hardcover_max_genres")) or 5
         if max < 0 then max = 0 end

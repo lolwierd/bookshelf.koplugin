@@ -15,6 +15,7 @@ local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
+local Space = require("lib/bookshelf_space")
 local Catalogue = require("lib/bookshelf_icons_catalogue")
 local DataStorage = require("datastorage")
 local lfs = require("libs/libkoreader-lfs")
@@ -183,8 +184,8 @@ local function currentItemList(state)
         -- LibraryModal calls into this list multiple times per refresh. We
         -- tokenise the query once and match against each cell's pre-lowered
         -- search_lc -- avoids ~2,800 query:lower() + gmatch reparses and
-        -- ~2,800 haystack:lower() calls per refresh that the generic
-        -- LibraryModal._matchesQuery would do.
+        -- ~2,800 haystack:lower() calls per refresh that matching each cell
+        -- from scratch would cost.
         local terms = {}
         for term in state.search_query:lower():gmatch("%S+") do
             terms[#terms + 1] = term
@@ -298,8 +299,9 @@ end
 -- Glyphs always render through the "symbols" face (KOReader's bundled
 -- Symbols Nerd Font); labels follow the bookshelf UI font.
 function IconsLibrary._renderCell(item, dimen)
+    local Kit = require("lib/bookshelf_popup_kit")
     local Font = require("ui/font")
-    local TextWidget = require("ui/widget/textwidget")
+    local TextWidget = require("lib/bookshelf_colour_text")
     local BFont = require("lib/bookshelf_fonts")
     local glyph_size = math.max(36, math.floor(dimen.w * 0.16))
     local glyph_w
@@ -323,17 +325,19 @@ function IconsLibrary._renderCell(item, dimen)
         text = item.label or "",
         face = label_face,
         fgcolor = Blitbuffer.COLOR_BLACK,
-        max_width = dimen.w - Screen:scaleBySize(8),
+        max_width = dimen.w - Space.px(8),
     }
     local stack = VerticalGroup:new{
         align = "center",
         glyph_w,
-        VerticalSpan:new{ width = Size.span.vertical_default or 4 },
+        VerticalSpan:new{ width = Space.span.vertical_default or 4 },
         label_w,
     }
-    return FrameContainer:new{
-        bordersize = Size.border.thin,
-        radius = Size.radius.default,
+    -- No border: the kit's card (cardify) has none, so the content fills the
+    -- slot (counted, every card came out short of it).
+    return require("lib/bookshelf_popup_kit").cardify(FrameContainer:new{
+        bordersize = 0,
+        radius = Kit.RADIUS,
         padding = 0,
         margin = 0,
         background = Blitbuffer.COLOR_WHITE,
@@ -341,7 +345,7 @@ function IconsLibrary._renderCell(item, dimen)
             dimen = Geom:new{ w = dimen.w, h = dimen.h },
             stack,
         },
-    }
+    })
 end
 
 -- Brief notification with the canonical name + codepoint on long-tap.
@@ -473,12 +477,12 @@ function IconsLibrary:show(on_select, opts)
                 return nil
             end
             local Font = require("ui/font")
-            local TextWidget = require("ui/widget/textwidget")
+            local TextWidget = require("lib/bookshelf_colour_text")
             local msg = TextWidget:new{
                 text = _("Drop .svg or .png files in koreader/icons/"),
-                face = Font:getFace("cfont", 16),
+                face = require("lib/bookshelf_fonts"):getFace("cfont", 16),
                 fgcolor = Blitbuffer.COLOR_BLACK,
-                max_width = content_width - Screen:scaleBySize(24),
+                max_width = content_width - Space.px(24),
             }
             return CenterContainer:new{
                 dimen = Geom:new{ w = content_width, h = area_height },

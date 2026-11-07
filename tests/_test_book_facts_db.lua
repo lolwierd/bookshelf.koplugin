@@ -36,7 +36,9 @@ package.loaded["logger"] = { dbg=function() end, info=function() end,
                              warn=function() end, err=function() end }
 local TMPDIR = os.getenv("TMPDIR") or "/tmp"
 local DBDIR = TMPDIR .. "/bookshelf_facts_db_test"
-os.execute("rm -rf '" .. DBDIR .. "' && mkdir -p '" .. DBDIR .. "'")
+-- The store lives in settings/bookshelf/ (lib/bookshelf_paths), which the
+-- paths module makes once per session; a test that wipes it makes it again.
+os.execute("rm -rf '" .. DBDIR .. "' && mkdir -p '" .. DBDIR .. "/bookshelf'")
 package.loaded["datastorage"] = { getSettingsDir = function() return DBDIR end }
 
 local Facts = require("lib/bookshelf_book_facts_db")
@@ -51,7 +53,9 @@ local function test(name, fn)
 end
 local function fresh()
     Facts.close()
-    os.execute("rm -rf '" .. DBDIR .. "' && mkdir -p '" .. DBDIR .. "'")
+    -- The store lives in settings/bookshelf/ (lib/bookshelf_paths), which the
+-- paths module makes once per session; a test that wipes it makes it again.
+os.execute("rm -rf '" .. DBDIR .. "' && mkdir -p '" .. DBDIR .. "/bookshelf'")
     Facts.forgetMemo()
 end
 
@@ -153,6 +157,29 @@ test("facts: clearing page counts leaves the looks alone", function()
     end
 end)
 
+test("facts: clearing looks leaves page counts and status alone (#537)", function()
+    fresh()
+    Facts.put("/b/a.epub", { p = 300, psrc = "ncx", r = 90, g = 90, b = 90, a = 1.5, s = "reading", sk = true })
+    Facts.put("/b/b.epub", { p = 400, psrc = "render", r = 4, g = 5, b = 6 })
+    Facts.put("/b/c.epub", { p = 500, psrc = "ncx" })
+    Facts.flush()
+    -- One look still only in memory, written after the last flush.
+    Facts.put("/b/d.epub", { r = 7, g = 8, b = 9 })
+    local n = Facts.clearLooks()
+    assert(n == 3, "expected 3 looks cleared, got " .. tostring(n))
+    for pass = 1, 2 do
+        if pass == 2 then Facts.forgetMemo() end
+        for _, fp in ipairs({ "/b/a.epub", "/b/b.epub", "/b/d.epub" }) do
+            local e = Facts.get(fp)
+            assert(not (e and e.r), fp .. " kept its look (pass " .. pass .. ")")
+        end
+        local a = Facts.get("/b/a.epub")
+        assert(a and a.p == 300 and a.psrc == "ncx", "the page count went with the look")
+        assert(a.s == "reading", "the cached status went with the look")
+        assert(Facts.get("/b/c.epub").p == 500, "a book with no look lost its count")
+    end
+end)
+
 test("facts: clearing counts on an empty store is a no-op, not an error", function()
     fresh()
     assert(Facts.clearPageCounts() == 0, "nothing to clear")
@@ -211,6 +238,119 @@ test("facts: false clears a field, absent leaves it alone", function()
     assert(e.sk == nil, "status_known should have been cleared")
     assert(e.p == 200, "the page count is not the sidecar's to invalidate")
     assert(e.r == 9, "the look should be untouched")
+end)
+
+-- ── Highlight counts, for the quote of the day ─────────────────────────────
+
+test("facts: a highlight count and its sidecar time survive a reopen", function()
+    fresh()
+    Facts.put("/b/q.epub", { hl = 9, hm = 1234 })
+    Facts.put("/b/none.epub", { hl = 0, hm = 99 })
+    Facts.flush(); Facts.close(); Facts.forgetMemo()
+    local e = Facts.get("/b/q.epub")
+    assert(e and e.hl == 9 and e.hm == 1234, "the count was not kept: " .. tostring(e and e.hl))
+    local found = Facts.highlightBooks()
+    assert(found["/b/q.epub"] == 9, "a book with highlights is not listed")
+    assert(found["/b/none.epub"] == nil, "a book without highlights is listed")
+end)
+
+test("facts: a count written this session is listed before a flush", function()
+    fresh()
+    Facts.put("/b/new.epub", { hl = 3, hm = 5 })
+    assert(Facts.highlightBooks()["/b/new.epub"] == 3, "an unflushed count is missing")
+end)
+
+test("facts: an older database gains the highlight columns", function()
+    fresh()
+    Facts.close()
+    local SQ3 = require("lua-ljsqlite3/init")
+    local db = SQ3.open(DBDIR .. "/bookshelf/book_facts.sqlite3")
+    db:exec([[CREATE TABLE book_facts (fp TEXT PRIMARY KEY, pages INTEGER, pages_src TEXT,
+        r INTEGER, g INTEGER, b INTEGER, aspect REAL, status TEXT, status_known INTEGER,
+        sidecar_mtime INTEGER);]])
+    db:exec("INSERT INTO book_facts (fp, pages) VALUES ('/b/old.epub', 300);")
+    db:close()
+    Facts.forgetMemo()
+    local e = Facts.get("/b/old.epub")
+    assert(e and e.p == 300, "the old row was lost")
+    Facts.put("/b/old.epub", { hl = 2, hm = 7 })
+    Facts.flush(); Facts.forgetMemo()
+    local e2 = Facts.get("/b/old.epub")
+    assert(e2.hl == 2 and e2.p == 300, "the column was not added to the old table")
+end)
+
+test("facts: what readProgress read from a sidecar round-trips with its mtime", function()
+    fresh()
+    local U = string.char(31)
+    local packed = table.concat({ "0.5", "reading", "", "320", "render", "12", "" }, U)
+    Facts.put("/b/r.epub", { rp = packed, rpm = 99 })
+    Facts.flush(); Facts.close(); Facts.forgetMemo()
+    local e = Facts.get("/b/r.epub")
+    assert(e and e.rpm == 99 and e.rp == packed, tostring(e and e.rp))
+    -- A page count written later leaves it alone.
+    Facts.put("/b/r.epub", { p = 300 })
+    Facts.flush(); Facts.forgetMemo()
+    assert(Facts.get("/b/r.epub").rpm == 99)
+end)
+
+test("facts: a publication date and its file mtime round-trip; empty means looked", function()
+    fresh()
+    Facts.put("/b/p.epub", { pd = "1869-01-01", pdm = 42 })
+    Facts.put("/b/none.epub", { pd = "", pdm = 7 })
+    Facts.flush(); Facts.close(); Facts.forgetMemo()
+    local e = Facts.get("/b/p.epub")
+    assert(e and e.pd == "1869-01-01" and e.pdm == 42, tostring(e and e.pd))
+    local n = Facts.get("/b/none.epub")
+    assert(n and n.pd == "" and n.pdm == 7, "an empty date must survive as looked-and-found-none")
+    Facts.put("/b/p.epub", { p = 300 })
+    Facts.flush(); Facts.forgetMemo()
+    assert(Facts.get("/b/p.epub").pd == "1869-01-01", "a page count disturbed the date")
+end)
+
+test("facts: an older database gains the publication date columns", function()
+    fresh()
+    Facts.close()
+    local SQ3 = require("lua-ljsqlite3/init")
+    local db = SQ3.open(DBDIR .. "/bookshelf/book_facts.sqlite3")
+    db:exec([[CREATE TABLE book_facts (fp TEXT PRIMARY KEY, pages INTEGER, pages_src TEXT,
+        r INTEGER, g INTEGER, b INTEGER, aspect REAL, status TEXT, status_known INTEGER,
+        sidecar_mtime INTEGER, highlights INTEGER, highlights_mtime INTEGER,
+        rprog TEXT, rprog_mtime INTEGER);]])
+    db:exec("INSERT INTO book_facts (fp, pages) VALUES ('/b/old.epub', 300);")
+    db:close()
+    Facts.forgetMemo()
+    Facts.put("/b/old.epub", { pd = "2001" })
+    Facts.flush(); Facts.forgetMemo()
+    local e = Facts.get("/b/old.epub")
+    assert(e and e.pd == "2001" and e.p == 300, "the column was not added to the old table")
+end)
+
+test("facts: publishedMap reads every stored date in one go, empty ones too", function()
+    fresh()
+    Facts.put("/b/p.epub", { pd = "1869-01-01", pdm = 42 })
+    Facts.put("/b/none.epub", { pd = "", pdm = 7 })
+    Facts.put("/b/pages.epub", { p = 300 })
+    Facts.flush(); Facts.close(); Facts.forgetMemo()
+    local m = Facts.publishedMap()
+    assert(m and m["/b/p.epub"] and m["/b/p.epub"].pd == "1869-01-01" and m["/b/p.epub"].pdm == 42,
+        "a stored date is missing")
+    assert(m["/b/none.epub"] and m["/b/none.epub"].pd == "", "a book read and found dateless must be known")
+    assert(m["/b/pages.epub"] == nil, "a row with no date read is not in the map")
+    assert(Facts.publishedMap() == m, "the map is read once a session")
+end)
+
+test("facts: put and drop keep publishedMap current", function()
+    fresh()
+    local m = Facts.publishedMap()
+    Facts.put("/b/new.epub", { pd = "1923", pdm = 5 })
+    assert(m["/b/new.epub"] and m["/b/new.epub"].pd == "1923", "a new date did not reach the map")
+    Facts.put("/b/new.epub", { p = 10 })
+    assert(m["/b/new.epub"].pd == "1923", "a page count disturbed the map's date")
+    Facts.put("/b/new.epub", { pd = false, pdm = false })
+    assert(m["/b/new.epub"] == nil, "a cleared date stayed in the map")
+    Facts.put("/b/gone.epub", { pd = "2001" })
+    Facts.drop("/b/gone.epub")
+    assert(m["/b/gone.epub"] == nil, "a dropped book stayed in the map")
 end)
 
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))

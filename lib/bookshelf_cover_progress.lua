@@ -16,7 +16,7 @@ local Font              = require("ui/font")
 local FrameContainer    = require("ui/widget/container/framecontainer")
 local Geom              = require("ui/geometry")
 local OverlapGroup      = require("ui/widget/overlapgroup")
-local TextWidget        = require("ui/widget/textwidget")
+local TextWidget        = require("lib/bookshelf_colour_text")
 local Widget            = require("ui/widget/widget")
 local ffi               = require("ffi")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
@@ -52,9 +52,53 @@ M.FAV_GLYPH_HEART = "\u{f004}"  -- nf-fa-heart
 M.GLYPH_DOWNLOADED = "\u{f058}"  -- nf-fa-check_circle
 
 -- favoriteIcon(): "heart" (default) or "star", from the fav_icon setting.
+-- What marks a FAVOURITE wherever one is marked (the %fav token, a spine).
+-- With the corner badge showing ratings instead it answers heart: a spine or
+-- a token line has no room for a rating, and a lone star there would read as
+-- one.
 function M.favoriteIcon()
     return BookshelfSettings.read("fav_icon") == "star" and "star" or "heart"
 end
+
+-- badgeMode(): what the corner badge on a cover shows -- "heart" or "star"
+-- for a favourite, or "rating" for the book's star rating (issue 538).
+function M.badgeMode()
+    local v = BookshelfSettings.read("fav_icon")
+    if v == "star" or v == "rating" then return v end
+    return "heart"
+end
+
+-- Rating stars (nerdfont "symbols" face, Private Use Area like the rest).
+M.RATING_GLYPH_FULL  = "\u{f005}"  -- nf-fa-star
+M.RATING_GLYPH_HALF  = "\u{f123}"  -- nf-fa-star_half_empty
+M.RATING_GLYPH_EMPTY = "\u{f006}"  -- nf-fa-star_o
+
+-- coverRating(fp, book) -> the rating a cover's badge shows, or nil: the
+-- book's effective rating (Repo.effectiveRating), the same one the Rating
+-- sort and the Ratings shelf use. Nothing is fetched here.
+function M.coverRating(fp, book)
+    if not fp then return nil end
+    local ok, Repo = pcall(require, "lib/bookshelf_book_repository")
+    if not (ok and Repo and Repo.readProgress and Repo.effectiveRating) then return nil end
+    local own = tonumber(book and book.rating)
+    if not (own and own > 0) then
+        local ok2, _p, _s, rr = pcall(Repo.readProgress, fp)
+        own = ok2 and rr or nil
+    end
+    local ok3, r = pcall(Repo.effectiveRating, fp, own)
+    return ok3 and r or nil
+end
+
+-- ratingStars(r) -> the filled stars for a cover's corner: one per whole
+-- star and a half from .5 up, with no empty ones (maintainer: on a cover the
+-- outline stars read as clutter). The top panel keeps its full five.
+function M.ratingStars(r)
+    local whole, out = math.floor(r), {}
+    for i = 1, math.min(5, whole) do out[i] = M.RATING_GLYPH_FULL end
+    if whole < 5 and r - whole >= 0.5 then out[#out + 1] = M.RATING_GLYPH_HALF end
+    return table.concat(out)
+end
+
 
 -- Cover-badge font scale. Single source of truth for the page-count
 -- pill, series-number pill, ×N count badge, and completed-tickbox
@@ -125,6 +169,20 @@ function M.decide(book)
             book.page_count = pages
         end
     end
+    -- Page count > Printed page counts first: the badge's own count, kept off
+    -- book.page_count, which the hero, tokens and sorting read as the reading
+    -- count. No printed count: the badge keeps the reading one.
+    -- Cleared under the other setting, so a record cached across the switch
+    -- does not keep showing the printed count.
+    if want_page_count and book.filepath
+            and BookshelfSettings.read("progress_page_count_source") == "printed" then
+        if book._badge_pages == nil then
+            if not _Repo then _Repo = require("lib/bookshelf_book_repository") end
+            book._badge_pages = _Repo.printedPageCount and _Repo.printedPageCount(book.filepath) or false
+        end
+    else
+        book._badge_pages = nil
+    end
     local want_bar      = _toggle("progress_bar_enabled")
     local want_bookmark = _toggle("progress_bookmark_enabled")
     -- Completed-badge style is tri-state: "none" / "bookmark" (the pre-v2.1
@@ -177,6 +235,7 @@ function M.decide(book)
             on_hold      = badge or nil,
             on_hold_fade = fade or nil,
             page_count   = want_page_count,
+            badge_pct    = pct,
         }
     elseif status == "reading" then
         return {
@@ -184,6 +243,9 @@ function M.decide(book)
             bar_pct    = pct or 0,
             glyph      = want_bookmark and "in_progress" or nil,
             page_count = want_page_count,
+            -- The percentage the badge can show (Page count > Show); only a
+            -- book being read or on hold has one worth showing.
+            badge_pct  = pct,
         }
     elseif status == "complete" or status == "finished" then
         local glyph_kind = nil
@@ -223,10 +285,14 @@ end
 -- exposes parallel *RGB32 variants that preserve true color; dispatch by
 -- type so the call sites stay shape-agnostic. (Same pattern bookends uses
 -- in bookends_overlay_widget.lua.)
+-- The RGB32 variants' corners need the invert flag off on Android: see
+-- Color.rawInvertBegin.
 local function _paintRoundedRect(bb, x, y, w, h, c, r)
     if not c then return end
     if ffi.istype(ColorRGB32_t, c) then
+        local raw = Color.rawInvertBegin(bb)
         bb:paintRoundedRectRGB32(x, y, w, h, c, r)
+        Color.rawInvertEnd(bb, raw)
     else
         bb:paintRoundedRect(x, y, w, h, c, r)
     end
@@ -236,11 +302,14 @@ M.paintRoundedRect = _paintRoundedRect
 local function _paintBorder(bb, x, y, w, h, bw, c, r)
     if not c then return end
     if ffi.istype(ColorRGB32_t, c) then
+        local raw = Color.rawInvertBegin(bb)
         bb:paintBorderRGB32(x, y, w, h, bw, c, r)
+        Color.rawInvertEnd(bb, raw)
     else
         bb:paintBorder(x, y, w, h, bw, c, r)
     end
 end
+M.paintBorder = _paintBorder
 
 local ProgressBarWidget = Widget:extend{
     width  = 0,
@@ -514,10 +583,13 @@ end
 -- centre fill. The shadow lands at offset (shadow_x, shadow_y) relative
 -- to the centre glyph; for it to peek out from behind the halo, pick
 -- shadow_x / shadow_y > halo_w (otherwise the halo covers it entirely).
+-- box_w (optional): the glyphs' own width when it is not `size` -- a run of
+-- glyphs (the rating stars) or text (the rating's number). Defaults to the
+-- square a single glyph fills.
 function M.buildHaloShadowedGlyphWidget(glyph_char, size, halo_w,
                                         shadow_x, shadow_y,
                                         halo_color, centre_color, shadow_color,
-                                        face_name)
+                                        face_name, box_w)
     halo_w       = halo_w or 1
     shadow_x     = shadow_x or 2
     shadow_y     = shadow_y or 2
@@ -528,9 +600,10 @@ function M.buildHaloShadowedGlyphWidget(glyph_char, size, halo_w,
     -- origin) and the shadow's extent (size + halo_w + max(0, shadow_x/y)
     -- from origin). Negative shadow offsets are clamped to 0 so the box
     -- doesn't shift the centre off-origin.
-    local halo_extent_x = size + 2 * halo_w
+    local w_in = box_w or size
+    local halo_extent_x = w_in + 2 * halo_w
     local halo_extent_y = size + 2 * halo_w
-    local shadow_extent_x = halo_w + math.max(0, shadow_x) + size
+    local shadow_extent_x = halo_w + math.max(0, shadow_x) + w_in
     local shadow_extent_y = halo_w + math.max(0, shadow_y) + size
     local widget_w = math.max(halo_extent_x, shadow_extent_x)
     local widget_h = math.max(halo_extent_y, shadow_extent_y)
@@ -606,12 +679,15 @@ local DEFAULT_CHROME_BG = { grey = 0xFF }
 -- their own, so over a semi-transparent card every line of text shows as a
 -- box -- the card cannot be less opaque than its contents.
 --
--- 0xEE, not 0xFF, and that is the value modules have always drawn on: every
--- TextBoxWidget built through the module Kit paints THIS colour as its own
--- background. Card and text background are one decision wearing two names, so
--- the setting drives both (Modules.setCardBg) -- change only the card and
--- every line of text keeps a visible box behind it.
-local DEFAULT_MODULE_BG = { grey = 0xEE }
+-- Not white, and every TextBoxWidget built through the module Kit paints THIS
+-- colour as its own background. Card and text background are one decision
+-- wearing two names, so the setting drives both (Modules.setCardBg) -- change
+-- only the card and every line of text keeps a visible box behind it.
+--
+-- A warm off-white paper, not the flat 0xEE grey it used to be: grey cards
+-- looked dead beside coloured covers on the shelf (maintainer). Its luminance
+-- is ~0xED, so a greyscale panel draws what it always did.
+local DEFAULT_MODULE_BG = { hex = "#F3EDE0" }
 -- The top panel's and footer panel's tint. Separate from chrome_bg because the
 -- two do different jobs: chrome_bg is an OPAQUE bar, panel_bg is blended over
 -- a picture at the shading strength, so the value that reads well as one is
@@ -781,7 +857,10 @@ function M.theme()
     -- night, which reads as day and night swapped over (issue 426). The
     -- setting stays as the fallback for anything with no screen to read.
     local inverting = require("lib/bookshelf_night_mode_sync").active(Screen)
-    local want = BookshelfSettings.read(M.THEME_SETTING)
+    -- The shelf on screen may wear its own theme (bookshelf_theme_pack).
+    local ok_t, TP = pcall(require, "lib/bookshelf_theme_pack")
+    local want = (ok_t and TP and TP.shelfLook) and TP.shelfLook()
+                 or BookshelfSettings.read(M.THEME_SETTING)
     local dark
     if want == "dark" then
         dark = true
@@ -800,8 +879,24 @@ local function _modeSuffix()
     return dark and "_night" or ""
 end
 
-local function _readModeColor(base_key, default_day, default_night)
-    local suffix = _modeSuffix()
+-- _partRead(key): a colour as the shelf on screen paints it, which the
+-- colour rows also show and edit: the defaults on an unedited Plain, the
+-- reader's edit to the theme on screen, else its own (a pack's
+-- colours.json), else the reader's own (bookshelf_theme_pack.colour, the
+-- one resolver, memoised per settings generation).
+local function _partRead(key)
+    local ok, TP = pcall(require, "lib/bookshelf_theme_pack")
+    if ok and TP and TP.colour then return TP.colour(key) end
+    return BookshelfSettings.read(key)
+end
+
+-- _readModeColor(base_key, default_day, default_night, suffix): what the
+-- shelf PAINTS for a colour, and what its row shows and edits: one resolver
+-- (_partRead). suffix (optional): the slot to read, "" or "_night"; default
+-- the one the shelf on screen paints from. The colour menu passes its own
+-- (editSuffix).
+local function _readModeColor(base_key, default_day, default_night, suffix)
+    suffix = suffix or _modeSuffix()
     if suffix ~= "" then
         -- Night mode: explicit override wins, otherwise fall through to
         -- the dedicated night default. Crucially we do NOT fall back to
@@ -810,12 +905,13 @@ local function _readModeColor(base_key, default_day, default_night)
         -- showing the inverted day appearance instead of the intended
         -- night palette. Users who want matching colors can set the
         -- night override explicitly.
-        local night = BookshelfSettings.read(base_key .. suffix)
+        local night = _partRead(base_key .. suffix)
         if night then return night end
         return default_night or default_day
     end
-    return BookshelfSettings.read(base_key) or default_day
+    return _partRead(base_key) or default_day
 end
+
 
 -- ink() -> the themed text colour, or nil to leave a widget's own default.
 --
@@ -830,6 +926,31 @@ end
 function M.ink()
     local ok, colors = pcall(M.resolvedColors)
     return ok and colors and colors.ink or nil
+end
+
+-- panelInk() -> the text colour for what is drawn on the top and footer
+-- panels, or nil when neither Panel color nor Panel text is set (each caller
+-- then keeps its own, as before). Panel text wins; else black or white,
+-- whichever reads on the panel colour (bookshelf_module_card.autoInk),
+-- judged on the colour itself: at low Panel shading the picture behind
+-- shows through more, and Panel text is there for that.
+function M.panelInk()
+    local sfx = _modeSuffix()
+    local picked = _partRead("panel_ink" .. sfx)
+    if type(picked) ~= "nil" then return M.resolvePicked(picked) end
+    if type(_partRead("panel_color" .. sfx)) == "nil" then return nil end
+    local ok, colors = pcall(M.resolvedColors)
+    if not (ok and colors and type(colors.panel_tint) ~= "nil") then return nil end
+    return (require("lib/bookshelf_module_card").autoInk(colors.panel_tint))
+end
+
+-- panelColourSet() -> does the theme on screen give the panels a colour of
+-- their own (Colors > Panel color, or a pack's "panel")? Such a panel is
+-- drawn on a plain page too: its ink (panelInk) is chosen for it, and with
+-- no panel under it a pack's cream text sat on white paper (Autumn on a
+-- PW5, maintainer, 2026-10-28).
+function M.panelColourSet()
+    return type(_partRead("panel_color" .. _modeSuffix())) ~= "nil"
 end
 
 function M.resolvedColors()
@@ -879,6 +1000,13 @@ function M.resolvedColors()
     -- an earlier build is inert rather than surprising.
     local panel_bg_raw     = is_night and NIGHT_DEFAULT_PANEL_BG
                                       or  DEFAULT_PANEL_BG
+    -- Colors > Panel color: the top and footer panels' tint, and only that.
+    -- Its own key, not panel_bg (an earlier build's leftovers stay inert),
+    -- and its own field, because panel_bg is also the theme's PAPER (list
+    -- rows, label plates, the add tile), which a panel colour must not
+    -- repaint. Its text follows with it (M.panelInk), which is what the old
+    -- picker lacked.
+    local panel_tint_raw   = _readModeColor("panel_color", DEFAULT_PANEL_BG, NIGHT_DEFAULT_PANEL_BG)
     -- NOT keyed to a setting: the page's own colour is picked through the
     -- wallpaper background row, which stores in paint space and is read by
     -- BookshelfWidget:_pageGroundColor. This is only the themed DEFAULT for
@@ -898,6 +1026,9 @@ function M.resolvedColors()
     local ribbon_bg_raw    = _readModeColor("folder_overlay_bg", nil,
                                              NIGHT_DEFAULT_FOLDER_BG)
     local folder_fg_raw    = _readModeColor("folder_overlay_fg", nil)
+    -- The micro-module card's hairline (issue 424). No default: unset, the
+    -- card keeps the theme's own ink (see _cardBorderInk in hero_modules).
+    local module_border_raw = _readModeColor("module_border", nil)
     -- Shadow color is hard-coded so it always paints DARK ON SCREEN
     -- regardless of mode. KOReader's night mode inverts the framebuffer
     -- at refresh time, so the shadow color in code is BLACK in day mode
@@ -919,10 +1050,17 @@ function M.resolvedColors()
         chrome_bg         = _paint(chrome_bg_raw),
         module_bg         = _paint(module_bg_raw),
         panel_bg          = _paint(panel_bg_raw),
+        panel_tint        = _paint(panel_tint_raw),
         page_bg           = _paint(is_night and NIGHT_DEFAULT_PAGE_BG
                                             or DEFAULT_PAGE_BG),
         ink               = _paint(ink_raw),
         border            = _paint(border_raw),
+        -- The theme's own border, whatever the setting says: a face-out on
+        -- the spine shelf frames in this (SpineWidget:_frameColor), because a
+        -- chosen colour there sets the cover apart from the page block and
+        -- boards it belongs to (maintainer ruling).
+        border_default    = _paint(is_night and NIGHT_DEFAULT_BORDER
+                                            or DEFAULT_BORDER),
         -- The ring a selected / current-book cover sits on, and the drop
         -- shadow behind every card. Distinct from `shadow` below, which is the
         -- offset shadow on GLYPHS and stays hard-coded for the reason given
@@ -948,12 +1086,47 @@ function M.resolvedColors()
         folder_bg         = folder_bg_raw and _paint(folder_bg_raw) or nil,
         ribbon_bg         = ribbon_bg_raw and _paint(ribbon_bg_raw) or nil,
         folder_fg         = folder_fg_raw and _paint(folder_fg_raw) or nil,
+        module_border     = module_border_raw and _paint(module_border_raw) or nil,
     }
     _resolved_gen   = gen
     _resolved_mode  = is_color
     _resolved_night = is_night
     _resolved_flip  = flip
     return _resolved_cache
+end
+
+-- resolvePicked(raw) -> a Blitbuffer colour for a stored colour value, with
+-- the same correction every palette entry gets: the value is stored for its
+-- slot's frame (the night slot pre-inverted for a frame that flips it), and
+-- when the shelf's theme and the frame disagree it is flipped before it is
+-- parsed. For the few readers of a picked colour that do not go through
+-- resolvedColors (the selected shelf button, the page's own colour).
+function M.resolvePicked(raw)
+    if type(raw) == "nil" then return nil end
+    local want_dark, inverting = M.theme()
+    if want_dark ~= inverting then raw = Color.invertValue(raw) end
+    return Color.parseColorValue(raw, Screen:isColorEnabled())
+end
+
+-- pickedBarColors() -> { fill = , bg = } or nil: the progress bar colours the
+-- reader actually PICKED for the current mode, resolved like every other
+-- colour here (night slot, theme flip, colour or grey screen). nil when
+-- neither is picked, so a bar painter keeps its own defaults -- each bookends
+-- style has its own look, and handing over this plugin's defaults would wash
+-- it out. The hero and list-row bars used to read the DAY keys directly, so
+-- in night mode they painted the day colour for an inverting frame and it
+-- displayed as its opposite.
+function M.pickedBarColors()
+    -- Plain paints the defaults: nothing picked (TP.colour reads nil).
+    local suffix = _modeSuffix()
+    local picked_fill  = _partRead("progress_fill" .. suffix)
+    local picked_track = _partRead("progress_track" .. suffix)
+    if type(picked_fill) == "nil" and type(picked_track) == "nil" then return nil end
+    local colors = M.resolvedColors()
+    return {
+        fill = (type(picked_fill) ~= "nil") and colors.fill or nil,
+        bg   = (type(picked_track) ~= "nil") and colors.track or nil,
+    }
 end
 
 -- Returns the raw setting values (storage shape, not Blitbuffer). For
@@ -964,42 +1137,52 @@ end
 function M.rawColors()
     local gen      = BookshelfSettings.generation()
     local is_night = require("lib/bookshelf_night_mode_sync").active(Screen)
+    -- The slot the colour menu edits (Colors for: Light | Dark), which is
+    -- part of the key: switching it changes nothing else.
+    local sfx = M.editSuffix()
+    is_night = tostring(is_night) .. sfx
     if _raw_cache and _raw_gen == gen and _raw_night == is_night then
         return _raw_cache
     end
+    -- The slot the colour menu edits.
+    local function _readOwnColor(k, d, n) return _readModeColor(k, d, n, sfx) end
     _raw_cache = {
-        fill              = _readModeColor("progress_fill",  DEFAULT_FILL, NIGHT_DEFAULT_FILL),
-        track             = _readModeColor("progress_track", DEFAULT_TRACK, NIGHT_DEFAULT_TRACK),
-        bookmark          = _readModeColor("bookmark_color", DEFAULT_BOOKMARK, NIGHT_DEFAULT_BOOKMARK),
-        complete_bookmark = _readModeColor("complete_bookmark_color",
+        fill              = _readOwnColor("progress_fill",  DEFAULT_FILL, NIGHT_DEFAULT_FILL),
+        track             = _readOwnColor("progress_track", DEFAULT_TRACK, NIGHT_DEFAULT_TRACK),
+        bookmark          = _readOwnColor("bookmark_color", DEFAULT_BOOKMARK, NIGHT_DEFAULT_BOOKMARK),
+        complete_bookmark = _readOwnColor("complete_bookmark_color",
                                             DEFAULT_COMPLETE_BOOKMARK,
                                             NIGHT_DEFAULT_COMPLETE_BOOKMARK),
-        favorite_star     = _readModeColor("favorite_star_color",
+        favorite_star     = _readOwnColor("favorite_star_color",
                                             DEFAULT_FAVORITE_STAR,
                                             NIGHT_DEFAULT_FAVORITE_STAR),
-        favorite_heart    = _readModeColor("favorite_heart_color",
+        favorite_heart    = _readOwnColor("favorite_heart_color",
                                             DEFAULT_FAVORITE_HEART,
                                             NIGHT_DEFAULT_FAVORITE_HEART),
-        badge_fg          = _readModeColor("badge_fg", DEFAULT_BADGE_FG, NIGHT_DEFAULT_BADGE_FG),
-        badge_bg          = _readModeColor("badge_bg", DEFAULT_BADGE_BG, NIGHT_DEFAULT_BADGE_BG),
-        chrome_bg         = _readModeColor("chrome_bg", DEFAULT_CHROME_BG, NIGHT_DEFAULT_CHROME_BG),
-        module_bg         = _readModeColor("module_bg", DEFAULT_MODULE_BG, NIGHT_DEFAULT_MODULE_BG),
-        ink               = _readModeColor("ink_color", DEFAULT_INK, NIGHT_DEFAULT_INK),
-        plank             = _readModeColor("spine_plank_color", DEFAULT_PLANK, NIGHT_DEFAULT_PLANK),
-        border            = _readModeColor("border_color", DEFAULT_BORDER, NIGHT_DEFAULT_BORDER),
+        badge_fg          = _readOwnColor("badge_fg", DEFAULT_BADGE_FG, NIGHT_DEFAULT_BADGE_FG),
+        badge_bg          = _readOwnColor("badge_bg", DEFAULT_BADGE_BG, NIGHT_DEFAULT_BADGE_BG),
+        chrome_bg         = _readOwnColor("chrome_bg", DEFAULT_CHROME_BG, NIGHT_DEFAULT_CHROME_BG),
+        module_bg         = _readOwnColor("module_bg", DEFAULT_MODULE_BG, NIGHT_DEFAULT_MODULE_BG),
+        ink               = _readOwnColor("ink_color", DEFAULT_INK, NIGHT_DEFAULT_INK),
+        plank             = _readOwnColor("spine_plank_color", DEFAULT_PLANK, NIGHT_DEFAULT_PLANK),
+        border            = _readOwnColor("border_color", DEFAULT_BORDER, NIGHT_DEFAULT_BORDER),
         -- NO night defaults here, deliberately, unlike the resolved colours
         -- above. rawColors() is what the settings menu reads to label a row,
         -- and a value the reader has not set must read as "default" rather
         -- than as a percentage they never chose.
-        folder_bg         = _readModeColor("folder_overlay_bg", nil),
-        folder_fg         = _readModeColor("folder_overlay_fg", nil),
+        folder_bg         = _readOwnColor("folder_overlay_bg", nil),
+        folder_fg         = _readOwnColor("folder_overlay_fg", nil),
+        module_border     = _readOwnColor("module_border", nil),
+        -- Panel color / Panel text: unset means the theme's own (and Auto).
+        panel_color       = _readOwnColor("panel_color", nil),
+        panel_ink         = _readOwnColor("panel_ink", nil),
         -- Selected chip (#294). Unset = the chip bar inverts as before, so no
         -- default here: nil is meaningful ("use the fast invert path").
         -- bookshelf_chip_bar reads the same keys directly when it paints; these
         -- entries exist so the settings menu's valueLabel/pickColor helpers can
         -- show and edit them like every other colour.
-        chip_selected_bg  = _readModeColor("chip_selected_bg", nil),
-        chip_selected_fg  = _readModeColor("chip_selected_fg", nil),
+        chip_selected_bg  = _readOwnColor("chip_selected_bg", nil),
+        chip_selected_fg  = _readOwnColor("chip_selected_fg", nil),
         fill_default              = DEFAULT_FILL,
         track_default             = DEFAULT_TRACK,
         bookmark_default          = DEFAULT_BOOKMARK,
@@ -1018,6 +1201,20 @@ end
 -- Exposed for the settings menu's pickColor helper so it writes the
 -- same suffixed key resolvedColors reads from. Returns "" or "_night".
 function M.modeSuffix()
+    return _modeSuffix()
+end
+
+-- The colour menu's slot (Colors for: Light | Dark): which of the reader's
+-- two colour sets the menu shows and edits. nil follows the shelf on screen
+-- (modeSuffix); "light" or "dark" is the reader's switch, which changes only
+-- what the menu edits -- never KOReader's night mode, nor what the shelf
+-- paints (maintainer, 2026-10-07). The menu sets it back to nil each time it
+-- opens.
+M._edit_slot = nil
+function M.setEditSlot(slot) M._edit_slot = slot end
+function M.editSuffix()
+    if M._edit_slot == "dark" then return "_night" end
+    if M._edit_slot == "light" then return "" end
     return _modeSuffix()
 end
 

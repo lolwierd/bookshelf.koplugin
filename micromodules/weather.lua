@@ -235,7 +235,7 @@ local function showSettings(ctx)
     local city = Store.read(KEY_CITY, "")
     local unit = Store.read(KEY_UNIT, "celsius")
 
-    dialog = ButtonDialog:new{
+    dialog = ButtonDialog:new(require("lib/bookshelf_module_kit").withClose{
         title       = _("Weather settings"),
         title_align = "center",
         buttons = {
@@ -322,7 +322,7 @@ local function showSettings(ctx)
                 },
             },
         },
-    }
+    })
     UIManager:show(dialog)
 end
 
@@ -330,6 +330,8 @@ end
 
 return {
     key   = "weather", -- stable id stored in user menus; never change it
+    -- Text: unreadable one grid column wide (truncates or breaks words).
+    min_w = 2,
     title = _("Weather"),
     summary = _("Open-Meteo. Needs internet."),
     -- Test hook: the locale-proof percent-encoding is pure; the registry
@@ -346,7 +348,7 @@ return {
         _async_refresh = refresh
         local Blitbuffer      = require("ffi/blitbuffer")
         local Fonts           = require("lib/bookshelf_fonts")
-        local TextWidget      = require("ui/widget/textwidget")
+        local TextWidget      = require("lib/bookshelf_colour_text")
         local VerticalGroup   = require("ui/widget/verticalgroup")
         local VerticalSpan    = require("ui/widget/verticalspan")
         local HorizontalGroup = require("ui/widget/horizontalgroup")

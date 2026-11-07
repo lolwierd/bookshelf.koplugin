@@ -28,13 +28,19 @@ local function chip(id)
     return tabs:match('({ id = "' .. id .. '".-enabled = %a+%s*},)')
 end
 
-t.test("Home opens as a spine shelf, newest first, with ornaments standing", function()
+t.test("Home opens as a spine shelf, newest added or opened first, with ornaments standing", function()
     local home = chip("all")
     assert(home, "the Home chip declaration moved")
+    -- Flattened: with folders, a Calibre library (a folder per author)
+    -- opened on a shelf of author names (maintainer, from Reddit).
+    assert(home:find('source = { kind = "library"', 1, true),
+        "Home should show the books flattened, not the library's folders")
     assert(home:find('view_mode = "spines"', 1, true),
         "Home no longer opens on spines, which is the view the shelf is for")
-    assert(home:find('key = "date_added",  reverse = true', 1, true),
-        "Home should lead with the newest book, not with a filename")
+    -- Added or opened, so a book picked up again comes back to the front
+    -- (maintainer).
+    assert(home:find('key = "added_or_opened", reverse = true', 1, true),
+        "Home should lead with the newest added or opened book, not with a filename")
     assert(home:find("ornament_frequency = 2", 1, true),
         "ornaments should be Always on the shelf a new reader sees first: at "
         .. "the lower stops a one-row shelf can roll nothing for ever")
@@ -70,7 +76,7 @@ t.test("panel shading defaults to Heavy", function()
     local v = tonumber(wall:match("M.SCRIM_DEFAULT = ([%d%.]+)"))
     assert(v, "SCRIM_DEFAULT moved")
     -- The menu's own Heavy stop, so the two cannot drift apart.
-    local heavy = tonumber(set:match('{ value = ([%d%.]+),%s*label = function%(%) return _%("Heavy"%)'))
+    local heavy = tonumber(set:match('value = ([%d%.]+),%s*label = function%(%) return _%("Heavy"%)'))
     assert(heavy, "the Heavy stop moved")
     eq(v, heavy, "the default is no longer the Heavy stop")
     assert(v > 0.6, "shading went back down; legibility over a busy picture "

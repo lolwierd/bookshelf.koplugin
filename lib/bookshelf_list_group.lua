@@ -52,6 +52,7 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local Geom           = require("ui/geometry")
 local OverlapGroup   = require("ui/widget/overlapgroup")
 local Screen         = require("device").screen
+local Space          = require("lib/bookshelf_space")
 local CoverProgress  = require("lib/bookshelf_cover_progress")
 local BookshelfSettings = require("lib/bookshelf_settings_store")
 local Repo           = require("lib/bookshelf_book_repository")
@@ -96,7 +97,9 @@ end
 -- carries its members inline.
 local function memberPaths(item)
     if item.kind == "folder" then
-        if not item.path then return nil end
+        -- A shelf of shelves' tile has no path; it brings its shelf's books
+        -- with it (BookshelfWidget:_subShelfItems, issue 527).
+        if not item.path then return item.member_fps end
         return Repo.getFolderBookPaths(item.path)
     end
     if item.books then
@@ -380,7 +383,7 @@ function Group.deck(books, height, opts)
     local SpineWidget = require("lib/bookshelf_spine_widget")
     -- The SLOT, sized so the CARD inside it comes out at the book aspect:
     -- SpineWidget takes its shadow reservation off whatever it is handed.
-    local shadow = SpineWidget.SHADOW_OFFSET or Screen:scaleBySize(4)
+    local shadow = SpineWidget.SHADOW_OFFSET or Space.px(4)
     local card_w, card_h = Group.slotWidth(height)
     local n = math.min(#books, Group.DECK_MAX)
 
@@ -504,9 +507,9 @@ end
 -- two the card spends: two is the floor where the label has exactly no room,
 -- and a card with no room for a single glyph is not worth the slot.
 local function minTileWidth()
-    local Size = require("ui/size")
+    local Space = require("lib/bookshelf_space")
     local FolderCard = require("lib/bookshelf_folder_card")
-    return (FolderCard.SHADOW_OFFSET or 0) + 4 * Size.padding.large
+    return (FolderCard.SHADOW_OFFSET or 0) + 4 * Space.padding.large
 end
 
 -- Build a tile, or nil if it will not build.
@@ -548,6 +551,22 @@ function Group.tile(item, width, height, opts)
     -- leave the row with nothing in it at all.
     if width < minTileWidth() then return nil end
     if not opts.fill_row and height < DECK_MIN_H then return nil end
+    -- A shelf of shelves' "+ Add shelf" fills its row as a dashed-outline
+    -- button (bookshelf_add_tile), not a card.
+    if item.add_subshelf then
+        return built(require("lib/bookshelf_add_tile"), {
+            width          = width,
+            height         = height,
+            label          = item.label,
+            item           = item,
+            on_tap         = opts.on_tap and function() return opts.on_tap() end,
+            on_hold        = opts.on_hold and function() return opts.on_hold() end,
+            is_selected    = opts.selected or nil,
+            reserve_shadow = false,
+            ink            = require("lib/bookshelf_list_row").ROW_FG,
+            no_fill        = true,
+        })
+    end
     local StackDisplay = require("lib/bookshelf_stack_display")
     local is_nav = item.kind == "opds_nav"
     if is_nav or item.kind == "folder" then
@@ -622,8 +641,12 @@ end
 -- as a button, not a book" -- and drives its border off is_selected, which is
 -- what the cover grid thickens when a tap lands. Handing that widget the whole
 -- row is all "exactly the same behaviour as the cover view" takes.
+--
+-- A shelf of shelves' "+ Add shelf" tile is the same kind of thing: a button
+-- named by its label, with nothing to fan or count.
 function Group.fillsRow(item)
-    return type(item) == "table" and item.kind == "opds_nav"
+    return type(item) == "table"
+        and (item.kind == "opds_nav" or item.add_subshelf == true)
 end
 
 -- The slot a tile or a deck occupies, so the two agree and a row with either
@@ -637,7 +660,7 @@ end
 function Group.slotWidth(height, max_w)
     local ListGeom = require("lib/bookshelf_list_geom")
     local SpineWidget = require("lib/bookshelf_spine_widget")
-    local shadow = SpineWidget.SHADOW_OFFSET or Screen:scaleBySize(4)
+    local shadow = SpineWidget.SHADOW_OFFSET or Space.px(4)
     local w, h = ListGeom.thumbSize(height - shadow, 0,
                                     max_w and (max_w - shadow) or nil)
     return w + shadow, h + shadow

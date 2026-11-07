@@ -85,8 +85,9 @@ Tokens.CATALOGUE = {
     { category = "Book",     token = "%favourite",        description = _("Favorite icon, empty when not a favorite") },
     { category = "Book",     token = "%filename",         description = _("File name") },
     { category = "Book",     token = "%format",           description = _("Format (EPUB/PDF/…)") },
-    { category = "Book",     token = "%calibre{name}",     description = _("A calibre column by name, like %calibre{pubdate} or a custom column; dates show the year (needs the calibre beta)") },
+    { category = "Book",     token = "%calibre{name}",     description = _("A calibre column by name, like %calibre{pubdate} or a custom column; dates show the year (needs Read calibre metadata.calibre, except a book's pubdate in an OPDS catalog)") },
     { category = "Book",     token = "%size",             description = _("File size on disk") },
+    { category = "Book",     token = "%published",        description = _("Publication year, from calibre, the OPDS catalog or the book file") },
     { category = "Book",     token = "%added",            description = _("Date added (the file's own date)") },
     { category = "Book",     token = "%description",      description = _("Book blurb (HTML stripped)") },
     { category = "Book",     token = "%quote",            description = _("A random highlight from this book") },
@@ -147,7 +148,7 @@ Tokens.CATALOGUE = {
     { category = "Logic",    token = "[if:foo>50]…[/if]", description = _("Numeric comparison") },
     { category = "Logic",    token = "[if:foo]…[else]…[/if]", description = _("If/else") },
     { category = "Logic",    token = "[if:lang=ja][font=NAME]…[/font][else]…[/if]", description = _("Per-language font: e.g. a Japanese face for ja books, another otherwise") },
-    { category = "Logic",    token = "[if:full_width]…[/if]", description = _("Show … only in the full-width status line (micro-module + full-screen views), not the cover-view status") },
+    { category = "Logic",    token = "[if:full_width]…[/if]", description = _("Show … only in the full-width status line (module + full-screen views), not the cover-view status") },
     { category = "Logic",    token = "%spacer",           description = _("Elastic gap: pushes content left/right to the region edges") },
     { category = "Progress", token = "%bar",              description = _("Progress bar, filling the rest of the line") },
     { category = "Progress", token = "%bar{rel}",         description = _("Progress bar whose length reflects how long the book is") },
@@ -343,6 +344,13 @@ Tokens.expanders.series_name = metaToken("series_name")
 Tokens.expanders.series_num  = metaToken("series_num")
 Tokens.expanders.filename    = metaToken("filename")
 Tokens.expanders.lang        = metaToken("lang")
+-- The best publication year the book has (lib/bookshelf_published): calibre's,
+-- the OPDS catalog's, or the file's own, read in the background on first use.
+Tokens.expanders.published = function(b)
+    if not b then return "" end
+    local ok, Published = pcall(require, "lib/bookshelf_published")
+    return ok and Published.forRecord(b) or ""
+end
 Tokens.expanders.format      = metaToken("format")
 -- %rating -> N filled stars + (5-N) empty stars. Rating is stored
 -- 1-5 (integer) in the DocSettings summary; book.rating is hydrated
@@ -448,7 +456,21 @@ end
 -- to live here as a local, which is exactly how bookends ended up with
 -- %description but not its sanitiser (85aa7c8) and rendered raw "<p>" tags on
 -- screen. One copy now, checked byte-identical by tools/check_token_parity.sh.
-local cleanDescription = Semantics.cleanDescription
+-- Memoised on the raw text: a list row expands %description every time the
+-- page is built, and the clean-up is a dozen gsub passes over the whole blurb
+-- -- 5-7% of a list page turn on a PW5 (jit.p). Pure, so a cache by input is
+-- exact. Bounded by count; cleared wholesale when full.
+local _clean_memo, _clean_n, CLEAN_CAP = {}, 0, 256
+local function cleanDescription(raw)
+    if not raw or raw == "" then return "" end
+    local hit = _clean_memo[raw]
+    if hit then return hit end
+    local out = Semantics.cleanDescription(raw)
+    if _clean_n >= CLEAN_CAP then _clean_memo, _clean_n = {}, 0 end
+    _clean_memo[raw] = out
+    _clean_n = _clean_n + 1
+    return out
+end
 
 Tokens.cleanDescription = cleanDescription      -- exported for tests / ad-hoc use
 Tokens.expanders.description = function(book)
@@ -661,15 +683,34 @@ function Tokens.reviewsHtml(payload)
             out[#out + 1] = '<p class="stars">' .. Tokens.starString(rr) .. "</p>"
         end
         local byline = { "<b>Review by</b> <i>" .. _escHtml(name) .. "</i>" }
+        if review.spoiler then byline[#byline + 1] = "<b>Spoiler</b>" end
         local d = _formatReviewDate(review.reviewed_at)
         if d then byline[#byline + 1] = "<i>" .. _escHtml(d) .. "</i>" end
         if tonumber(review.likes_count) and tonumber(review.likes_count) > 0 then
-            byline[#byline + 1] = string.format("%d likes", tonumber(review.likes_count))
+            local n = tonumber(review.likes_count)
+            byline[#byline + 1] = (n == 1) and _("1 like") or string.format(_("%d likes"), n)
         end
         out[#out + 1] = '<p class="byline">' .. table.concat(byline, " \xC2\xB7 ") .. "</p>"
         local body = Tokens.sanitiseReviewHtml(review.text or "")
         if body == "" then body = "<p>No review text.</p>" end
         out[#out + 1] = body
+    end
+    return table.concat(out, "\n")
+end
+
+-- myReviewHtml(text): the reader's own review (KOReader's summary.note) as
+-- HTML for the Reviews tab. Plain text in, so it is escaped; a blank line
+-- starts a paragraph and a single newline is a line break, as typed.
+function Tokens.myReviewHtml(text)
+    if type(text) ~= "string" or not text:match("%S") then return nil end
+    local out = {}
+    local norm = text:gsub("\r\n?", "\n")
+    for para in (norm .. "\n\n"):gmatch("(.-)\n%s*\n") do
+        if para:match("%S") then
+            local lines = {}
+            for line in (para .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = _escHtml(line) end
+            out[#out + 1] = "<p>" .. table.concat(lines, "<br/>") .. "</p>"
+        end
     end
     return table.concat(out, "\n")
 end
@@ -756,6 +797,7 @@ end
 -- report, same modal as the auto-link report. data:
 --   skipped   number       -- already had a count (opened / prior scan)
 --   filename  {name,...}   -- counted from a p(N) filename marker
+--   calibre   {{name=,pages=},...} -- from a Calibre custom column
 --   publisher {{name=,pages=},...}
 --   hardcover {{name=,pages=},...}
 --   rendered  {{name=,pages=},...}
@@ -769,6 +811,7 @@ function Tokens.pageCountReportHtml(data)
     local DOT = " \xC2\xB7 "  -- " · "
     local function list(t) return type(t) == "table" and t or {} end
     local filename  = list(data.filename)
+    local calibre   = list(data.calibre)
     local publisher = list(data.publisher)
     local hardcover = list(data.hardcover)
     local rendered  = list(data.rendered)
@@ -796,6 +839,9 @@ function Tokens.pageCountReportHtml(data)
     summary[#summary + 1] = string.format("Publisher %d", #publisher)
     summary[#summary + 1] = string.format("Hardcover %d", #hardcover)
     summary[#summary + 1] = string.format("Paginated %d", #rendered)
+    if #calibre > 0 then
+        summary[#summary + 1] = string.format("Calibre %d", #calibre)
+    end
     if #failed > 0 then
         summary[#summary + 1] = string.format("Failed %d", #failed)
     end
@@ -828,7 +874,8 @@ function Tokens.pageCountReportHtml(data)
     end
     section("Publisher page numbers", publisher, true)
     section("Hardcover editions", hardcover, true)
-    section("Paginated with the reading engine", rendered, true)
+    section("Paginated at your reading settings", rendered, true)
+    section("From your Calibre column", calibre, true)
     section("Counted from the filename", filename, false)
     section("Could not be paginated", failed, false)
 
@@ -1221,7 +1268,7 @@ end
 -- "%calibre" in the preview. Field names match case-insensitively, with or
 -- without calibre's leading '#' (a custom column "#year" answers both
 -- %calibre{year} and %calibre{#Year}). Values come pre-rendered as strings
--- on book.calibre by the repository, only when the calibre beta is on.
+-- on book.calibre by the repository, only when Read calibre metadata.calibre is on.
 local function calibreField(book, field)
     local map = book and book.calibre
     if type(map) ~= "table" then return "" end
@@ -1387,9 +1434,12 @@ local function tokenNamesByLengthDesc()
     return names
 end
 
+-- Day and month names through KOReader's translations, as the named date
+-- tokens do: os.date's come from the C locale, English on a Kindle whatever
+-- the interface language (issue 545).
 local function expandDatetimeBraces(format, state)
     return (format:gsub("%%datetime{(.-)}", function(spec)
-        return os.date(spec, timeNow(state))
+        return LocalDate.localize(os.date(spec, timeNow(state)))
     end))
 end
 
@@ -1515,6 +1565,86 @@ function Tokens.isEmpty(s)
     -- to sit here -- "new format tags added in future versions need to be
     -- added here" -- is exactly the maintenance this avoids.
     return InlineStyle.strip(s):match("^%s*$") ~= nil
+end
+
+-- ── Tokens from a user patch or another plugin (PR 515) ──────────────────
+--
+-- Tokens.register(id, defs) -> true, or false and the reason.
+--
+-- defs maps a token name (without the %) to function(book, state) -> string,
+-- or to { expand = function, description = "..." } to list it in the token
+-- picker as well, under the id. The new %name works wherever the built-in
+-- tokens do: list lines, cover labels, the top panel, [if:name] conditions.
+-- An expander that errors renders as empty and is logged once.
+--
+-- A name a built-in token already uses is refused, so a patch cannot change
+-- what an existing template says. Registering an id again replaces its
+-- tokens; defs = nil removes them.
+--
+--     userpatch.registerPatchPluginFunc("bookshelf", function(Bookshelf)
+--         if not Bookshelf.registerTokens then return end  -- older bookshelf
+--         Bookshelf:registerTokens("ao3", {
+--             chapters = function(book) return ... end,
+--         })
+--     end)
+Tokens.API = 1
+local _builtin = {}
+for name in pairs(Tokens.expanders) do _builtin[name] = true end
+local _owned = {}   -- id -> { name = true, ... }
+
+local function _unregister(id)
+    for name in pairs(_owned[id] or {}) do Tokens.expanders[name] = nil end
+    _owned[id] = nil
+    for i = #Tokens.CATALOGUE, 1, -1 do
+        if Tokens.CATALOGUE[i].owner == id then table.remove(Tokens.CATALOGUE, i) end
+    end
+    _token_names_cache = nil
+end
+
+function Tokens.register(id, defs)
+    if type(id) ~= "string" or id == "" then return false, "id must be a string" end
+    if defs ~= nil and type(defs) ~= "table" then return false, "tokens must be a table" end
+    for name, def in pairs(defs or {}) do
+        if type(name) ~= "string" or not name:match("^[%a_][%w_]*$") then
+            return false, "bad token name: " .. tostring(name)
+        end
+        if _builtin[name] then return false, "%" .. name .. " is a built-in token" end
+        for other, names in pairs(_owned) do
+            if other ~= id and names[name] then
+                return false, "%" .. name .. " is already registered by " .. other
+            end
+        end
+        local fn = type(def) == "table" and def.expand or def
+        if type(fn) ~= "function" then return false, "%" .. name .. " needs a function" end
+    end
+    _unregister(id)
+    if not defs then return true end
+    local names, listed = {}, {}
+    for name, def in pairs(defs) do
+        local fn = type(def) == "table" and def.expand or def
+        local warned = false
+        Tokens.expanders[name] = function(book, state)
+            local ok, v = pcall(fn, book, state)
+            if ok then return v ~= nil and tostring(v) or "" end
+            if not warned then
+                warned = true
+                pcall(function()
+                    require("logger").warn("bookshelf: token %" .. name .. " from " .. id .. " failed:", v)
+                end)
+            end
+            return ""
+        end
+        names[name] = true
+        if type(def) == "table" and type(def.description) == "string" then
+            listed[#listed + 1] = { category = id, token = "%" .. name,
+                                    description = def.description, owner = id }
+        end
+    end
+    table.sort(listed, function(a, b) return a.token < b.token end)
+    for _i, entry in ipairs(listed) do Tokens.CATALOGUE[#Tokens.CATALOGUE + 1] = entry end
+    _owned[id] = names
+    _token_names_cache = nil
+    return true
 end
 
 return Tokens

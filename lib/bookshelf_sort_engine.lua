@@ -41,17 +41,35 @@ local SortEngine = {}
 local _pinyin_on  = false
 local _pinyin_gen = -1
 local _key_epoch  = 0
+-- "Ignore The, A, An when sorting" (issue 428). On by default, which is how
+-- titles and series have sorted since 120960a / issue 412; off sorts by the
+-- title and series name exactly as written, calibre's title_sort included.
+-- Rides the same epoch as the pinyin flag, for the same reason: the keys it
+-- changes are memoised on every record.
+local _articles_on = true
 
 local function refreshPinyinFlag()
-    if not (Store and Pinyin) then return end
+    if not Store then return end
     local gen = Store.generation()
     if gen == _pinyin_gen then return end
     _pinyin_gen = gen
-    local on = Store.read("cjk_pinyin_sort") == true
-    if on ~= _pinyin_on then
+    local on = Pinyin ~= nil and Store.read("cjk_pinyin_sort") == true
+    local articles = Store.read("sort_ignore_articles") ~= false
+    if on ~= _pinyin_on or articles ~= _articles_on then
         _pinyin_on = on
+        _articles_on = articles
         _key_epoch = _key_epoch + 1
     end
+end
+
+-- keySignature() -> a short string naming every setting that changes how a
+-- sort KEY is derived (pinyin, the leading-article rule). Sort LEVELS are
+-- the caller's own and already in its cache keys; these are not, so a cache
+-- of sorted results that left them out went on serving the old order after
+-- the setting changed -- until something else invalidated it.
+function SortEngine.keySignature()
+    refreshPinyinFlag()
+    return (_pinyin_on and "P" or "") .. (_articles_on and "" or "W")
 end
 
 local function ensureEpoch(b)
@@ -102,6 +120,21 @@ local STATUS_RANK_ACTIVE   = {
     finished = 4, complete = 4,
 }
 
+-- isFavourite(item) -> the book is in KOReader's default "favorites"
+-- collection. A plain table lookup on ReadCollection.coll (the same check the
+-- spine shelf and the favourite token make), so it is cheap enough to run on
+-- every one of the comparator's ~n*log(n) calls. Without ReadCollection (the
+-- standalone test harness) nothing is a favourite.
+local function isFavourite(item)
+    local fp = type(item) == "table" and item.filepath
+    if not fp then return false end
+    local ok, rc = pcall(require, "readcollection")
+    return ok and type(rc) == "table" and type(rc.coll) == "table"
+        and type(rc.coll.favorites) == "table"
+        and rc.coll.favorites[fp] ~= nil or false
+end
+SortEngine.isFavourite = isFavourite
+
 -- nil-safe comparator helper. Returns -1, 0, +1 so it composes cleanly.
 -- nil always sorts to the end (higher sort order).
 -- Sentinel return values for nil-handling. The chainedComparator detects
@@ -114,6 +147,64 @@ local SORT_TO_START = "__sort_to_start__" -- only b missing            -> a befo
 
 local function isMissing(v)
     return v == nil or v == ""
+end
+
+-- publishedOf(item) -> the publication year the Published sort orders by,
+-- or nil: the same year %published shows (lib/bookshelf_published: calibre,
+-- an OPDS catalogue's date, else the date read from the book's file). A book
+-- not read yet answers nil now and is queued for the background read, which
+-- clears this memo when it brings dates (clearPublishedMemo) so the shelf
+-- can sort again. Memoised per record: the comparator runs n log n times.
+local _pub_memo = setmetatable({}, { __mode = "k" })
+function SortEngine.clearPublishedMemo() _pub_memo = setmetatable({}, { __mode = "k" }) end
+
+function SortEngine.publishedOf(item)
+    if type(item) ~= "table" then return nil end
+    local m = _pub_memo[item]
+    if m == nil then
+        local ok, P = pcall(require, "lib/bookshelf_published")
+        -- A folder view's file entry ({ name, fp, attr }) has no filepath:
+        -- ask by its path. A folder entry has no year.
+        local rec = item
+        if not item.filepath and type(item.fp) == "string"
+                and not (item.attr and item.attr.mode == "directory") then
+            rec = { filepath = item.fp }
+        end
+        local y = ok and P and P.forRecord and P.forRecord(rec) or nil
+        m = tonumber(y) or false
+        _pub_memo[item] = m
+    end
+    return m or nil
+end
+
+-- pageCountOf(item) -> the count the Pages sort orders by.
+--
+-- Reddit report: "I'd like to have a chip that sorts books by length, but it
+-- doesn't appear that it works with the extracted numbers." Most sort paths
+-- hand the comparator light records, which carry no count for a reflowable
+-- book, and the one that backfills skips books with no sidecar -- exactly the
+-- never-opened books "Extract page counts" is for. So a record with no count
+-- of its own asks the repository's resolver (installed by
+-- bookshelf_book_repository, which this module must not require), once per
+-- record: the comparator runs n log n times. clearPageCountMemo() drops the
+-- answers when the counts change.
+local _page_memo = setmetatable({}, { __mode = "k" })
+local _page_resolver = nil
+
+function SortEngine.setPageCountResolver(fn) _page_resolver = fn end
+function SortEngine.clearPageCountMemo() _page_memo = setmetatable({}, { __mode = "k" }) end
+
+function SortEngine.pageCountOf(item)
+    if type(item) ~= "table" then return nil end
+    local v = item.page_count or item.total_pages
+    if v ~= nil or not _page_resolver or not item.filepath then return v end
+    local m = _page_memo[item]
+    if m == nil then
+        local ok, n = pcall(_page_resolver, item.filepath)
+        m = (ok and tonumber(n)) or false
+        _page_memo[item] = m
+    end
+    return m or nil
 end
 
 local function cmp(a, b)
@@ -360,10 +451,14 @@ local function cachedTitleKey(b)
     ensureEpoch(b)
     local v = b._title_key_cache
     if v == nil then
-        v = b.title_sort
-        if v == nil or v == "" then
-            v = stripLeadingArticle(
-                b.title or (b.doc_props and b.doc_props.display_title) or b.name)
+        local raw = b.title or (b.doc_props and b.doc_props.display_title) or b.name
+        if _articles_on then
+            v = b.title_sort
+            if v == nil or v == "" then v = stripLeadingArticle(raw) end
+        else
+            -- As written: calibre's title_sort IS the article rule, so it
+            -- goes too.
+            v = raw
         end
         v = (v ~= nil and v ~= "") and pinyinise(tostring(v):lower()) or false
         b._title_key_cache = v
@@ -434,7 +529,7 @@ local function cachedSeriesKey(b)
         -- preferred for a book. It has no stored series sort field: it runs
         -- its own title-sort algorithm over the series name when asked and
         -- never persists the result, so the heuristic is all there is.
-        v = stripLeadingArticle(v)
+        if _articles_on then v = stripLeadingArticle(v) end
         v = (v ~= nil and v ~= "") and pinyinise(tostring(v):lower()) or false
         b._series_key_cache = v
     end
@@ -473,6 +568,8 @@ function SortEngine.sortKeyValue(item, key)
         v = cachedFilenameKey(item)
     elseif key == "series_name" or key == "series_combined" then
         v = cachedSeriesKey(item)
+    elseif key == "series_or_title" then
+        v = cachedSeriesKey(item) or cachedTitleKey(item)
     end
     -- Every branch above hands back a key its memo has already lowercased and
     -- pinyinised, so it is returned untouched.
@@ -522,6 +619,24 @@ SortEngine.KEYS = {
                             return cmp(tonumber(a.series_index or a.series_num),
                                        tonumber(b.series_index or b.series_num))
                         end },
+    -- Issue 437: one alphabet for series and standalones. A book in a series
+    -- files under its SERIES name, one without under its title, so "Adventure"
+    -- (a standalone) comes before the "Court" series instead of after every
+    -- series on the shelf, which is where series_name's missing-key rule sends
+    -- it. Within a series, index order, then title. The keys are the same
+    -- memoised, article-stripped forms series_name and title sort by.
+    series_or_title = { label = tr("Series, else title"), short = tr("Series or title"),
+                        comparator = function(a, b)
+                            local ka = cachedSeriesKey(a) or cachedTitleKey(a)
+                            local kb = cachedSeriesKey(b) or cachedTitleKey(b)
+                            -- Natural order, as titles sort: "Book 2" before "Book 10".
+                            local s = natCmp(ka, kb)
+                            if s ~= 0 then return s end
+                            s = cmp(tonumber(a.series_index or a.series_num),
+                                    tonumber(b.series_index or b.series_num))
+                            if s ~= 0 then return s end
+                            return natCmp(cachedTitleKey(a), cachedTitleKey(b))
+                        end },
     -- Book record: a.last_opened
     -- lfs entry:   a._last_read (when last_read prefetch ran)
     -- group shape: a.latest (most-recent last_opened among member books)
@@ -552,6 +667,12 @@ SortEngine.KEYS = {
                                 return cmp(STATUS_RANK_ACTIVE[a.read_status or a._status or "unread"] or 99,
                                            STATUS_RANK_ACTIVE[b.read_status or b._status or "unread"] or 99)
                             end },
+    -- Favourites (KOReader's default "favorites" collection) ahead of the
+    -- rest; ties fall to the next level, e.g. Reading 1st then Last opened.
+    favorites_first = { label = tr("Favorites first"), short = tr("Favorite 1st"),
+                        comparator = function(a, b)
+                            return cmp(isFavourite(a) and 1 or 2, isFavourite(b) and 1 or 2)
+                        end },
     -- Book record: a.date_added
     -- lfs entry:   a.attr.modification
     -- group shape: a.latest_added (max member mtime; set in _buildGroups so
@@ -565,6 +686,21 @@ SortEngine.KEYS = {
                             local bv = b.date_added or b.latest_added
                                     or (b.attr and b.attr.modification)
                             return cmp(av, bv)
+                        end },
+    -- The later of the two above (issue 519), the way a Kindle's home orders
+    -- its books: a new book goes to the front, and so does one just opened,
+    -- until the next new book pushes it back. Same fields as last_opened and
+    -- date_added, every shape; a missing side counts as never.
+    added_or_opened = { label = tr("Added or opened"), short = tr("Added/opened"),
+                        comparator = function(a, b)
+                            local function at(x)
+                                local o = tonumber(x.last_opened or x._last_read or x.latest) or 0
+                                local d = tonumber(x.date_added or x.latest_added
+                                    or (x.attr and x.attr.modification)) or 0
+                                local v = math.max(o, d)
+                                if v > 0 then return v end
+                            end
+                            return cmp(at(a), at(b))
                         end },
     -- Book record: a.size
     -- lfs entry:   a.attr.size
@@ -592,10 +728,17 @@ SortEngine.KEYS = {
                         end },
     -- Book record: a.page_count (from BIM / DocSettings stats.pages)
     -- group shape: a.total_pages (sum of member page counts)
+    -- A record with neither asks the repository (SortEngine.pageCountOf).
     page_count      = { label = tr("Page count"), short = tr("Pages"),
                         comparator = function(a, b)
-                            return cmp(a.page_count or a.total_pages,
-                                       b.page_count or b.total_pages)
+                            return cmp(SortEngine.pageCountOf(a),
+                                       SortEngine.pageCountOf(b))
+                        end },
+    -- Issue 580: the year %published shows. Groups have no year of their own
+    -- (nil ties them, so the next level decides).
+    published       = { label = tr("Publication year"), short = tr("Published"),
+                        comparator = function(a, b)
+                            return cmp(SortEngine.publishedOf(a), SortEngine.publishedOf(b))
                         end },
     -- Book record: a.collection_order (the `order` KOReader stores per item in
     -- a collection; the repository's collection source copies it onto the
@@ -621,11 +764,11 @@ SortEngine.KEYS = {
 -- usefulness on a typical library view, not alphabetically.
 SortEngine.ORDER = {
     "title", "filename", "author_surname", "author_name",
-    "series_name", "series_index", "series_combined",
-    "last_opened", "date_added",
+    "series_name", "series_index", "series_combined", "series_or_title",
+    "last_opened", "date_added", "added_or_opened",
     "percent_read", "rating",
-    "read_status", "read_status_active",
-    "size", "page_count", "book_count",
+    "read_status", "read_status_active", "favorites_first",
+    "size", "page_count", "book_count", "published",
 }
 
 -- chainedComparator(priority): builds a single Lua-table-sort comparator from

@@ -98,6 +98,42 @@ function Kit.settingsReopen(ctx, dialog, show_settings)
     if show_settings then show_settings(ctx) end
 end
 
+-- Kit.withClose(spec) -> a module settings ButtonDialog's spec with a close X
+-- at the right end of its title: tapping outside closed it, but nothing on
+-- it said so. The X does what that tap does (onClose, so a
+-- tap_close_callback runs). ButtonDialog has no place for one, so the
+-- spec's own init (which Widget:new calls in place of the class's) builds
+-- the dialog as usual, then lays the X over the title line, the same size,
+-- so nothing below moves. With no title, a Close row at the foot instead.
+function Kit.withClose(spec)
+    -- A side swipe off it turns the shelf's page behind (maintainer).
+    require("lib/bookshelf_gesture_zones").passSwipesOn(spec)
+    if not spec.title then
+        local _ = require("lib/bookshelf_i18n").gettext
+        spec.buttons = spec.buttons or {}
+        table.insert(spec.buttons, { { text = _("Close"), callback = function()
+            if spec.onClose then spec:onClose() else require("ui/uimanager"):close(spec) end
+        end } })
+        return spec
+    end
+    function spec:init()
+        require("ui/widget/buttondialog").init(self)
+        local group = self.title_group and self.title_group[1]
+        local title = group and group[1]
+        if not (title and title.getSize) then return end
+        local sz = title:getSize()
+        local Geom = require("ui/geometry")
+        local dimen = Geom:new{ w = sz.w, h = sz.h }
+        local x = require("ui/widget/iconbutton"):new{
+            icon = "close", width = sz.h, height = sz.h,
+            callback = function() self:onClose() end,
+        }
+        group[1] = require("ui/widget/overlapgroup"):new{ dimen = dimen, title,
+            require("ui/widget/container/rightcontainer"):new{ dimen = dimen, x } }
+    end
+    return spec
+end
+
 -- Kit.radioRow{ label=, active=, on_pick=, toggle= } -> ButtonDialog row.
 -- Checkmark-prefixed radio row (U+2713 when active, two-space placeholder
 -- otherwise, so labels stay aligned). Tapping the already-active row is a
@@ -150,19 +186,75 @@ function Kit.fitText(o)
     return TextBoxWidget:new(args)
 end
 
+-- coverFit(width, height, gap, overhang) -> how many 2:3 covers a width x
+-- height box holds side by side at full height, with `gap` between them and
+-- `overhang` px kept above and below for the status marks. At least one, at
+-- most twelve. Recently read and the Shelf module size their rows by it.
+function Kit.coverFit(width, height, gap, overhang)
+    local h = height - 2 * (overhang or 0)
+    local w = math.floor(h * 2 / 3)
+    if w < 1 then return 1 end
+    local n = math.floor((width + (gap or 0)) / (w + (gap or 0)))
+    return math.max(1, math.min(n, 12))
+end
+
+-- isStrip(width, height) -> true for a cell clearly wider than tall (a 3x1 or
+-- 6x1 on the grid), where a card reads better laid out sideways. No height
+-- (the start menu, the picker): false, the stacked layout as always.
+function Kit.isStrip(width, height)
+    if not (width and height and height > 0) then return false end
+    return width >= height * 2.4
+end
+
 -- valueCard{...} -> VerticalGroup. The shared "heading + big value + suffix +
 -- bar + sub + context" card (reading_goal / reading_stats, and a good default
 -- for any stat module). All fields optional except width/scale_pct.
 --   heading - small muted bold line               value  - big primary value
 --   suffix  - baseline-aligned small primary       bar    - optional full-width widget
 --   sub     - optional muted small line            context- optional small primary line
+--   height  - the cell height, when the host has one: in a strip (isStrip) the
+--             value goes on the left and the rest in a column beside it.
 function Kit.valueCard(o)
-    local TextWidget      = require("ui/widget/textwidget")
+    local TextWidget      = require("lib/bookshelf_colour_text")
     local VerticalGroup   = require("ui/widget/verticalgroup")
     local VerticalSpan    = require("ui/widget/verticalspan")
     local HorizontalGroup = require("ui/widget/horizontalgroup")
     local sc = Kit.sc(o.scale_pct)
     local mw = math.max(50, o.width or 50)
+    if o.value and Kit.isStrip(mw, o.height) then
+        local HorizontalSpan = require("ui/widget/horizontalspan")
+        local fbig, bbig = Kit.face(26, o.scale_pct, { bold = true })
+        local left = VerticalGroup:new{ align = "left",
+            TextWidget:new{ text = o.value, face = fbig, bold = bbig,
+                fgcolor = Kit.COLOR_PRIMARY } }
+        if o.suffix then
+            left[#left + 1] = TextWidget:new{ text = (o.suffix:gsub("^%s+", "")),
+                face = Kit.face(14, o.scale_pct), fgcolor = Kit.COLOR_PRIMARY }
+        end
+        local gap = sc(16)
+        local rw = math.max(10, mw - left:getSize().w - gap)
+        local right = VerticalGroup:new{ align = "left" }
+        if o.heading then
+            local f, b = Kit.face(15, o.scale_pct, { bold = true })
+            right[#right + 1] = TextWidget:new{ text = o.heading, face = f, bold = b,
+                fgcolor = Kit.COLOR_MUTED, max_width = rw }
+        end
+        if o.sub then
+            right[#right + 1] = TextWidget:new{ text = o.sub, face = Kit.face(13, o.scale_pct),
+                fgcolor = Kit.COLOR_MUTED, max_width = rw }
+        end
+        if o.context then
+            right[#right + 1] = TextWidget:new{ text = o.context,
+                face = Kit.face(13, o.scale_pct, { italic = true }),
+                fgcolor = Kit.COLOR_PRIMARY, max_width = rw }
+        end
+        if o.bar_fraction then
+            right[#right + 1] = VerticalSpan:new{ width = sc(6) }
+            right[#right + 1] = Kit.progressBar{ width = rw, height = sc(6), fraction = o.bar_fraction }
+        end
+        return HorizontalGroup:new{ align = "center", left,
+            HorizontalSpan:new{ width = gap }, right }
+    end
     local g = VerticalGroup:new{ align = "left" }
     if o.heading then
         local f, b = Kit.face(15, o.scale_pct, { bold = true })
@@ -200,6 +292,46 @@ function Kit.valueCard(o)
     return g
 end
 
+-- progressBar{ width, height, fraction } -> a full-width track with the filled
+-- part in the card's ink, for valueCard's `bar`. Moved here from reading_goal
+-- so the battery card draws the same bar.
+--
+-- The bar is DRAWING, not text, so nothing hands it a colour: it was a
+-- hard-coded black fill on a fixed 0xCC track. Under the shelf's dark theme
+-- that reads exactly backwards -- the black fill sinks into the card and the
+-- pale track becomes the part that looks filled, so 20% shows as 80%.
+--
+-- Fill is the card's ink. The track keeps the relationship it has always had
+-- to it: 0xCC is a seventh of the way from the 0xEE card toward black, so a
+-- seventh of the way from the card toward the ink reproduces the light theme
+-- exactly (238 + (0-238)/7 = 204 = 0xCC) and gives the dark one a 0x33 track
+-- on its near-black card.
+function Kit.progressBar(o)
+    local Blitbuffer = require("ffi/blitbuffer")
+    local Widget     = require("ui/widget/widget")
+    local Geom       = require("ui/geometry")
+    local FILL  = Kit.COLOR_PRIMARY or Blitbuffer.COLOR_BLACK
+    local TRACK = Blitbuffer.Color8(0xCC)
+    local ok_lum, lum = pcall(function() return FILL:getColor8().a end)
+    if ok_lum and type(lum) == "number" then
+        local card = (lum > 128) and 0x11 or 0xEE
+        TRACK = Blitbuffer.Color8(math.floor(card + (lum - card) / 7 + 0.5))
+    end
+    local bar_w, bar_h = o.width, o.height
+    local fill_w = math.max(0, math.min(bar_w, math.floor(bar_w * (o.fraction or 0))))
+    local Bar = Widget:extend{}
+    function Bar:init()   self.dimen = Geom:new{ w = bar_w, h = bar_h } end
+    function Bar:getSize() return Geom:new{ w = bar_w, h = bar_h } end
+    function Bar:paintTo(bb, x, y)
+        self.dimen = Geom:new{ x = x, y = y, w = bar_w, h = bar_h }
+        -- Color.paintRect: the fill is the card's ink, which may be a colour.
+        local Color = require("lib/bookshelf_color")
+        Color.paintRect(bb, x, y, bar_w, bar_h, TRACK)
+        if fill_w > 0 then Color.paintRect(bb, x, y, fill_w, bar_h, FILL) end
+    end
+    return Bar:new{}
+end
+
 -- The width at which a flexible card can hold TWO comfortable text columns
 -- instead of one. Single source for every surface that decides between a
 -- one- and two-column layout: the hero/full-screen grid uses it as a flex
@@ -228,6 +360,64 @@ function Kit.shape(width, avail_h)
     if r >= 1.6 then return "wide" end
     if r <= 0.7 then return "tall" end
     return "square"
+end
+
+-- plugin(MODULE_DIR) -> the live instance of the plugin this module ships
+-- in, for a module in a pack (a .koplugin's bookshelf_modules/) that shows
+-- its own plugin's state. MODULE_DIR is the folder the module file is called
+-- with (`local MODULE_DIR = ...`). nil when the plugin is not running, or
+-- for a module outside any plugin (the drop-in folder).
+--   local pet = Kit.plugin(MODULE_DIR)
+--   if pet then ... pet.state ... end
+function Kit.plugin(dir)
+    return SM.pluginOf and SM.pluginOf(dir) or nil
+end
+
+-- onHomeShelf(key) -> true when the reader's home shelf (the first shelf on
+-- the chip strip that holds books) holds module `key`.
+-- setOnHomeShelf(key, on) -> puts module `key` first on the home shelf, at its
+-- starting width, or takes it off; true when that is where things now stand
+-- (false: no such module, or no home shelf). A shelf on screen redraws.
+-- Putting it on turns Modules > On the shelf on, if it was off.
+-- For a pack's own plugin, and only from something the reader chose (a tick
+-- in its settings or its welcome screen): the home shelf is theirs.
+function Kit.onHomeShelf(key)
+    local ok, on = pcall(function()
+        return require("lib/bookshelf_shelf_modules").onHome(key, require("lib/bookshelf_tab_model").load())
+    end)
+    return ok and on or false
+end
+
+function Kit.setOnHomeShelf(key, on)
+    local ShelfModules = require("lib/bookshelf_shelf_modules")
+    local TabModel = require("lib/bookshelf_tab_model")
+    -- Forced: with no module in use anywhere yet, Bookshelf loads none.
+    local def = SM.get(key, true)
+    if on and not def then return false end
+    local tabs = TabModel.load()
+    local changed, home, removed = ShelfModules.setOnHome(key, on and true or false, tabs,
+        ShelfModules.startWidth(def))
+    if not home then return false end
+    -- Modules > On the shelf off: the card would show nowhere. The reader
+    -- asked for it, so the switch comes on with it (maintainer).
+    local switched = false
+    if on then
+        local ok_s, Store = pcall(require, "lib/bookshelf_settings_store")
+        if ok_s and Store.microOnShelf and not Store.microOnShelf() then
+            Store.save("micro_on_shelf", true)
+            Store.flush()
+            switched = true
+        end
+    end
+    if changed or switched then
+        if changed then TabModel.save(tabs) end
+        for _i, m in ipairs(removed or {}) do SM.notifyRemoved(m) end
+        -- The shelf on screen redraws (BookshelfWidget:onBookshelfShelfModulesChanged).
+        local UIManager = require("ui/uimanager")
+        local Event = require("ui/event")
+        UIManager:broadcastEvent(Event:new("BookshelfShelfModulesChanged", home.id))
+    end
+    return true
 end
 
 -- Per-module SHARED store handle (caches, per-type defaults), backed by the

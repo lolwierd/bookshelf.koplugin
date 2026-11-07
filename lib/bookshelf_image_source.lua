@@ -200,7 +200,7 @@ end
 function ImageSource.getImageLibraryPath()
     local override = Store.read("image_library_path")
     if type(override) == "string" and override ~= "" then return override end
-    local home = G_reader_settings and G_reader_settings:readSetting("home_dir")
+    local home = require("lib/bookshelf_home_dir").get()
     if type(home) ~= "string" or home == "" then return nil end
     return home:gsub("/+$", "") .. "/.bookshelf-images"
 end
@@ -211,18 +211,6 @@ function ImageSource.setImageLibraryPath(path)
     else
         Store.save("image_library_path", path)
     end
-end
-
--- Returns the expected library filename (without extension) for a
--- (kind, name) pair, so the menu's "Show expected filename" helper can
--- show users exactly what to name a file for auto-discovery to pick
--- it up. Returns nil for unsupported kinds.
-function ImageSource.expectedLibraryStub(kind, name)
-    local subdir = STACK_SUBDIRS[kind]
-    if not subdir or type(name) ~= "string" or name == "" then return nil end
-    local lib = ImageSource.getImageLibraryPath()
-    if not lib then return nil end
-    return lib:gsub("/+$", "") .. "/" .. subdir .. "/" .. name
 end
 
 local function _stackOverridesTable()
@@ -277,16 +265,54 @@ local function _autoDiscoverStackImage(kind, name)
         memo[dkey] = dir_ok
     end
     if not dir_ok then return nil end
+    -- One listing of the folder, indexed by lower-cased file name, instead of
+    -- a stat per candidate: up to 16 per stack (two spellings x eight
+    -- extensions), paid for every new stack on a page -- 9% of a Genres page
+    -- turn on a PW5 with an image library (jit.p). Lower-cased because the
+    -- stats were effectively case-blind where most readers keep their images
+    -- (FAT/exFAT storage); the listed name is returned, so the path is real.
+    local ikey = "idx\1" .. base
+    local index = memo[ikey]
+    if index == nil then
+        index = {}
+        pcall(function()
+            for entry in lfs.dir(base) do
+                if entry ~= "." and entry ~= ".." then index[entry:lower()] = entry end
+            end
+        end)
+        memo[ikey] = index
+    end
     local candidates = { name }
     local slug = _slug(name)
     if slug ~= "" and slug ~= name then
         candidates[#candidates + 1] = slug
     end
+    -- An author's file may be named the other way round: saved as "Osman,
+    -- Richard.jpg" (by hand, or by Find author image online while the shelf
+    -- showed Last, First) and looked up as "Richard Osman" after Author name
+    -- formatting changed, or the reverse. Tried after the name as given, so
+    -- an exact file still wins. Lookups in the listing index, not stats.
+    if kind == "author" then
+        local ok_an, AuthorName = pcall(require, "lib/bookshelf_author_name")
+        if ok_an and AuthorName and AuthorName.formatted then
+            for _i, mode in ipairs({ "first_last", "last_first" }) do
+                local alt = AuthorName.formatted(name, mode)
+                if type(alt) == "string" and alt ~= "" and alt ~= name then
+                    candidates[#candidates + 1] = alt
+                    local alt_slug = _slug(alt)
+                    if alt_slug ~= "" and alt_slug ~= alt then
+                        candidates[#candidates + 1] = alt_slug
+                    end
+                end
+            end
+        end
+    end
     for _, stem in ipairs(candidates) do
         for _, ext in ipairs(LIBRARY_EXTS) do
-            local p = base .. stem .. "." .. ext
-            if lfs.attributes(p, "mode") == "file" then
-                return p
+            local real = index[(stem .. "." .. ext):lower()]
+            if real then
+                local p = base .. real
+                if lfs.attributes(p, "mode") == "file" then return p end
             end
         end
     end
@@ -542,6 +568,64 @@ function ImageSource.loadImage(image_path, w, h)
     return bb
 end
 
+-- coverCrop(iw, ih, w, h) -> rw, rh, x, y: an iw*ih picture scaled (aspect
+-- kept) to rw*rh, just covering a w*h box, and the (x, y) of the w*h window
+-- cut from it. Wider than the box: the sides go, evenly. Taller: most of the
+-- cut comes off the bottom (a fifth off the top), since a portrait's face is
+-- near its top.
+function ImageSource.coverCrop(iw, ih, w, h)
+    local f = math.max(w / iw, h / ih)
+    local rw = math.max(w, math.floor(iw * f + 0.5))
+    local rh = math.max(h, math.floor(ih * f + 0.5))
+    return rw, rh, math.floor((rw - w) / 2), math.floor((rh - h) / 5)
+end
+
+-- loadImageCover(path, w, h) -> a w*h bb of the picture cropped to fill it,
+-- for author photos: every author card is a book cover's shape, whatever
+-- shape the photo came in (maintainer: "always crop to the same standard
+-- cover aspect ratio"). Before, the photo kept its own shape in a frame and
+-- a true-aspect shelf gave the card that shape too, so a row of authors was
+-- every height. loadImage stretches instead, which squashed them.
+function ImageSource.loadImageCover(image_path, w, h)
+    if type(image_path) ~= "string" or not w or not h or w <= 0 or h <= 0 then
+        return nil
+    end
+    local attr = lfs.attributes(image_path)
+    if not attr or attr.mode ~= "file" then return nil end
+    local tag = ImageSource.imageSizeTag and ImageSource.imageSizeTag(image_path)
+    -- Not `tag and tag:match(...)`: an `and` keeps only its first value.
+    local iw, ih
+    if tag then iw, ih = tag:match("^(%d+)x(%d+)$") end
+    iw, ih = tonumber(iw), tonumber(ih)
+    if not (iw and ih and iw > 0 and ih > 0) then return ImageSource.loadImage(image_path, w, h) end
+    local key = image_path .. "|" .. tostring(attr.modification or 0)
+                .. "|" .. tostring(w) .. "|" .. tostring(h) .. "|cover"
+    local hit = _bb_cache[key]
+    if hit then return hit.bb end
+    local rw, rh, x, y = ImageSource.coverCrop(iw, ih, w, h)
+    local ok, out = pcall(function()
+        local Blitbuffer = require("ffi/blitbuffer")
+        local photo = RenderImage:renderImageFile(image_path, false, rw, rh)
+        if not photo then return nil end
+        -- The decoder may round the size it was asked for; cut from what
+        -- it gave, never past its edge.
+        local pw, ph = photo:getWidth(), photo:getHeight()
+        x = math.max(0, math.min(x, pw - w))
+        y = math.max(0, math.min(y, ph - h))
+        local canvas = Blitbuffer.new(w, h, photo:getType())
+        canvas:fill(Blitbuffer.COLOR_WHITE)
+        canvas:blitFrom(photo, 0, 0, x, y, math.min(w, pw), math.min(h, ph))
+        photo:free()
+        return canvas
+    end)
+    if not ok or not out then
+        logger.warn("[bookshelf image] failed to crop", image_path, "err=", tostring(out))
+        return ImageSource.loadImage(image_path, w, h)
+    end
+    _bbPut(key, out)
+    return out
+end
+
 -- Load at the image's native size, without scaling -- so the bb keeps its true
 -- aspect ratio. loadImage() above resizes to an exact w*h (a stretch, not a
 -- fit), which is fine when the target box already matches the cover's aspect
@@ -579,7 +663,12 @@ end
 local _size_tag_memo = {}
 function ImageSource.imageSizeTag(path)
     if type(path) ~= "string" or path == "" then return nil end
-    local memo = _size_tag_memo[path]
+    -- Keyed on the file's mtime too: a folder's cover.jpg can be replaced in
+    -- place by a differently shaped picture, and the true-aspect tile has to
+    -- follow it the way loadImage's cache does.
+    local mtime = lfs.attributes(path, "modification") or 0
+    local mkey = path .. "\0" .. tostring(mtime)
+    local memo = _size_tag_memo[mkey]
     if memo ~= nil then return memo or nil end
     local w, h
     local ok = pcall(function()
@@ -619,10 +708,10 @@ function ImageSource.imageSizeTag(path)
     end)
     if ok and w and h and w > 0 and h > 0 then
         local tag = w .. "x" .. h
-        _size_tag_memo[path] = tag
+        _size_tag_memo[mkey] = tag
         return tag
     end
-    _size_tag_memo[path] = false
+    _size_tag_memo[mkey] = false
     return nil
 end
 

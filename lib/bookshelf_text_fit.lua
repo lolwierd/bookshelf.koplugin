@@ -151,19 +151,31 @@ function M.balanceLines(text, face, max_width, bold)
     -- (Reddit report, 2026-08-26). If the balanced text renders taller
     -- than its intended line count, the natural greedy wrap - whose height
     -- the caller's fit loop validated with this same widget - wins.
+    --
+    -- Against the ORIGINAL's rendered line count, not n_lines. n_lines is the
+    -- same per-word estimate, and it errs both ways: when it overcounts (says
+    -- three where xtext fits two), the search balances to three lines, the
+    -- balanced text really does render in three, and a check against n_lines
+    -- lets it through -- one line more than the fit loop measured, so the
+    -- height cap cut it off: "A Hymn Of..." at 14pt on a card where 14pt
+    -- fits (issue 457). Balancing may never add a line to what the widget
+    -- would have drawn anyway.
     do
         local ok_tb, TextBoxWidget = pcall(require, "ui/widget/textboxwidget")
         if ok_tb and TextBoxWidget then
-            local probe = TextBoxWidget:new{
-                text          = out,
-                face          = face,
-                bold          = bold,
-                width         = max_width,
-                height_adjust = true,
-            }
-            local rendered = #(probe.vertical_string_list or {})
-            if probe.free then probe:free() end
-            if rendered > n_lines then return text end
+            local function renderedLines(s)
+                local probe = TextBoxWidget:new{
+                    text          = s,
+                    face          = face,
+                    bold          = bold,
+                    width         = max_width,
+                    height_adjust = true,
+                }
+                local n = #(probe.vertical_string_list or {})
+                if probe.free then probe:free() end
+                return n
+            end
+            if renderedLines(out) > math.min(n_lines, renderedLines(text)) then return text end
         end
     end
     return out
@@ -255,6 +267,56 @@ function M.fitFontSize(o)
         if fits(mid) then best = mid; a = mid + 1 else b = mid - 1 end
     end
     return best
+end
+
+-- pathMiddle(path, fits) -> path, or with the folders nearest its name
+-- swapped for an ellipsis until fits(text) holds, so where it starts and the
+-- folder's own name both show (a folder filter's row; folders can be outside
+-- the home folder, so it is not made relative to it). The shortest is
+-- "/.../name"; past that the text widget cuts it.
+-- (pathOneLine, below, keeps the end instead: a book's file.)
+function M.pathMiddle(path, fits)
+    if fits(path) then return path end
+    local parts = {}
+    for seg in path:gmatch("[^/]+") do parts[#parts + 1] = seg end
+    if #parts < 2 then return path end
+    local name = table.remove(parts)
+    local out
+    repeat
+        table.remove(parts)
+        out = "/" .. table.concat(parts, "/") .. (#parts > 0 and "/" or "") .. "\xE2\x80\xA6/" .. name
+    until #parts == 0 or fits(out)
+    return out
+end
+
+-- pathOneLine(path, fits) - path shortened until fits(text) holds, for a
+-- file line that must stay on one line (the book popup's header). Folders
+-- go first, from the front ("…/Doyle/A Study in Scarlet.epub"), so the
+-- name and the folder it is in show longest; past "…/name" the name loses
+-- its start, keeping its end (the extension, a volume number). UTF-8 safe.
+function M.pathOneLine(path, fits)
+    if fits(path) then return path end
+    local E = "\xE2\x80\xA6"
+    local parts = {}
+    for seg in path:gmatch("[^/]+") do parts[#parts + 1] = seg end
+    local name = table.remove(parts) or path
+    while #parts > 0 do
+        table.remove(parts, 1)
+        local out = E .. "/" .. table.concat(parts, "/") .. (#parts > 0 and "/" or "") .. name
+        if fits(out) then return out end
+    end
+    -- Character starts, so a cut never splits a multi-byte letter.
+    local starts = {}
+    for pos in name:gmatch("()[^\128-\191]") do starts[#starts + 1] = pos end
+    -- The longest end that fits, by halves: each try measures text, and a
+    -- popup opening on a slow device shouldn't measure a name per letter.
+    local lo, hi = 2, #starts   -- cut before starts[k]: smaller k, longer end
+    if hi < lo then return E .. name end
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if fits(E .. name:sub(starts[mid])) then hi = mid else lo = mid + 1 end
+    end
+    return E .. name:sub(starts[lo])
 end
 
 return M

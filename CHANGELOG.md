@@ -14,6 +14,27 @@ the trailing `.N` is the fork revision, reset whenever the upstream base changes
 
 _Nothing yet._
 
+## [6.3.3.1] - 2026-11-08
+
+Synced with upstream **v6.3.3** (1,222 commits since the previous fork build).
+
+### Upstream changes pulled in
+- Added theme packs, wallpaper and plank pickers, ornament placement and tap actions, and per-shelf themes.
+- Added a micro-module layout editor, shelf and ornament modules, modules among books, and a Highlights tab in book details.
+- Redesigned menus and shelf editors, expanded filters, and improved keyboard and page-button navigation.
+- Added publication-year metadata, the `%published` token, publication-year sorting and date editing, plus wallpaper scaling and image contrast controls.
+- Improved shelf switching, cover caching, page-count extraction, OPDS support, and compatibility with other plugins.
+- Fixed wake-screen repainting and sleep anti-ghosting, online-cover pagination crashes, and clipped library-refresh notices.
+- Moved personal settings and content to `koreader/settings/bookshelf` and caches to `koreader/cache/bookshelf`; upstream migrates existing files on first start.
+
+### Fork behaviours retained
+- Kept the screensaver host fallback when neither FileManager nor ReaderUI is available.
+- Kept direct suspend requests and reader-configured multiswipe sleep, including with a parked reader.
+- Kept update checks, downloads, branch installs, release links and changelog refreshes pointing at this fork.
+- Kept upstream's reader-return lifecycle guard in place of the retired fork timer.
+- Used upstream's shared live gesture routing, including plugin gestures and empty-space book drop, alongside the fork's sleep override.
+- Used upstream's shared highlights browser for quote navigation; the old direct FileManager-dependent bookmark path is gone.
+
 ## [5.1.4.1] - 2026-09-23
 
 Sync with upstream **v5.1.4** plus the five commits after it on `master`

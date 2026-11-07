@@ -293,10 +293,20 @@ end)
 -- take arguments, so the body is wrapped back into a function with its real
 -- signature and `self` becomes an explicit first parameter rather than a
 -- global.
+-- The match is memoised like bodyOf's: it scans the whole widget source, and
+-- the sweeps call this per case (it was ~98% of the suite's three minutes
+-- again). Only the compile depends on env.
+local _method_cache = {}
 local function methodOf(name, env)
-    local params, body = src:match("\nfunction BookshelfWidget:" .. name
-        .. "%((.-)%)\n(.-)\nend\n")
-    assert(body, "could not find BookshelfWidget:" .. name .. "(...) - renamed?")
+    local hit = _method_cache[name]
+    if not hit then
+        local params, body = src:match("\nfunction BookshelfWidget:" .. name
+            .. "%((.-)%)\n(.-)\nend\n")
+        assert(body, "could not find BookshelfWidget:" .. name .. "(...) - renamed?")
+        hit = { params = params, body = body }
+        _method_cache[name] = hit
+    end
+    local params, body = hit.params, hit.body
     local wrapped = "return function(self, " .. params .. ")\n" .. body .. "\nend"
     return compile(wrapped, env, name)()
 end
@@ -376,8 +386,8 @@ local BASELINES = { PW5, PW3, KBASIC, STOCK }
 local COMBOS = { { false, false }, { true, false },
                  { false, true },  { true, true } }
 
--- methodOf re-matches the whole of bookshelf_widget.lua on every call, which
--- is the cost bodyOf is memoised against. bandOf runs from the nested loops
+-- methodOf used to re-match the whole of bookshelf_widget.lua on every call
+-- (its match is memoised now, like bodyOf's). bandOf runs from the nested loops
 -- below, so extracting a SECOND method per case put two minutes on the sweep
 -- when it was measured. The compiled helper only varies with the baseline's
 -- Size.padding.large, so it is cached on that.
@@ -915,7 +925,8 @@ local function heroPair(o)
         _gridCols      = function() return n_cols end,
         _bookGap       = function(_s, pad) return pad end,
         _coverAspect   = function() return aspect end,
-        _shelfLabelMode = function() return nil end,
+        _shelfLabelMode = function() return o.own_mode end,
+        _anyShelfShowsCaptions = function() return o.any_captions or false end,
         _listMinRowHeight = function() return row_h end,
     }
     local split = methodOf("_collapsedGridSplit", env)
@@ -926,9 +937,34 @@ local function heroPair(o)
     -- would answer with a list row count.
     env._asCoverGrid = function(fn) pinned = pinned + 1 return fn() end
     local hero = methodOf("_listCollapsedHeroHeight", env)(self, false)
-    local _shelf_h, grid_hero = split(self, false)
-    return hero, grid_hero, pinned
+    local shelf_h, grid_hero = split(self, false)
+    return hero, grid_hero, pinned, shelf_h
 end
+
+t.test("the hero is one height on every shelf whenever any shelf shows captions", function()
+    -- Home holding only folders as divider cards prints no caption strip,
+    -- Series does: the hero used to grow ~54 px on Home (tutorial clip and
+    -- PW5, 2026-10-11). Now the strip-less shelf's ROWS are a strip shorter
+    -- and its hero is the captioned shelf's.
+    for _i, base in ipairs({ {}, { n_shelves = 3 }, { height = 1248, n_shelves = 1, n_cols = 6 } }) do
+        local function with(extra)
+            local o = {}
+            for k, v in pairs(base) do o[k] = v end
+            for k, v in pairs(extra) do o[k] = v end
+            return o
+        end
+        local _h1, hero_cap, _p1, row_cap = heroPair(with{ own_mode = "title", any_captions = true })
+        local _h2, hero_none, _p2, row_none = heroPair(with{ own_mode = nil, any_captions = true })
+        assert(hero_cap == hero_none, string.format(
+            "hero %d with a caption strip, %d without: it jumps between shelves", hero_cap, hero_none))
+        local strip = 12 + math.floor(14 * 1.3)   -- Size.padding.default + the label line
+        assert(row_cap - row_none == strip, string.format(
+            "a strip-less row should be one strip (%d) shorter, got %d", strip, row_cap - row_none))
+        -- Captions off everywhere: the hero keeps the room no strip needs.
+        local _h3, hero_off = heroPair(with{ own_mode = nil, any_captions = false })
+        assert(hero_off >= hero_cap, "with no captions anywhere the hero must not lose the strip's room")
+    end
+end)
 
 t.test("the list hero is fetched from the grid, under the covers pin", function()
     local hero, grid_hero, pinned = heroPair()
@@ -1452,6 +1488,62 @@ t.test("boxHeight bills VISIBLE lines, not the whole description", function()
                     lines_per_page = 5, line_height_px = 30 }
     assert(fn(short) == 60,
         "a short box must bill its actual lines, got " .. fn(short))
+end)
+
+t.test("boxHeight bills the glyph overhang the box's bitmap carries", function()
+    -- Issue 510: TextBoxWidget's bitmap is line_glyph_extra_height taller
+    -- than its lines when the glyphs outgrow the pitch (a bold name), and
+    -- getSize reports the bitmap. Billing lines alone let a wrapped cell
+    -- outgrow its slot and paint over the rule above it.
+    local body = row_src:match("\nlocal function boxHeight%b()\n(.-)\nend\n")
+    local compile = loadstring or load
+    local fn = assert(compile("return function(box)\n" .. body .. "\nend"))()
+    local box = { vertical_string_list = { 1, 2 }, lines_per_page = 2,
+                  line_height_px = 35, line_glyph_extra_height = 2 }
+    assert(fn(box) == 72, "expected 72, got " .. fn(box))
+end)
+
+t.test("fitBox: a wrapped box never outgrows its offer, and reports its bitmap", function()
+    -- The real fitBox and boxHeight, run against a TextBoxWidget stand-in
+    -- that sizes itself the way KOReader's does: lines_per_page from the
+    -- height it is given (at least one line), bitmap = height + overhang.
+    local compile = loadstring or load
+    local hb = row_src:match("\nlocal function boxHeight%b()\n(.-)\nend\n")
+    local fb = row_src:match("\nlocal function fitBox%(line, flat, w, offer%)\n(.-)\nend\n")
+    assert(fb, "fitBox is gone or was renamed")
+    local LH, EXTRA, LINES = 35, 2, 2
+    local function make(h)
+        h = math.max(h, LH)
+        local b = { vertical_string_list = {}, line_height_px = LH,
+                    line_glyph_extra_height = EXTRA, height = h,
+                    lines_per_page = math.floor(h / LH) }
+        for k = 1, LINES do b.vertical_string_list[k] = k end
+        b.free = function() end
+        return b
+    end
+    local env = { math = math }
+    local function load_in(code)
+        local f = assert(compile(code))
+        if setfenv then setfenv(f, env) end
+        return f
+    end
+    if not setfenv then
+        load_in = function(code) return assert(load(code, "fit", "t", env)) end
+    end
+    env.boxHeight = load_in("return function(box)\n" .. hb .. "\nend")()
+    env.wrapBox = function(_line, _flat, _w, h) return make(h) end
+    local fit = load_in("return function(line, flat, w, offer)\n" .. fb .. "\nend")()
+    for _i, offer in ipairs({ 70, 71, 72, 73, 74, 200 }) do
+        local box, used = fit({}, "x", 100, offer)
+        local bitmap = box.height + EXTRA
+        assert(used == bitmap, ("offer %d: used %d but the bitmap is %d"):format(offer, used, bitmap))
+        assert(used <= offer, ("offer %d: the box is %d tall"):format(offer, used))
+    end
+    -- Two lines no longer fit in 70 once the overhang is counted: one line.
+    local box = fit({}, "x", 100, 70)
+    assert(box.lines_per_page == 1, "70px holds one 35px line plus overhang")
+    box = fit({}, "x", 100, 72)
+    assert(box.lines_per_page == 2, "72px holds both lines and the overhang")
 end)
 
 t.test("the emptiness test and the wrap path read PLAIN text", function()

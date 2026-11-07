@@ -72,6 +72,7 @@ local Geom       = require("ui/geometry")
 local Widget     = require("ui/widget/widget")
 local Screen     = require("device").screen
 local BookshelfSettings = require("lib/bookshelf_settings_store")
+local Space      = require("lib/bookshelf_space")
 local logger     = (function()
     local ok, l = pcall(require, "logger")
     if ok and l then return l end
@@ -230,33 +231,97 @@ function M.externalLabel(mode, name)
     return name
 end
 
--- itemDrawsExternalLabel(item, mode) -> bool
+-- groupLabel(mode, item, name, group_text, format)
+--   -> text, is_group_text   (nil when nothing goes below the tile)
+--
+-- What goes on the one line below a GROUP tile (a folder, or a series,
+-- author, genre, collection or language stack).
+--
+-- The group's NAME comes first, as externalLabel decides it: a tile that does
+-- not name itself (Book stack, Collage, None) keeps the line for its name, as
+-- it always has, and the group text has nowhere to go. A tile that does
+-- (Divider card, Ribbon, Text) leaves the line free, and the reader's
+-- "Show author below series" choice (`group_text`, CoverLabel.groupMode)
+-- fills it (issue 486):
+--
+--   "author"  a series stack's author: item.stack_author, its members' modal
+--             author (Repo's hydrateSeriesShape), formatted by `format` as a
+--             book's author label is. Nothing under an author stack (it IS
+--             the author) or under a genre, collection, language or folder
+--             tile (none has an author of its own).
+--   nil       nothing: the default, and every shelf before this choice.
+--
+-- 5.4's "custom" (a template for groups) is gone: it had nothing to print
+-- but this author (CoverLabel.groupMode reads it as "author").
+--
+-- is_group_text tells the row which face to set it in (the groups' own).
+function M.groupLabel(mode, item, name, group_text, format)
+    local n = M.externalLabel(mode, name)
+    if n then return n, false end
+    if type(item) ~= "table" or item.kind == "opds_nav" then return nil end
+    if group_text == "author" then
+        if item.kind == "author" then return nil end
+        local a = item.stack_author
+        if type(a) ~= "string" or a == "" then return nil end
+        if format then a = format(a) or a end
+        return a, true
+    end
+    return nil
+end
+
+-- groupTextDraws(item, group_text) -> bool: whether groupLabel can print the
+-- group text under this tile, for the strip budget below.
+local function groupTextDraws(item, group_text)
+    if item.kind == "opds_nav" then return false end
+    if group_text == "author" then
+        local a = item.stack_author
+        return item.kind ~= "author" and type(a) == "string" and a ~= ""
+    end
+    return false
+end
+
+-- itemDrawsExternalLabel(item, mode, labels) -> bool
 -- Whether the shelf prints a name BELOW this tile, with labels on and the
 -- folder display already resolved to `mode`. Mirrors what ShelfRow builds: a
 -- book gets its title under the cover; a folder or any other group gets its
 -- name there only in the modes whose artwork does not carry it (see
 -- needsExternalLabel); a nav tile is a Text tile and never does.
-function M.itemDrawsExternalLabel(item, mode)
+--
+-- `labels` (optional): { books = false } when the books print nothing below
+-- their covers, groups = CoverLabel.groupMode() when the groups do. Omitted,
+-- the answer is the one it has always been (books on, no group text).
+-- A series stack (no kind, a member list) counts as a book here, as it always
+-- has, so a Series shelf keeps the strip it had whatever its tile style.
+function M.itemDrawsExternalLabel(item, mode, labels)
     if type(item) ~= "table" then return false end
-    if item.kind == nil then return true end
+    local books  = not (labels and labels.books == false)
+    local groups = labels and labels.groups
+    if item.kind == nil then
+        if books then return true end
+        if type(item.books) ~= "table" then return false end
+        if M.externalLabel(mode, item.series_name) ~= nil then return true end
+        return groups ~= nil and groupTextDraws(item, groups)
+    end
     if item.kind == "opds_nav" then return false end
-    return M.externalLabel(mode, item.label) ~= nil
+    if M.externalLabel(mode, item.label) ~= nil then return true end
+    return groups ~= nil and groupTextDraws(item, groups)
 end
 
--- anyExternalLabel(items, override) -> bool
+-- anyExternalLabel(items, override, labels) -> bool
 -- Does ANY tile in this item set print a name below itself? The shelf asks
 -- before it budgets the label strip: a chip whose tiles all carry their name
 -- inside (a folder chip in the divider or text style) would otherwise show a
 -- blank strip under every row. `override` is the chip's raw folder-display
 -- value, resolved here the way ShelfRow resolves it, so the two agree.
+-- `labels` as itemDrawsExternalLabel's.
 --
 -- pairs(), not ipairs(): a page's item list has holes for its empty slots,
 -- and the fetch result carries a flag field beside the items.
-function M.anyExternalLabel(items, override)
+function M.anyExternalLabel(items, override, labels)
     if type(items) ~= "table" then return false end
     local mode = M.resolve(override)
     for _, it in pairs(items) do
-        if M.itemDrawsExternalLabel(it, mode) then return true end
+        if M.itemDrawsExternalLabel(it, mode, labels) then return true end
     end
     return false
 end
@@ -387,13 +452,12 @@ function M.ribbonWidget(cover_w, cover_h, label)
     -- cache key, so handing it { bold = true } is a crash, not a bad font.
     -- Same call the cardboard label makes (bookshelf_folder_card).
     local BFont           = require("lib/bookshelf_fonts")
-    local Size            = require("ui/size")
     if not RibbonTextBox then RibbonTextBox = TextBoxWidget:extend{ alpha = true } end
 
     local text = label:gsub("/$", "")
     local over    = M.ribbonOverhang()
     local band_w  = cover_w + over * 2
-    local pad     = Size.padding.small
+    local pad     = Space.padding.small
     local avail_w = band_w - pad * 2
     if avail_w <= 0 then return nil end
 
@@ -464,7 +528,7 @@ function M.ribbonWidget(cover_w, cover_h, label)
     if ok_sw and SpineWidget and SpineWidget.SHADOW_OFFSET then
         shadow = SpineWidget.SHADOW_OFFSET
     end
-    local gap = math.max(Screen:scaleBySize(3),
+    local gap = math.max(Space.px(3),
                          math.floor(cover_h * RIBBON_BOTTOM_GAP))
     local y = cover_h - shadow - gap - band_h
     if y < 0 then y = 0 end
@@ -1012,6 +1076,7 @@ function M.collageBB(filepaths, width, height)
     for i, q in ipairs(order) do cells[i] = quarters[q] end
 
     local ok_cache, Cache = pcall(require, "lib/bookshelf_scaled_cover_cache")
+    local ok_ic, IC = pcall(require, "lib/bookshelf_image_contrast")
     local ok_repo,  Repo  = pcall(require, "lib/bookshelf_book_repository")
     local drawn = 0
     -- One histogram across every cover: the wash stands for the GROUP, so its
@@ -1073,6 +1138,12 @@ function M.collageBB(filepaths, width, height)
                 sources[i] = from or "none"
                 if not src then return end
                 local scaled = src:scale(cell.w, cell.h)
+                -- Image contrast: a cached cover is boosted already; a file or
+                -- a fresh decode is not, so its copy is boosted here and every
+                -- tile matches. The collage is marked boosted below.
+                if scaled and not (ok_ic and IC.isBoosted(src)) and ok_ic then
+                    IC.boostImage(scaled)
+                end
                 if scaled then
                     out:blitFrom(scaled, cell.x, cell.y, 0, 0, cell.w, cell.h)
                     sampleCover(hist, scaled)
@@ -1120,8 +1191,10 @@ function M.collageBB(filepaths, width, height)
         local stroke = math.max(1, Screen:scaleBySize(1))
         local edge = cardBorder()
         pcall(function()
-            out:paintRect(hw - math.floor(stroke / 2), 0, stroke, height, edge)
-            out:paintRect(0, hh - math.floor(stroke / 2), width, stroke, edge)
+            -- The Border color pick: through Color.paintRect.
+            local paint = require("lib/bookshelf_color").paintRect
+            paint(out, hw - math.floor(stroke / 2), 0, stroke, height, edge)
+            paint(out, 0, hh - math.floor(stroke / 2), width, stroke, edge)
         end)
     end
 
@@ -1186,6 +1259,9 @@ function M.collageBB(filepaths, width, height)
         end)
     end
     paintDividers()
+    -- Every tile is boosted (above) when the boost is on: the collage is a
+    -- boosted picture, not to be boosted again where it is drawn.
+    if ok_ic and IC.boost() > 0 then IC.markBoosted(out) end
     return out
 end
 

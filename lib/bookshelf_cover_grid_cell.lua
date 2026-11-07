@@ -5,9 +5,8 @@
 -- (SpineWidget.BorderOverlay), so "selected here" reads identically to
 -- "selected on the shelf". Tapping fires on_tap(candidate).
 --
--- The tile renders from candidate.local_path (every candidate is a local file
--- by the time it reaches the grid -- online results are downloaded first, the
--- embedded cover is extracted to a PNG). Decoding goes through ImageSource's
+-- The tile renders from candidate.local_path (online results are downloaded
+-- first), or candidate.image for the embedded cover (decoded in memory). Decoding goes through ImageSource's
 -- shared cache, so the dimension probe done when the candidate was built is a
 -- cache hit here.
 
@@ -20,11 +19,12 @@ local ImageWidget     = require("ui/widget/imagewidget")
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local OverlapGroup    = require("ui/widget/overlapgroup")
 local Size            = require("ui/size")
-local TextWidget      = require("ui/widget/textwidget")
+local TextWidget      = require("lib/bookshelf_colour_text")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
 local Device          = require("device")
 local Screen          = Device.screen
+local Space           = require("lib/bookshelf_space")
 local BFont           = require("lib/bookshelf_fonts")
 local ImageSource     = require("lib/bookshelf_image_source")
 local SpineWidget     = require("lib/bookshelf_spine_widget")
@@ -42,7 +42,7 @@ function FocusCell:paintTo(bb, x, y)
     InputContainer.paintTo(self, bb, x, y)
     if self._focused and self.dimen then
         bb:paintBorder(x, y, self.dimen.w, self.dimen.h,
-                       Size.border.thick, Blitbuffer.COLOR_BLACK, Size.radius.default)
+                       Size.border.thick, Blitbuffer.COLOR_BLACK, Space.radius.default)
     end
 end
 function FocusCell:onFocus() self._focused = true; return true end
@@ -114,7 +114,7 @@ function CoverGridCell.new(opts)
         },
     }
     local cap_h = caption:getSize().h
-    local gap   = Screen:scaleBySize(4)
+    local gap   = Space.px(4)
 
     -- Cover box fills what's left, inset by RING on every side so the selection
     -- ring (which paints RING pixels beyond the box) stays within the tile.
@@ -122,7 +122,7 @@ function CoverGridCell.new(opts)
     local box_h = height - cap_h - gap - 2 * RING
     if box_h < Screen:scaleBySize(24) then box_h = Screen:scaleBySize(24) end
 
-    local bb = c.local_path and ImageSource.loadImageNative(c.local_path) or nil
+    local bb = c.image or (c.local_path and ImageSource.loadImageNative(c.local_path)) or nil
     local inner
     if bb then
         inner = ImageWidget:new{
